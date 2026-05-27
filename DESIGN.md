@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.8. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.9. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -72,6 +72,15 @@ object storage.
 > contract changes; and the source operator exposes a `credits_available()`
 > signal so the connector's poll rate is governed by downstream backpressure
 > rather than runaway ingestion.
+>
+> **v3.9 adds two lakehouse-driven connector contract additions** (§13.3):
+> partition-filter pushdown lets the planner hand column predicates to
+> `start_snapshot` and `poll_delta` so Iceberg/Delta/Hudi connectors can
+> skip non-matching partition directories rather than scanning and discarding
+> them in the operator layer; and a `should_flush` signal on sink connectors
+> lets file-format sinks (Iceberg, Delta Lake, Parquet) buffer across epochs
+> before physically writing, solving the small-files problem without
+> sacrificing exactly-once semantics.
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -1420,14 +1429,54 @@ this before consuming and stop polling when the pool runs dry. This bounds
 the in-flight memory footprint at the connector boundary regardless of
 source burst rate.
 
+**Partition-filter pushdown.** When a source reads a partitioned table format
+(Iceberg, Delta Lake, Hudi, Parquet-manifest), the planner's predicate-pushdown
+pass may already know which partition columns to restrict. Rather than scanning
+all partitions and discarding non-matching rows in the operator layer, the
+planner passes a `PartitionFilter` — a conjunction of simple column predicates
+— directly to `start_snapshot` and `poll_delta`. Connectors that support
+pushdown skip non-matching partition directories entirely; connectors that do
+not simply ignore the filter and fall back to operator-layer filtering. The
+filter type is defined in the connector contract and does not depend on
+DataFusion internals:
+
+```
+/// Partition-column predicates pushed from the planner to skip directories
+/// the pipeline cannot match.  Predicates are ANDed together.
+enum PartitionPredicate {
+    Eq   { column: String, value: ScalarValue },
+    In   { column: String, values: Vec<ScalarValue> },
+    Range{ column: String,
+           lo: Option<ScalarValue>, hi: Option<ScalarValue> },
+}
+type PartitionFilter = Vec<PartitionPredicate>;
+```
+
+`ScalarValue` is RockStream's own minimal scalar type (bool, integer, float,
+string, date, timestamp); it is serialisable over gRPC and does not carry a
+DataFusion type-system dependency.
+
+**Sink file aggregation.** The epoch-commit protocol checkpoints state every
+epoch for exactly-once recovery, but physical file writes to Iceberg/Delta/Hudi
+must be large (128 MB–1 GB) to avoid the small-files problem. The sink contract
+therefore separates *checkpoint granularity* from *physical write granularity*
+via a `should_flush` signal. When `should_flush` returns false, pending rows are
+staged as `connector/{id}/pending_buffer` in the shard SlateDB and participate
+in the epoch checkpoint, so they survive a crash between epochs. Physical file
+writes happen only when the connector decides the buffer is large enough. The
+epoch-commit protocol guarantees exactly-once regardless of the flush policy.
+
 Source connectors must provide:
 
 ```
-discover_schema()                  -> SchemaVersion
-start_snapshot(frontier)           -> SnapshotStream
+discover_schema()                         -> SchemaVersion
+start_snapshot(frontier,
+               partition_filter: Option<PartitionFilter>)
+  -> SnapshotStream
 poll_delta(after: OffsetToken,
            max_bytes: usize,
-           credits_available: usize)
+           credits_available: usize,
+           partition_filter: Option<PartitionFilter>)
   -> { batches: Vec<RecordBatchDelta>,
        new_offset: OffsetToken,
        watermark: Option<EventTimeWatermark> }
@@ -1438,9 +1487,12 @@ pause(reason) / resume()
 Sink connectors must provide:
 
 ```
-prepare(epoch, rows) -> pending_handle
-commit(epoch, pending_handle, checkpoint_id) -> IdempotentResult
-abort(epoch, pending_handle) -> IdempotentResult
+prepare(epoch, rows)                       -> pending_handle
+commit(epoch, pending_handle,
+       checkpoint_id)                      -> IdempotentResult
+abort(epoch, pending_handle)               -> IdempotentResult
+should_flush(bytes_buffered: u64,
+             epochs_buffered: u32)         -> bool
 ```
 
 Every emitted row includes the stable `row_id` rules from §6.4 and the schema
