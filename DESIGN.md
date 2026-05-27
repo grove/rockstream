@@ -5,10 +5,24 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v2 (supersedes v1). The v1 design had a single-writer
-> bottleneck, no SQL compiler, no shuffle operator, and a scalar watermark
-> protocol that could not correctly handle multi-input operators. This document
-> addresses all of those.
+> **Status**: Design v3.1. v3 reframed the engine around DBSP-native operators
+> with pg_trickle as a correctness oracle and SlateDB's real API surface as a
+> hard constraint. v3.1 incorporates a second source-level review of
+> `../feldera`, `../pg-trickle1`, and `../slatedb` and adds three structural
+> commitments that follow from it:
+>
+> 1. **Time is causal, not global.** Cross-shard progress uses an antichain of
+>    `(shard_id, source_epoch)` pairs, not a single global LSN. Per-shard
+>    sequence numbers stay local to each SlateDB; the cluster frontier is a
+>    meet over per-shard frontiers and is allowed to be slightly stale.
+> 2. **Scheduling is async.** Operators are long-lived async tasks coordinated
+>    by data arrival and frontier updates. We deliberately do not adopt
+>    Feldera's synchronous `DynamicScheduler` ownership model, which rejects
+>    valid distributed topologies with `OwnershipConflict`.
+> 3. **SlateDB is respected as-is.** WAL listing cost, manifest churn,
+>    compaction-filter snapshot safety, missing range deletion, and merge-
+>    operator associativity are first-class constraints with explicit
+>    handling rather than wishful assumptions.
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -55,6 +69,36 @@ object storage.
 | P8 | **Exactly-once end-to-end.** | Source offsets and sink commits are integrated into the epoch commit protocol via a two-phase commit on connector state. |
 | P9 | **Adaptive parallelism per operator.** | Different operators in the same query can run at different widths. A hot aggregation can use 100 shards while a small lookup uses 4. |
 | P10 | **Idempotent everything.** | Every side effect — shuffle write, sink write, state mutation — is keyed so that replay is a no-op. |
+| P11 | **DBSP is the runtime truth.** | Native DBSP-style operators define behavior. pg_trickle's SQL delta engine is used as an oracle and regression corpus, not copied blindly as runtime machinery. |
+| P12 | **Respect SlateDB's real constraints.** | We rely on supported features (single-writer fencing, WriteBatch, DbReader, checkpoints, merge operators, TTL, compaction filters, WAL reader, segments) and do not assume missing APIs such as range deletion. |
+| P13 | **Causal time.** | Progress is an antichain over `(shard_id, source_epoch)` pairs. There is no global LSN. The cluster frontier is computed asynchronously from per-shard frontiers and is allowed to lag by a bounded budget. |
+| P14 | **Async scheduling.** | Operators are long-lived async tasks. There is no synchronous global scheduler tick and no per-stream ownership checker. Backpressure flows via credits; progress flows via frontiers. |
+| P15 | **Bounded staleness for cross-shard reads.** | Query gateways pin to a published cluster frontier (a vector of per-shard checkpoints) rather than to wall-clock "fresh"; the staleness budget is documented and observable. |
+
+### 1.1 Non-Goals (Explicit)
+
+The following are intentionally **out of scope** because they conflict with
+horizontal scale on object storage, and the v3.1 review confirmed that
+attempting them would compromise the rest of the design:
+
+- **Distributed IMMEDIATE / synchronous IVM.** pg_trickle's IMMEDIATE mode
+  takes table-level locks and runs inside one PostgreSQL transaction; it does
+  not generalize to a sharded cluster. RockStream's default is deferred,
+  low-latency epochs. A restricted IMMEDIATE mode may exist for single-shard
+  scan chains, but cluster-wide synchronous IVM is not a goal.
+- **Global linearizable snapshots across all shards in the hot path.** Reads
+  see a causally consistent vector frontier, not a single global LSN. Queries
+  that demand global linearizability must opt in to a cluster checkpoint and
+  accept higher latency.
+- **Cross-shard atomic SAVEPOINT-style transactions.** pg_trickle's diamond
+  consistency relies on PostgreSQL's local transaction manager. RockStream
+  expresses diamond consistency at the frontier layer (downstream waits for
+  all upstream members to reach the same epoch), not via a 2PC protocol that
+  blocks every shard.
+- **A global write sequence number.** SlateDB's per-DB sequence is local. We
+  do not synthesize a cluster-wide sequence on top of it.
+- **Loading or linking pg_trickle / Feldera at runtime.** Neither is a Cargo
+  dependency. They are reference material and test oracles only.
 
 ---
 
@@ -99,6 +143,15 @@ Recursive queries (`WITH RECURSIVE`, transitive closure, graph algorithms) use
 **semi-naive evaluation** inside a fixed-point loop. DBSP gives this a clean
 formalization via the `I` (integrate) and `D` (differentiate) operators applied
 in nested time scopes.
+
+Feldera's `IterativeCircuit` (`crates/dbsp/src/operator/recursive.rs`) is
+**local to one circuit on one worker**. RockStream lifts this into the
+distributed setting by allowing `Exchange` operators inside a recursive scope
+so the inner-time iteration can re-partition data each round. The iteration
+frontier (`Timestamp::iteration`) participates in the same antichain protocol
+as the outer source epoch. Cross-shard convergence is detected when the
+iteration component of the cluster frontier stops advancing, not via a
+synchronous barrier.
 
 ---
 
@@ -164,8 +217,9 @@ in nested time scopes.
 SlateDB is single-writer per database. To exceed one writer's throughput we run
 **many SlateDBs**. A *shard* is one SlateDB instance. The system is a mesh of
 hundreds or thousands of shards. Each operator instance pins to a shard for its
-state. Throughput scales linearly with shard count; latency stays flat because
-each shard's working set is small.
+state. Throughput scales with shard count for partitionable workloads; the real
+limits are hot keys, shuffle fan-out, object-store request rates, compaction
+debt, and external source/sink throughput.
 
 ### What a "Worker" Owns
 
@@ -231,9 +285,11 @@ SQL text
 - Substrait support for cross-language tooling.
 - Active community; used by InfluxDB IOx, Comet, Ballista, etc.
 
-We borrow ideas (and possibly code) from Feldera's `sql-to-dbsp` for the
-incrementalization pass — that compiler has the most complete coverage of SQL
-semantics under incremental evaluation.
+We use Feldera's `sql-to-dbsp` as the reference for SQL-to-DBSP semantics and
+pg_trickle as the reference for concrete SQL edge cases. The RockStream runtime
+does not execute generated SQL and does not copy pg_trickle's CTEs into the hot path.
+It compiles SQL into native DBSP-style operators and validates their behavior
+against batch DataFusion, PostgreSQL, and pg_trickle test oracles.
 
 ### 4.1 The Differentiation Pass & PlanIR
 
@@ -244,19 +300,19 @@ The incrementalization step (4) and operator runtime are specified in detail in
   variant per operator (Scan, Filter, Project, InnerJoin, Aggregate, Distinct,
   Window, TopK, TimeWindow, Recursive, Exchange, …). PlanIR is modelled on
   pg_trickle's `OpTree`.
-- A **`DiffCtx`** walks PlanIR and emits a runtime operator graph (`OpNode`s)
-  using per-operator differentiation rules ported from pg_trickle's `diff_*`
-  functions. Each rule is a direct implementation of the corresponding DBSP
-  derivation, with documented edge-case corrections (the EC-01 join fix, the
-  Q07 double-counting correction, the Q21 SemiJoin correction, FULL JOIN NULL
-  handling in SUM, etc.).
+- A **`DiffCtx`** walks PlanIR and emits a runtime operator graph (`OpNode`s).
+  The operator semantics are DBSP-native. pg_trickle's `diff_*` functions are
+  used to identify edge cases and build regression tests: the EC-01 join fix,
+  Q07 double-counting correction, Q21 SemiJoin correction, FULL JOIN NULL
+  handling in SUM, recursive DRed fallback, and similar cases.
 - The runtime is a **long-lived circuit of typed operators** (Feldera's model)
   rather than per-epoch SQL re-execution (pg_trickle's model). Each operator
   is a long-lived async task that consumes `RecordBatch` deltas and maintains
   one or more **arrangements** (indexed Z-sets) on its assigned SlateDB shard.
-- We deliberately reject Feldera's compile-to-Rust-binary model in favour of
-  interpreting a fixed physical plan; the vectorized `RecordBatch` inner loop
-  is fast enough via DataFusion's expression executor.
+- We do not use generated Rust artifacts as the v1 deployment model. Instead,
+  workers interpret a fixed physical plan; the vectorized `RecordBatch` inner
+  loop is fast enough via DataFusion's expression executor. Code generation can
+  be added later for hot paths without changing semantics.
 
 See [IVM.md §4–7](IVM.md#4-the-rockstream-ivm-architecture) for the full
 operator catalogue, runtime trait, and per-operator rules.
@@ -267,6 +323,12 @@ operator catalogue, runtime trait, and per-operator rules.
 
 Each shard has its own SlateDB. Within a shard, we use a layout designed
 specifically for the operator catalog and the shuffle subsystem.
+
+When a shard is created, RockStream configures a SlateDB segment extractor that
+uses the namespace + arrangement prefix. This lets SlateDB's segment-aware LSM
+layout isolate operator/shuffle/view state inside one shard without requiring a
+separate SlateDB database per operator. The segment extractor is immutable after
+database creation, so the prefix scheme is part of the storage format contract.
 
 ### 5.1 Shard-Local Namespaces
 
@@ -297,6 +359,54 @@ A small SlateDB cluster (one writer, ≥2 readers) holds:
 Workers read this database (via `DbReader` pinned to fresh checkpoints) on
 startup and subscribe to its CDC feed (`WalReader`) for plan changes and
 topology updates. Writes to the control DB go through the control-plane leader.
+
+### 5.3 SlateDB API Constraints Used by This Design
+
+The design assumes the following SlateDB features because they exist in the
+current implementation: single-writer fencing, `WriteBatch`, `DbReader`, MVCC
+snapshots, transactions, checkpoints/clones, merge operators, TTL, compaction
+filters, WAL reader, and segment extractors.
+
+The design deliberately does **not** assume range deletion or database
+split/merge APIs. Cleanup and rebalancing therefore use one of three patterns:
+
+- **Scan-and-delete** for bounded key ranges and correctness-sensitive cleanup.
+- **Frontier-aware compaction filters** for retention where dropping old entries
+  cannot make older values visible again.
+- **Checkpoint/clone/projection** for large shard movement or blue/green plan
+  replacement.
+
+Compaction filters are never treated as a correctness shortcut. SlateDB warns
+that filters can affect snapshot consistency and that dropping entries can
+resurrect older versions. RockStream uses explicit deletes for zero-crossing
+state transitions and reserves compaction filters for retention after the
+frontier proves no reader can observe the removed versions.
+
+### 5.4 SlateDB Operational Budgets
+
+These SlateDB realities are first-class budget items in this design rather than
+things to discover at runtime:
+
+- **WAL listing is expensive at high retention.** `WalReader` documents that
+  listing thousands of WAL files is costly. Every worker keeps a per-shard
+  WAL listing cache, invalidated only on WAL rotation, and tails via
+  `WalReader::get(latest_id + 1)` rather than repeated `list()`.
+- **Manifest writes are not free.** Every flush/compaction/GC updates the
+  manifest, which is an object-store write. Epoch sizes have a configurable
+  minimum (`min_epoch_ms`, `min_epoch_bytes`) so manifest churn stays bounded
+  even when source rate spikes. `manifest_poll_interval` on readers is tuned
+  to match the cluster's frontier-staleness budget.
+- **Merge operators must be associative.** SlateDB does not verify
+  associativity. RockStream registers only operators whose associativity is
+  proved by construction (integer add for weights, `(sum, count)` tuples for
+  algebraic aggregates). MIN/MAX/Top-K/window/recursive state is maintained
+  as explicit sorted arrangements, not merge operands.
+- **Compaction-filter snapshot consistency** is preserved by gating any `Drop`
+  decision on the per-shard checkpoint frontier; a filter never drops data
+  that an active `DbReader` snapshot could observe.
+- **`DbReader` is the cross-worker read path.** Joins and lookups that read
+  state owned by another shard use `DbReader` pinned to a published
+  checkpoint, never an undefined "live" read.
 
 ---
 
@@ -370,7 +480,10 @@ list = `[all shards]`.
 ```
 
 `MergeOperator` sums weights. Output emits delta when weight transitions
-between zero and non-zero. Compaction filter drops weight-zero entries.
+between zero and non-zero. When a key reaches zero, the operator emits an
+explicit delete/tombstone for the arrangement entry when correctness requires
+immediate invisibility. A compaction filter may later remove obsolete merge
+operands after the frontier proves no snapshot can need them.
 
 ### 6.7 Window Functions (ROW_NUMBER, RANK, LAG, LEAD, sliding aggregates)
 
@@ -394,10 +507,12 @@ feed back as input deltas at the next iteration timestamp. The frontier
 protocol naturally handles the inner-time dimension (the `iteration` component
 of the timestamp vector).
 
-Convergence detection: iteration stops when the input frontier advances past
-the iteration timestamp with no new deltas produced. See
-[IVM.md §11](IVM.md#11-recursion-with-recursive) for the full algorithm,
-which is modelled on Feldera's `IterativeCircuit`.
+Convergence detection: iteration stops when the recursive delta distincts to
+empty and the inner frontier advances past the iteration timestamp. The compiler
+also classifies recursive terms for monotonicity. INSERT-only monotone recursion
+uses semi-naive evaluation; mixed insert/delete/update changes use DRed
+(delete-and-rederive); non-monotone or unsupported recursive terms fall back to
+full recomputation. See [IVM.md §11](IVM.md#11-recursion-with-recursive).
 
 ### 6.9 Time Windows (Tumbling, Hopping, Session)
 
@@ -406,8 +521,9 @@ which is modelled on Feldera's `IterativeCircuit`.
 ```
 
 `window_id` is computed from the event-time of the row. Window expiry uses
-SlateDB **TTL** based on event-time-derived deadlines, combined with a
-compaction filter that drops state past the watermark.
+SlateDB **TTL** based on event-time-derived deadlines and a frontier-aware
+compaction filter. The filter is only allowed to remove data older than both
+the event-time expiry and the relevant input/output frontiers.
 
 ### 6.10 Top-K
 
@@ -539,6 +655,14 @@ subscribed). When the input frontier advances, the operator may:
 - Compact garbage in its arrangements.
 - Acknowledge upstream shuffle batches for deletion.
 
+Frontier aggregation is **explicitly asynchronous**. It is not on the hot path
+of any operator: operators decide what to do for the next epoch from their last
+observed input frontier, even if it is a few aggregation rounds stale. The
+aggregator's batching interval (`frontier_agg_interval`) is a tunable budget,
+typically 50–500 ms. A frontier that is up to one budget interval stale is
+still correct for garbage collection, window closing, and shuffle cleanup; it
+only affects how quickly those reclamations happen.
+
 ### 8.5 Garbage Collection of Shuffle Buffers
 
 When a receiver operator's input frontier on exchange `E` advances past epoch
@@ -548,16 +672,21 @@ When a receiver operator's input frontier on exchange `E` advances past epoch
 control: frontier/exchange_e/consumed → e
 ```
 
-Senders observe this and **range-delete** all `shuffle_outbox/` entries with
-`epoch ≤ e`. Receivers similarly range-delete their `shuffle_inbox/` entries.
-This is exact (no TTL guessing).
+Senders observe this and enqueue exact cleanup for all `shuffle_outbox/` entries
+with `epoch ≤ e`. Receivers do the same for `shuffle_inbox/`. Because SlateDB
+does not currently expose range deletion, cleanup is implemented as bounded
+prefix scan + batched deletes, with a frontier-aware compaction-filter fallback
+for very old retained data. This is exact in semantics; it is not implemented
+by a single range-delete API call.
 
 ---
 
 ## 9. Atomic Epoch Commit Protocol
 
-Each operator instance commits its state changes for an epoch as a single
-SlateDB `WriteBatch` on its shard. The batch includes:
+Each shard commits the mutations produced by all ready operator instances for an
+epoch as one or more coalesced SlateDB `WriteBatch`es. Operator tasks return
+`EpochOutput`; the shard-level epoch coordinator groups these outputs by shard
+to reduce WAL/manifest/object-store write amplification. A batch includes:
 
 1. All `op_state/` puts/deletes/merges produced by the operator.
 2. All `op_index/` updates.
@@ -590,10 +719,33 @@ batch.put(frontier_key, encode_frontier(&new_output_frontier));
 shard_db.write(batch).await?;
 ```
 
-This is the **only** durability event per epoch per operator instance. SlateDB's
-WAL guarantees atomicity. Recovery is automatic: on restart, the operator reads
-its current frontier and processes inputs from that frontier forward — by
-construction, idempotent.
+This is the **only** durability event per epoch per shard group, not per
+operator. SlateDB's WAL guarantees each `WriteBatch` is atomic. Recovery is
+automatic: on restart, the shard reads its current frontier and processes inputs
+from that frontier forward. Every write is idempotently keyed by epoch,
+operator, port, and sequence.
+
+### 9.1 Epoch Sizing
+
+Epoch size is a tuning parameter, not a constant. The shard-level coordinator
+enforces `min_epoch_ms` and `min_epoch_bytes` floors so a bursty source cannot
+drive manifest/WAL writes faster than object storage can amortize them. It
+also enforces a `max_epoch_ms` ceiling so a quiet source still publishes
+frontier progress on a predictable cadence. All three are exposed per pipeline.
+
+### 9.2 Crash Semantics
+
+On worker death, the new worker opens each lost shard as the single writer
+(SlateDB fences the previous writer via the manifest epoch), reads
+`shard_meta/0x06 0xFR` to recover the last committed epoch frontier, and
+re-runs source inputs from that frontier forward. Because every write inside a
+shard `WriteBatch` is idempotently keyed by `(epoch, op_id, port, seq)`,
+replay is a no-op.
+
+Partial-shard failures (one shard commits epoch `e`, another does not) are
+resolved by the frontier protocol: downstream operators that depend on both
+shards simply do not advance their input frontier past `e` until both shards
+publish it. There is no cross-shard 2PC.
 
 ---
 
@@ -626,7 +778,9 @@ epoch boundary.
      `DbReader`) and ingests into its own SlateDB.
    - Once caught up, the control plane atomically flips the shard map to the
      new version at a chosen epoch boundary.
-5. After cutover, the donor shards range-delete the migrated keys.
+5. After cutover, the donor shards mark the migrated key ranges as retired and
+  reclaim them via bounded scan-and-delete or a frontier-aware compaction
+  filter. This avoids depending on a missing SlateDB range-delete API.
 
 ### 10.3 Removing a Shard (Graceful)
 
@@ -661,7 +815,7 @@ running.
 
 | Boundary | Mechanism |
 |---|---|
-| **Within an epoch on one operator** | `WriteBatch` is atomic. |
+| **Within an epoch on one shard group** | Coalesced `WriteBatch` commit is atomic. |
 | **Across operators in the same cluster** | Frontier protocol + idempotent operator state keyed by source epoch. |
 | **External sources & sinks** | Two-phase commit on connector state; sink writes are keyed by `(source_epoch, output_position)`. |
 
@@ -735,8 +889,13 @@ A stateless query gateway service:
 3. Routes range scans to the appropriate shards via `DbReader` connections.
 4. Merges results with DataFusion's local executor.
 
-Gateways are stateless and horizontally scalable. They pin to a recent cluster
-checkpoint so concurrent queries see a consistent snapshot.
+Gateways are stateless and horizontally scalable. For each query they pin to a
+**published vector frontier** — the antichain of per-shard checkpoints
+associated with the most recent committed cluster frontier. All `DbReader`
+handles for one query open at that vector, so multi-shard reads in the same
+query see a causally consistent snapshot even though no global LSN exists. The
+vector frontier's age is exposed in query metadata so clients can decide
+whether to retry against a fresher one.
 
 ### 12.3 Subscribe / Streaming Queries
 
@@ -804,6 +963,12 @@ The exchange subsystem implements credit-based flow control:
 beyond a threshold, the upstream operator pauses (its `WriteBatch` includes a
 wait on outbox-size).
 
+Backpressure is **always cooperative**, never a synchronous global barrier.
+No operator blocks on a sibling operator's progress; it only blocks on its own
+credits and on its own input frontier. This is the structural reason RockStream
+does not adopt Feldera's `DynamicScheduler` ownership model, which would
+reject the multi-owner topologies that are normal in a distributed shard mesh.
+
 ### 14.4 Admission Control
 
 The control plane refuses to start new pipelines if cluster utilization would
@@ -828,6 +993,79 @@ high-priority ones (via a priority field in the pipeline config).
 The unique positioning: **end-to-end object-storage native** (no NVMe required,
 no local-state assumptions) **+ full SQL via DBSP** (correctness guarantees) **+
 adaptive per-operator parallelism**.
+
+---
+
+## 16. Optimality Assessment (v3.1)
+
+The v3.1 review against `../feldera`, `../pg-trickle1`, and `../slatedb`
+asked five questions of this design. Each answer is the structural commitment
+this document now encodes; the open risks list what remains to validate in
+implementation.
+
+### 16.1 Is the storage substrate used correctly?
+
+**Yes, with explicit budgets.** SlateDB's single-writer fence, `WriteBatch`,
+`DbReader`, checkpoints, segment extractors, TTL, compaction filters and WAL
+reader are all real and used as documented. Range deletion is absent and is
+therefore not assumed. Cleanup is scan-and-delete plus frontier-gated
+compaction filters (§5.3, §8.5). Manifest and WAL costs are explicit budgets
+(§5.4, §9.1).
+
+### 16.2 Does the runtime model fit a sharded object-store backend?
+
+**Yes, after diverging from Feldera in three places.** RockStream borrows
+Feldera's circuit-of-typed-operators design but (a) schedules operators
+asynchronously per shard rather than via Feldera's synchronous
+`DynamicScheduler`, (b) treats arrangements as SlateDB-backed indexed Z-sets
+rather than in-memory Spines, and (c) makes `Exchange` first-class so
+cross-shard ownership is never an `OwnershipConflict` error.
+
+### 16.3 Are pg_trickle's correctness rules honored?
+
+**Yes, as oracle-driven test obligations.** EC-01 join split, Q07
+double-counting correction, Q21 SemiJoin context, FULL JOIN NULL handling in
+SUM, `has_key_changed` metadata, distinct-as-multiplicity, EXCEPT/INTERSECT
+per-branch counts, DRed recursion, recomputation fallback, diamond
+consistency, and cadence inheritance all appear as planner metadata or test
+vectors in IVM.md. The runtime does not execute pg_trickle's SQL; it must
+match its behavior.
+
+### 16.4 Does the time model scale?
+
+**Yes, because it is causal.** Per-shard frontiers compose into a cluster
+vector frontier; there is no global LSN to contend on. Aggregation is async
+with a documented staleness budget (§8.4). Query reads pin to a published
+vector frontier (§12.2). Recursion participates in the same antichain via the
+inner `iteration` component.
+
+### 16.5 Where is the design still at risk?
+
+The following items are the explicit validation backlog and feed the
+implementation plan's Phase 3.5 and Phase 4 acceptance criteria:
+
+- **Hot-key skew** in joins and aggregates. Sub-key partitioning and adaptive
+  re-sharding (§10.5) must keep worst-shard load within a documented factor
+  of median.
+- **Object-store request budget** under sustained load (PUT/GET/LIST/DELETE
+  per second per shard) including WAL, manifest, SST, shuffle, and
+  checkpoints.
+- **Frontier-aggregator throughput** with thousands of shards × hundreds of
+  operators. The aggregator must be CPU- and memory-bounded, never blocking.
+- **Distributed recursion cost**. Each inner iteration is a full shuffle
+  round; convergence detection across shards must not require a synchronous
+  global barrier.
+- **Bootstrap and recovery time** for state sizes ≥ 1 TB. Recovery uses
+  `DbReader` against per-shard checkpoints; base-table ingest uses snapshot
+  mode (IVM.md §12).
+- **Compaction-filter safety proofs** for distinct/union retention and
+  windowed expiry. Every filter has a written argument that no `Drop`
+  decision could resurrect a version observable by an active reader.
+- **Control-plane HA**. A single SlateDB writer with hot readers is good
+  enough for MVP; production HA likely needs an external consensus or lease
+  layer. Tracked as IMPLEMENTATION_PLAN.md open question 7.
+
+The design is considered structurally sound modulo these validations.
 
 ---
 

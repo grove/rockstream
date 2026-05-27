@@ -8,8 +8,8 @@ system with progressively more capability.
 > - [DESIGN.md](DESIGN.md) — system architecture (storage, shards, exchange,
 >   fault tolerance, scaling).
 > - [IVM.md](IVM.md) — the incremental-view-maintenance engine itself
->   (PlanIR, differentiation pass, per-operator rules, circuit runtime,
->   arrangements). Phases 1–3 below operationalize IVM.md's
+>   (PlanIR, DBSP-native differentiation pass, operator runtime,
+>   arrangements, and pg_trickle-derived correctness oracles). Phases 1–3 below operationalize IVM.md's
 >   `IVM-1` through `IVM-13` milestones.
 
 ---
@@ -45,7 +45,8 @@ Durations are indicative effort, not calendar time, and assume a small dedicated
 - Cargo workspace with the following crates:
   - `rockstream-types` — shared types (timestamp, frontier, Z-set row, schema).
   - `rockstream-storage` — wrappers around SlateDB, key encoders/decoders,
-    merge operator registry.
+    merge operator registry, segment extractor configuration, checkpoint
+    helpers, scan-and-delete cleanup utilities.
   - `rockstream-plan` — `PlanNode` enum (the PlanIR from IVM.md §5) and the
     physical `OpNode` graph.
   - `rockstream-diff` — the `DiffCtx` differentiation pass (IVM.md §6–7).
@@ -64,6 +65,10 @@ Durations are indicative effort, not calendar time, and assume a small dedicated
   `cargo test`, `cargo deny`, codecov.
 - Logging via `tracing` with OTEL exporter feature flag.
 - Property-testing harness via `proptest`.
+- Storage API validation tests proving the design uses only supported SlateDB
+  features: single-writer fencing, `WriteBatch`, `DbReader`, checkpoints,
+  `MergeOperator`, TTL, compaction filters, WAL reader, and segment extractor.
+  No code path may depend on range deletion.
 - Pinned MSRV; reproducible builds.
 - License headers, CONTRIBUTING, CODE_OF_CONDUCT.
 - Dev container (Dockerfile + devcontainer.json) with SlateDB, MinIO,
@@ -93,10 +98,23 @@ hard-coded plans only; the SQL parser comes in Phase 2.
   the trivial linear-operator rules for filter/project/map.
 - Implement the `Operator` trait and `EpochOutput` struct from IVM.md §8.1.
 - Implement `OperatorTask` event loop (IVM.md §8.2): one tokio task per
-  operator instance, single atomic SlateDB `WriteBatch` per epoch covering
-  state + outputs + frontier.
+  operator instance returning `EpochOutput` fragments to a shard-level epoch
+  commit coordinator.
+- Implement shard-level group commit: coalesce all ready operator fragments for
+  a shard into one or more atomic SlateDB `WriteBatch` commits covering state,
+  output, shuffle staging, connector offsets, and frontiers.
 - Per-shard SlateDB namespaces from DESIGN.md §5.1 (op_state, view_output,
   shard_meta) wired through `ShardDb`.
+- `ShardDb` must expose: `put/merge/delete` fragment builders, checkpoint
+  creation, `DbReader` snapshot reads, WAL reader smoke tests, segment extractor
+  setup, and bounded prefix scan + batched delete cleanup.
+- **WAL listing cache** in `ShardDb`: list WAL files once on attach, then tail
+  via `WalReader::get(latest_id + 1)` and invalidate only on rotation. Listing
+  must not appear on the hot path (validated by smoke test).
+- **Async, ownership-free scheduler**: the per-worker scheduler runs operators
+  as tokio tasks driven by data arrival and frontier updates, with credit-based
+  backpressure. No `OwnershipConflict`-style rejection of multi-consumer
+  streams.
 - Source connector that feeds a `Vec<RecordBatch>` as delta batches with
   `_weight: i64` column convention.
 - Property test: `SELECT a, b * 2 AS c FROM t WHERE c > 10` against random
@@ -135,6 +153,8 @@ hard-coded plans only; the SQL parser comes in Phase 2.
 - Crash mid-epoch (`kill -9` injected mid-`WriteBatch`); on restart, the
   shard reads its persisted frontier and reprocesses the failed epoch —
   output bit-identical to an uninterrupted run.
+- Group-commit benchmark: shard-level batching must reduce durability events
+  by at least 5x compared with one commit per operator at the same epoch rate.
 - Oracle property test runs green for ≥ 100k randomized scenarios per
   operator combination.
 
@@ -170,13 +190,17 @@ join queries written as plain SQL.
 
 - Add `InnerJoin` PlanNode + dual arrangements (`0xJL`, `0xJR` from
   DESIGN.md §6.4).
-- Port the bilinear-expansion algorithm with corrections **literally** from
+- Implement a DBSP-native two-arrangement join and validate it against the
+  corrected bilinear-expansion behavior in
   [`pg-trickle1/src/dvm/operators/join.rs`](../pg-trickle1/src/dvm/operators/join.rs):
   - Part 1 — `ΔL ' R` split into `ΔL_I ' R₁` and `ΔL_D ' R₀` (EC-01 fix).
   - Part 2 — `L₀ ' ΔR` with appropriate pre-change snapshot construction.
   - Part 3 — correction term `(L₁ − L₀) ' ΔR` for join children (Q07 fix).
 - Pre-change snapshot semantics: arrangements are updated at end-of-epoch
   commit, so during processing they reflect epoch `e-1`.
+- Planner metadata: `JoinSemantics` records inside-semi/anti context,
+  join-child depth, pre-change snapshot mode, key-change tracking, and which
+  node owns correction output.
 - Distribution pass inserts `Exchange` whenever the join key differs from the
   child's partition key (no-op in single shard; verified by tests).
 - Run TPC-H Q1, Q3, Q5 (5-way join), Q6 against the batch oracle for parity.
@@ -185,7 +209,7 @@ join queries written as plain SQL.
 ### Milestone IVM-5 — Outer / Semi / Anti joins (IVM.md §13 IVM-5, §7.4–7.5)
 
 - Add `LeftJoin`, `RightJoin`, `FullJoin`, `SemiJoin`, `AntiJoin` variants.
-- Port pg_trickle's implementations
+- Implement DBSP-native operators validated against pg_trickle's implementations
   ([`outer_join.rs`](../pg-trickle1/src/dvm/operators/outer_join.rs),
   [`full_join.rs`](../pg-trickle1/src/dvm/operators/full_join.rs),
   [`semi_join.rs`](../pg-trickle1/src/dvm/operators/semi_join.rs),
@@ -193,6 +217,12 @@ join queries written as plain SQL.
   side-specific NULL-padding logic and the Q21 SemiJoin correction.
 - One extra arrangement per side tracking currently-unmatched rows so
   transitions can emit retractions.
+- **Planner optimizations from pg_trickle** (implemented as `JoinSemantics`
+  metadata, not as SQL CTE rewriting): SemiJoin `R_old` materialization
+  (Q21 fix), DI-6 equi-join key filter pushdown on the SemiJoin right side,
+  `merge_safe_dedup` flag for scan-filter-project chains, and FULL JOIN
+  aggregate rescan when an upstream FULL JOIN can produce matched\u2194unmatched
+  transitions under a SUM/AVG.
 - Run TPC-H Q11, Q21 (the notorious SemiJoin corner cases) against the oracle.
 
 ### Milestone IVM-6 — Distinct / Union / Intersect / Except (IVM.md §13 IVM-6, §7.7–7.8)
@@ -201,9 +231,11 @@ join queries written as plain SQL.
   `DistinctWeightMerge` (`i64` addition).
 - Output delta on zero-crossing transitions (0 → +n emits +1;
   +n → 0 emits −1).
-- SlateDB compaction filter drops keys with weight 0.
-- Implement Intersect / Except with set + bag semantics; port pg_trickle's
-  `intersect.rs` / `except.rs`.
+- Zero-crossing entries are explicitly deleted/tombstoned when immediate
+  invisibility is required. A compaction filter may remove obsolete merge
+  operands only after a snapshot-safety audit.
+- Implement Intersect / Except with set + bag semantics; validate against
+  pg_trickle's `intersect.rs` / `except.rs`.
 - Property tests on set semantics with random sequences.
 
 **Exit criteria for Phase 2**
@@ -239,8 +271,9 @@ standard for analytical workloads.
 
 - TUMBLE, HOP, SESSION windows.
 - `0xTW` arrangement (DESIGN.md §6.9) keyed by `window_id`.
-- Event-time TTL on arrangement entries plus a compaction filter that drops
-  state past the input frontier's watermark.
+- Event-time TTL on arrangement entries plus a frontier-aware compaction filter
+  that removes state only after event-time expiry and input/output frontiers
+  prove safety.
 - Late-data handling policy: configurable (`drop` / `update` / `route_to_sink`).
 
 ### Milestone IVM-9 — Top-K (continues Phase 2's set-op family)
@@ -256,6 +289,11 @@ standard for analytical workloads.
 - Add `Recursive` and `RecursiveSelfRef` PlanNodes.
 - `0xRC` recursive-variable arrangement (DESIGN.md §6.8) keyed by
   `row_hash + iteration`.
+- Compiler strategy selection:
+  - Semi-naive for monotone insert-only recursion.
+  - DRed for monotone mixed insert/delete/update recursion.
+  - Full recomputation fallback for non-monotone terms, unsupported multiple
+    self-references, or recursive/output column mismatches.
 - Implement the nested-time scheduler loop:
   - Outer time = `source_epoch`; inner time = `iteration` (resets per epoch).
   - At each iteration, evaluate the step plan against the arrangement at
@@ -263,6 +301,8 @@ standard for analytical workloads.
   - Convergence: inner frontier advances past `iteration` with no new
     deltas → loop exits, output frontier on the operator advances to
     `{source_epoch + 1, 0}`.
+- Safety controls: max iteration count, frontier-stall detection, and explicit
+  error reporting when fallback recomputation exceeds configured cost limits.
 - This is Feldera's `IterativeCircuit` model rebuilt for our async runtime.
 - Test: transitive closure on a 1M-edge graph; recursive employee hierarchy;
   graph reachability with cycles.
@@ -285,7 +325,7 @@ standard for analytical workloads.
 
 - Add `ViewRef` PlanNode that subscribes to an upstream view's CDC stream
   (the upstream view's `view_output/` namespace via SlateDB `WalReader`).
-- Port pg_trickle's `dag.rs` model: per-stream-table cadence inheritance,
+- Model pg_trickle's `dag.rs` semantics: per-stream-table cadence inheritance,
   diamond-consistency groups (`atomic` mode where all members of a diamond
   refresh together at the same epoch boundary, enforced by the frontier
   protocol).
@@ -338,7 +378,7 @@ distribution and fault tolerance. (IVM.md §13 IVM-13.)
 
 **Deliverables**
 
-- **TPC-H 22/22**: port pg_trickle's TPC-H test suite (queries Q1–Q22 at
+- **TPC-H 22/22**: adapt pg_trickle's TPC-H test suite (queries Q1–Q22 at
   SF=0.01) and run all 22 incrementally on RockStream; bit-identical results
   vs. DataFusion batch.
 - **Nexmark soak**: continuous Nexmark workload, 24 hours, verify zero
@@ -352,6 +392,23 @@ distribution and fault tolerance. (IVM.md §13 IVM-13.)
 - **Deterministic simulation testing**: borrow SlateDB's `slatedb-dst`
   pattern; a single-threaded, seeded-RNG harness drives source connectors
   deterministically and verifies bit-identical output across reruns.
+- **Storage correctness audit**: verify every cleanup path works without SlateDB
+  range deletion; prove each compaction filter is snapshot-safe; run a WAL
+  retention/listing-cost test with long-lived readers.
+- **Commit-cost benchmark**: compare shard-level group commit against
+  per-operator commits at 10, 100, and 1000 operators per shard.
+- **Object-store request budget**: measure GET/LIST/PUT/DELETE rates for
+  arrangements, shuffle, checkpoint, WAL reader, and compaction under soak.
+- **Manifest churn budget**: measure manifest writes per minute under steady
+  state and bursty load; confirm `min_epoch_ms` / `min_epoch_bytes` floors
+  hold the write rate within budget without starving frontier progress past
+  `max_epoch_ms`.
+- **WAL listing-cost test**: keep a `DbReader` open against a writer at 1-hour
+  WAL retention; assert that no operator hot path issues `list()` and that
+  cached tail reads stay below an explicit per-shard request/s budget.
+- **Per-shard adaptive cost model**: validate that a hot shard switching to
+  recomputation while sibling shards stay on DIFFERENTIAL produces correct
+  outputs and does not stall the cluster frontier.
 - **Performance regression suite**: criterion benchmarks tracked over time;
   CI fails on > 10% regression.
 
@@ -360,6 +417,8 @@ distribution and fault tolerance. (IVM.md §13 IVM-13.)
 - 22 / 22 TPC-H queries: identical results vs. batch.
 - ≥ 10× measured speedup vs. batch at 1% change rate (matches pg_trickle's
   TPC-H number).
+- No correctness-critical cleanup depends on range deletion; compaction filters
+  have documented safety proofs and failing tests for unsafe resurrection cases.
 - Random fuzzer runs ≥ 1 hour without finding divergence on any operator
   combination implemented in Phases 1–3.
 - DST harness passes 100k seeds with bit-identical output across reruns.
@@ -387,7 +446,7 @@ production-ready.
   - Hybrid dispatcher: chooses path per-batch based on receiver health and
     batch size.
   - `shuffle_outbox/` and `shuffle_inbox/` encoders integrated into the
-    epoch commit batch.
+    shard-level epoch commit batch.
   - Credit-based backpressure.
 - **Rendezvous hashing** library with virtual nodes; property tests for
   re-balance minimality.
@@ -396,7 +455,7 @@ production-ready.
   - The scheduler on each worker runs only the `OperatorTask`s (IVM.md §8.2)
     whose `instance_idx` is assigned to its shards.
   - Exchange operators serialize Arrow batches keyed by destination shard
-    and stage them in `shuffle_outbox/` as part of the per-epoch atomic
+    and stage them in `shuffle_outbox/` as part of the per-shard atomic
     commit (DESIGN.md §9).
   - Cross-shard arrangement reads are forbidden in the hot path: the
     compiler's distribution pass guarantees that every stateful operator's
@@ -404,11 +463,18 @@ production-ready.
     don't (IVM.md §5, §9.4).
   - Re-run the full Phase 1–3 oracle + TPC-H suite against the distributed
     cluster; results must be bit-identical to the single-shard runs.
+- **Distributed recursion**: extend the recursion runtime (IVM.md §11.1) so
+  `Exchange` operators can appear inside a recursive scope. The inner-iteration
+  frontier participates in the standard antichain aggregation. Validate with
+  a sharded transitive-closure / reachability benchmark on a 10M-edge graph;
+  enforce max-iteration cap, inner-frontier stall timeout, and per-shard
+  recompute fallback.
 
 **Exit criteria**
 
-- 16-shard cluster (single host, 16 processes) runs TPC-H with linear
-  throughput vs. single shard for parallelizable queries.
+- 16-shard cluster (single host, 16 processes) runs TPC-H with near-linear
+  throughput vs. single shard for partitionable queries, with documented skew
+  and shuffle limits.
 - Killing one worker process causes its shards to be re-leased to another
   worker; processing continues without data loss (verified by output equality
   vs. uninterrupted run).
@@ -434,8 +500,9 @@ production-ready.
   - Trigger window closing.
   - Detect recursion convergence.
   - Release shuffle inbox entries.
-- **Exchange GC**: senders observe `frontier/exchange_e/consumed` and range-
-  delete their outbox.
+- **Exchange GC**: senders observe `frontier/exchange_e/consumed` and reclaim
+  outbox/inbox entries with bounded prefix scan + batched deletes; long-retained
+  entries may be removed by frontier-aware compaction filters after audit.
 
 **Exit criteria**
 
@@ -494,7 +561,8 @@ production-ready.
   - Donor shard creates a `Checkpoint`; new shard ingests the affected key
     range via `DbReader`.
   - Cutover at an epoch boundary; shard map version bump.
-  - Donor shard range-deletes migrated keys.
+  - Donor shard retires migrated keys and reclaims them via bounded
+    scan-and-delete or a frontier-aware compaction filter after cutover.
 - **Online shard merge**: reverse of split.
 - **Worker scale-out**: new worker process joins, control plane assigns
   un-leased shards or rebalances from over-loaded workers.
@@ -658,9 +726,20 @@ These run in parallel with every phase.
 | Risk | Mitigation |
 |---|---|
 | SlateDB single-writer is too restrictive | Already mitigated by sharding; further mitigation via per-shard write parallelism using SlateDB's batched writer. |
+| Per-operator commits overwhelm object storage | Shard-level group commit; commit-cost benchmark in Phase 3.5; adaptive epoch sizing with `min_epoch_ms` / `min_epoch_bytes` floors. |
+| SlateDB has no range-delete API | Design cleanup as scan-and-delete, compaction-filter retention, or checkpoint/clone/projection; make range-delete absence an integration test. |
+| Compaction filters break snapshot safety | Treat filters as retention only; explicit deletes for correctness; safety proofs and stale-reader tests before enabling filters. |
+| MergeOperator used for non-associative state | Restrict merge operators to associative accumulators; implement MIN/MAX/Top-K/window/recursive retractions with explicit arrangements. |
 | Frontier protocol implementation bugs | Heavy property testing; reference implementation in pure logic for comparison. |
-| Object-store cost dominates | Aggressive local SST cache; coalesce small writes; tier cold state. |
-| SQL incrementalization gaps | Start from Feldera's compiler reference; build a comprehensive SQL test corpus. |
+| Object-store cost dominates | Aggressive local SST cache; coalesce small writes; tier cold state; WAL listing cache. |
+| WAL listing becomes a hot-path cost | Per-shard WAL listing cache, tail via `WalReader::get(latest_id+1)`; Phase 3.5 listing-cost test. |
+| Manifest churn under bursty load | `min_epoch_ms` / `min_epoch_bytes` floors; manifest-write budget tracked in Phase 3.5. |
+| Frontier aggregator becomes a bottleneck | Async aggregation with bounded staleness budget; Phase 5 throughput test at thousands of shards × hundreds of operators. |
+| SQL incrementalization gaps | Use Feldera's compiler as semantic reference; use pg_trickle as oracle for edge cases; build a comprehensive SQL test corpus. |
+| pg_trickle semantics diverge from native runtime | Side-by-side oracle tests; store planner metadata explicitly; favor DBSP derivations where pg_trickle is PostgreSQL-specific. |
+| Distributed IMMEDIATE mode fights scale | Keep IMMEDIATE restricted to simple/single-shard cases; default to deferred low-latency epochs. |
+| Feldera-style synchronous ownership scheduling rejects valid topologies | Use async, ownership-free per-worker scheduler; multi-consumer streams are normal; `DbReader` is the multi-reader path. |
+| Distributed recursion stalls or diverges | Per-iteration inner frontier, max-iteration cap, inner-frontier stall timeout, per-shard recompute fallback. |
 | Operator skew | Adaptive re-sharding in Phase 7; sub-key partitioning for extreme skew. |
 | Hardware/network partitions | Chaos testing; documented degraded-mode behavior. |
 | Schema evolution | Versioned plan storage; online plan replacement via `Clone`. |
@@ -680,8 +759,8 @@ Total: 8–9 engineers for ~12-month path to GA.
 ## Open Questions (To Be Resolved Early)
 
 1. **Compiler reuse vs. ground-up** — **resolved**: ground-up Rust on
-   DataFusion, with per-operator rules ported from pg_trickle (IVM.md §3).
-   Feldera's Java sql-to-dbsp is a reference for SQL coverage only.
+  DataFusion, with DBSP-native operators validated against pg_trickle edge
+  cases (IVM.md §3). Feldera's sql-to-dbsp is a reference for SQL semantics.
 2. **Execution model: codegen vs. interpretation** — **resolved**:
    interpretation of a long-lived operator graph (IVM.md §8.3). Code generation
    may be added later as an optimization for hot queries; not required for v1.
@@ -695,10 +774,26 @@ Total: 8–9 engineers for ~12-month path to GA.
    external Raft like the standard Kubernetes pattern? Start with a single
    writer + cold standby; harden in Phase 10.
 6. **Arrangement compaction frontier**: Materialize aggressively compacts
-   arrangements past the consumer frontier. We get the equivalent from
-   SlateDB compaction + the weight-zero-drop compaction filter — but it's
-   worth measuring whether active arrangement consolidation is needed for
-   long-running queries. Resolve in Phase 3.5 soak.
+   arrangements past the consumer frontier. SlateDB compaction filters may help,
+   but only after snapshot-safety proof; active arrangement consolidation may
+   still be needed for long-running queries. Resolve in Phase 3.5 soak.
+7. **Control DB implementation detail**: a single SlateDB writer with hot
+   readers may be enough for MVP catalog/control operations, but production HA
+   likely needs an external consensus/lease layer. Prototype in Phase 4 and
+   finalize before Phase 10.
+8. **Frontier-aggregator staleness budget**: the aggregator is async with a
+   `frontier_agg_interval` tunable (DESIGN.md §8.4). Pick a default value and
+   confirm it satisfies window-close, shuffle-GC, and query-freshness SLOs at
+   target scale during Phase 5.
+9. **Vector-frontier query semantics**: query gateways pin to a published
+   cluster vector frontier (DESIGN.md §12.2). Confirm in Phase 9 that
+   client-facing freshness metadata (vector frontier age) is sufficient for
+   common BI/serving workloads, and decide whether to expose an opt-in
+   "wait-for-this-source-epoch" hint.
+10. **Distributed recursion shape**: IVM.md §11.1 allows `Exchange` inside the
+    recursive scope. Validate in Phase 4 with a sharded transitive-closure
+    benchmark that convergence detection via the inner-iteration frontier
+    scales without a synchronous global barrier.
 
 These are explicitly to be revisited and answered with prototypes during
 Phases 1–4.

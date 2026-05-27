@@ -1,6 +1,6 @@
 # RockStream
 
-**Keep your reports and dashboards up-to-date — automatically, instantly, and at any scale.**
+**Keep your reports and dashboards up-to-date automatically as your workload grows.**
 
 ---
 
@@ -39,10 +39,10 @@ RockStream figures out what changed (the "delta")
 It updates only the affected parts of your pre-computed results
       │
       ▼
-Your dashboards and reports instantly reflect the new reality
+Your dashboards and reports quickly reflect the new reality
 ```
 
-No full re-scans. No waiting. No stale data.
+No routine full re-scans. Less waiting. Fresher data.
 
 ## What Makes RockStream Different
 
@@ -63,6 +63,11 @@ from the ground up for the cloud era.
 RockStream splits the work across as many workers as you need. Each worker is responsible
 for a slice of the data. When traffic grows, you add more workers. When it quiets down,
 you remove them. Workers coordinate automatically — no manual reconfiguration required.
+
+The design is intentionally honest about the limits of scale: object-storage request
+rates, skewed keys, network shuffle, and source/sink throughput still matter. RockStream's
+goal is to remove the single database writer as the central bottleneck by splitting state
+across many independent SlateDB-backed shards.
 
 ### Never Loses Work
 
@@ -86,11 +91,13 @@ arrive.
 
 ## Inspiration
 
-RockStream is inspired by three production systems:
+RockStream is inspired by production systems and implementation research:
 
 | System | What it does |
 |---|---|
 | **[Feldera](https://feldera.com/)** | Uses mathematical theory (DBSP) to guarantee that incremental results are always identical to what a full re-computation would produce |
+| **pg_trickle** | Shows how to turn SQL views into practical per-operator delta rules, with many hard correctness cases worked through in PostgreSQL |
+| **[SlateDB](https://slatedb.io/)** | Provides the cloud-native object-storage-backed LSM that RockStream uses as its durable shard and arrangement store |
 | **[RisingWave](https://risingwave.com/)** | A streaming database that maintains materialized views in real time |
 | **[Snowflake Dynamic Tables](https://docs.snowflake.com/en/user-guide/dynamic-tables-intro)** | Automatically refreshed tables inside the Snowflake cloud data warehouse |
 
@@ -104,7 +111,7 @@ RockStream brings these ideas to an open, cloud-native storage foundation.
 | **Delta / change** | Only the new or removed records since the last update |
 | **Epoch** | A small batch of changes processed together, like a transaction |
 | **Worker** | A process that handles one slice of the data |
-| **Watermark** | A marker that says "all changes up to this point have been processed" |
+| **Frontier** | A marker that says "no future change before this point is expected"; this is the distributed version of a watermark |
 | **Checkpoint** | A saved snapshot of progress so the system can recover after a crash |
 | **CDC** | Change Data Capture — streaming the changes out to other systems |
 
@@ -115,9 +122,9 @@ in progressively more detail:
 
 | Document | Audience | What it covers |
 |---|---|---|
-| [DESIGN.md](DESIGN.md) | Engineers / architects | Full system architecture: storage layout, operator state, worker coordination, fault tolerance, scaling model |
-| [IVM.md](IVM.md) | IVM specialists | How the incremental-view-maintenance engine itself works — the operators, the differentiation pass, the circuit runtime, the arrangements on SlateDB — synthesized from deep analysis of Feldera DBSP and pg_trickle |
-| [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Implementers | Phase-by-phase build plan from empty repo to GA, including the IVM-1 through IVM-13 milestones from IVM.md |
+| [DESIGN.md](DESIGN.md) | Engineers / architects | Full system architecture: storage layout, operator state, worker coordination, fault tolerance, scaling model, and constraints discovered from SlateDB research |
+| [IVM.md](IVM.md) | IVM specialists | How the incremental-view-maintenance engine itself works — DBSP-native operators, the differentiation pass, the circuit runtime, arrangements on SlateDB, and pg_trickle as a correctness oracle |
+| [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Implementers | Phase-by-phase build plan from empty repo to GA, including corrected IVM milestones and validation gates |
 
 ## Contributing
 

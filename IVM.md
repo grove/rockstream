@@ -12,11 +12,13 @@ reading of two production IVM systems:
    emits a single SQL `WITH` chain (the "delta query"), and executes that
    query inside Postgres to compute deltas from change buffer tables.
 
-We adopt the **algorithm** from pg_trickle (simple, debuggable, per-operator
-SQL-generation rules) and the **runtime model** from Feldera (long-lived
-circuit of typed operators, durable arrangements, frontier-based scheduling),
-fused into a third architecture suited to RockStream's shard-mesh storage on
-SlateDB.
+We adopt the **semantic model** from Feldera/DBSP (native Z-set operators,
+long-lived circuits, traces/arrangements, frontier-based scheduling) and use
+pg_trickle as the **correctness oracle** for hard SQL edge cases. pg_trickle's
+per-operator SQL differentiation rules are reference material, not runtime
+code; they supply tests, metadata requirements, and known failure cases such as
+EC-01 joins, Q07 double-counting, Q21 SemiJoin interactions, aggregate rescans,
+and recursive DRed fallback.
 
 > Cross-references: [DESIGN.md](DESIGN.md) (system architecture),
 > [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) (phased roadmap).
@@ -155,9 +157,9 @@ scaling, recursion has stack-depth caveats.
 |---|---|---|---|
 | **Query input** | SQL (Calcite) | SQL (Postgres parser) | SQL (DataFusion) |
 | **Plan IR** | Calcite RelNode → DBSPCircuit | `OpTree` (~20 variants) | `PlanIR` (DataFusion LogicalPlan + IVM annotations) |
-| **Incrementalization style** | Whole-circuit transform via I/D operator insertion | Per-operator SQL-generation rules walking OpTree | Per-operator rules walking PlanIR, *both* generating arrangement-update code (hot path) and SQL fragments (debug/explain) |
+| **Incrementalization style** | Whole-circuit transform via I/D operator insertion | Per-operator SQL-generation rules walking OpTree | DBSP-native operators over PlanIR, with pg_trickle-derived metadata and regression tests |
 | **Runtime data type** | Typed Z-set batches (`IndexedZSet<K,V>`) | SQL rows + `__pgt_action` column ('I'/'D') | Arrow `RecordBatch` with `_weight: i64` column |
-| **Operator execution** | Long-lived Rust functions in a fixed circuit | Generated SQL re-run per refresh by Postgres planner | Long-lived Rust operator instances, code-generated expression eval via DataFusion physical operators |
+| **Operator execution** | Long-lived Rust functions in a fixed circuit | Generated SQL re-run per refresh by Postgres planner | Long-lived Rust operator instances, vectorized expression eval via DataFusion physical expressions |
 | **State (arrangements)** | Spine of file-backed batches on local NVMe | Stream table itself = state; auxiliary `__pgt_count` columns | SlateDB shard, indexed Z-set encoded as KV (see §9) |
 | **Scheduling** | Fixed graph + work scheduler | EDF + demand-driven cadence + diamond groups | Frontier-driven dataflow scheduler (§10) |
 | **Recursion** | `IterativeCircuit` with nested timestamps, `Z1`, `Distinct` | Generated WITH RECURSIVE in delta SQL | Same nested-timestamp approach as Feldera |
@@ -169,21 +171,22 @@ scaling, recursion has stack-depth caveats.
 
 ## 3. What RockStream Inherits From Each
 
-### From pg_trickle — the *algorithm*
+### From pg_trickle — the *oracle and edge-case catalogue*
 
-- **Per-operator diff rules in their plain-SQL form**. The pg_trickle source
-  contains battle-tested differentiation rules for every relational operator,
-  with documented edge cases (EC-01 fix in join, Q21 SemiJoin regression,
-  Q07 double-counting correction, FULL JOIN NULL handling in aggregates,
-  etc.). These rules are SQL-portable, easy to test against a reference
-  Postgres implementation, and easy to explain. We will translate them into
-  RockStream's operator implementations one-for-one.
+- **Per-operator diff rules as executable documentation**. The pg_trickle
+  source contains battle-tested differentiation rules for every relational
+  operator, with documented edge cases (EC-01 fix in join, Q21 SemiJoin
+  regression, Q07 double-counting correction, FULL JOIN NULL handling in
+  aggregates, recursive DRed fallback, etc.). These rules become regression
+  tests and planner metadata requirements. We do **not** translate its SQL CTEs
+  directly into native code; we implement the corresponding DBSP operators
+  and validate them against pg_trickle and batch SQL.
 - **OpTree-style plan IR with one variant per operator** — much easier to
   pattern-match against than a generic optimizer's plan node.
 - **Delta-source abstraction** (`DeltaSource::ChangeBuffer` vs
-  `TransitionTable`). RockStream gets a third source — `Arrangement` (the
-  upstream operator's current state, served from SlateDB) — for inner deltas
-  that don't come from base tables.
+  `TransitionTable`). RockStream generalizes this to source deltas, view-output
+  deltas, and arrangement snapshots. Immediate transition-table semantics are
+  not a v1 distributed feature; deferred low-latency epochs are the default.
 - **Caching the *plan* with parameterized inputs**. pg_trickle's
   `__PGS_PREV_LSN_{oid}__` placeholders show how to compile-once-execute-many.
   We do the analogous thing with our physical plan: compile a query into a
@@ -214,10 +217,11 @@ scaling, recursion has stack-depth caveats.
 
 ### What we deliberately reject
 
-- **Feldera's compile-to-Rust model**. Too operationally painful for a
-  service. Instead we interpret a fixed physical plan at runtime; the inner
-  loop is still fast because expression evaluation runs through DataFusion's
-  vectorized JIT-able executor.
+- **Feldera's generated-Rust artifact as the primary deployment model**.
+  Feldera's compiler can serialize circuits as Rust and its DBSP runtime is
+  dynamic enough to construct circuits programmatically. RockStream chooses a
+  fixed interpreted `OpKind` graph for operational simplicity; code generation
+  may be added later for hot paths, but is not required for v1.
 - **pg_trickle's SQL-string-as-runtime model**. Re-parsing and re-planning a
   giant `WITH` chain on every refresh would be silly when we control the
   whole stack. We *generate* the equivalent operator graph at compile time
@@ -264,8 +268,9 @@ scaling, recursion has stack-depth caveats.
               │   • Each task owns an Arc<ShardDb>      │
               │   • Each task consumes input batches    │
               │     and produces output batches         │
-              │   • Per-epoch atomic WriteBatch commits │
-              │     state + output deltas + frontier    │
+              │   • Shard-level epoch coordinator       │
+              │     coalesces operator mutations into   │
+              │     atomic WriteBatch commits           │
               │  Exchange dispatcher (gRPC + S3)         │
               │  Frontier reporter → control plane       │
               └─────────────────────────────────────────┘
@@ -323,6 +328,7 @@ pub enum PlanNode {
         right:       Box<PlanNode>,
         left_arrangement:  ArrangementId,  // join_key → left rows
         right_arrangement: ArrangementId,  // join_key → right rows
+        semantics: JoinSemantics,          // EC-01/Q07/Q21 metadata
     },
     OuterJoin { side: JoinSide, /* ... */ },
     SemiJoin  { /* ... */ },
@@ -366,6 +372,7 @@ pub enum PlanNode {
         base:      Box<PlanNode>,
         step:      Box<PlanNode>,          // contains RecursiveSelfRef nodes
         result_arrangement: ArrangementId,
+      strategy:  RecursionStrategy,      // SemiNaive | DRed | Recompute
     },
     RecursiveSelfRef { id: RecursionId, schema: SchemaRef },
 
@@ -393,23 +400,31 @@ pub enum PlanNode {
   the operator's semantics: join keys, group-by keys, …). The distribution
   pass inserts `Exchange` whenever a child's `partition_key` differs from
   the parent's required key.
+- Stateful nodes carry **semantic annotations** computed once by the compiler:
+  monotonicity, whether they are inside SemiJoin/AntiJoin context, join depth,
+  whether an update changes key columns or only aggregate arguments, whether a
+  recursive term is non-monotone, and whether an operator is safe for immediate
+  row-exclusive maintenance. These annotations prevent every worker from
+  re-deriving subtle pg_trickle-style context locally.
 
 ---
 
 ## 6. The Differentiation Pass
 
-The differentiation pass is the heart of IVM. It is **directly modelled on
-pg_trickle's `DiffContext`**, but instead of emitting SQL CTEs it emits
-**runtime operator descriptors** plus, for debugging, an equivalent SQL
-representation.
+The differentiation pass is the heart of IVM. It is **informed by
+pg_trickle's `DiffContext`** but emits native DBSP operator descriptors, not a
+SQL CTE plan. A debug/explain mode may emit a SQL sketch for comparison, but
+that SQL is not the runtime implementation.
 
 ```rust
 pub struct DiffCtx<'a> {
     plan: &'a PlanNode,
     arrangements: ArrangementRegistry,
     inside_semijoin: bool,
+  join_context: JoinContext,
+  key_change_tracker: KeyChangeTracker,
     in_recursion: Option<RecursionId>,
-    // ... (mirror pg_trickle's DiffContext)
+  // ... (keep only the pg_trickle context that affects native semantics)
 }
 
 pub fn differentiate(plan: PlanNode) -> Result<PhysicalPlan> {
@@ -458,13 +473,17 @@ The runtime is just an interpreter for `OpKind`. Compilation is one-time; the
 op graph is durable in the control-plane SlateDB and is what each worker
 loads at startup.
 
+`OpKind` is static and closed over the native runtime implementations. It may
+store DataFusion physical expressions and planner annotations, but it must not
+store SQL strings that are re-parsed per epoch.
+
 ---
 
 ## 7. Per-Operator Differentiation Rules
 
-We adopt pg_trickle's rules verbatim (they are themselves an implementation
-of the DBSP calculus + practical corrections). Each rule below references
-the source file where pg_trickle implements it for traceability.
+We implement DBSP-native operators and validate them against pg_trickle's SQL
+rules. Each rule below references the source file where pg_trickle implements
+the equivalent behavior for traceability and test-case extraction.
 
 ### 7.1 Scan (`diff_scan`, [`pg-trickle1/src/dvm/operators/scan.rs`](../pg-trickle1/src/dvm/operators/scan.rs))
 
@@ -489,8 +508,10 @@ DataFusion's physical expression evaluator. No arrangement needed.
          = ΔL_I ⋈ R₁  +  ΔL_D ⋈ R₀  +  L₀ ⋈ ΔR
 ```
 
-pg_trickle documents three correctness fixes (EC-01, Q07 double-counting,
-Q21 SemiJoin regression). We adopt the corrected algorithm.
+pg_trickle documents several correctness fixes (EC-01, Q07 double-counting,
+Q21 SemiJoin regression). RockStream must preserve the semantics of these
+fixes, but the native implementation uses versioned/staged arrangements rather
+than SQL `EXCEPT ALL` subqueries.
 
 **RockStream runtime**:
 - Two arrangements: `left_arr[op_id][join_key] → left rows`, symmetric for
@@ -506,6 +527,25 @@ Q21 SemiJoin regression). We adopt the corrected algorithm.
   Symmetric handling of left/right deltas in the same epoch is done by
   staging both sides' updates in memory before either commit; the operator
   computes `ΔL ⋈ ΔR` once at the end.
+- `JoinSemantics` records whether the join is inside SemiJoin/AntiJoin context,
+  whether either child is itself a join, and whether correction output must be
+  produced by this node or an ancestor. This is the native replacement for
+  pg_trickle's `inside_semijoin`, `is_join_child`, and Part-3 generation logic.
+
+**Planner optimizations adopted from pg_trickle** (each is implemented as
+planner metadata on the native join, not as SQL CTE rewriting):
+
+- **SemiJoin `R_old` materialization** (Q21 fix): when a SemiJoin's right side
+  is itself a join, mark the right-side arrangement as "materialize across
+  iterations of this epoch" so it is computed once per epoch instead of once
+  per EXISTS check. Driven by `JoinSemantics::r_old_materialize`.
+- **DI-6 equi-join key filter pushdown**: when computing the right-side
+  pre-change view for a SemiJoin or AntiJoin, restrict it to join keys that
+  appear in either delta side. Implemented as a key-set filter on the
+  arrangement scan, not as a SQL `WHERE` rewrite.
+- **Merge-safe dedup**: when the operator chain above a Scan-Filter-Project
+  contains no join/aggregate/distinct, the planner sets `merge_safe_dedup =
+  true` so the sink can skip the deduplication sort.
 
 ### 7.4 Outer Joins (LEFT / RIGHT / FULL)
 
@@ -539,6 +579,10 @@ Two categories:
   - value changed → `(old_value, -1) ⊎ (new_value, +1)`.
 - For SUM, the cache of last-emitted value lives in a sibling key
   (`op_index/`), so we know what to retract.
+- The compiler propagates key-change and value-change metadata from scans
+  through projections and joins. This is required to distinguish value-only
+  updates from group-key or join-key updates, mirroring pg_trickle's
+  `has_key_changed` signal.
 
 **Non-invertible** (MIN, MAX, MEDIAN, PERCENTILE):
 - Maintain a sorted indexed multiset per group:
@@ -559,7 +603,10 @@ fallback (read the current arrangement and re-aggregate that group).
 - Emit output delta when weight transitions across zero:
   - 0 → positive: emit `(row, +1)`.
   - positive → 0: emit `(row, -1)`.
-- Compaction filter drops keys with weight 0.
+- The operator writes an explicit tombstone for zero-crossing entries when the
+  row must disappear immediately. Compaction filters are only used later to
+  remove obsolete merge operands after the frontier proves no snapshot can need
+  them.
 
 ### 7.8 Intersect / Except (`intersect.rs`, `except.rs`)
 
@@ -583,8 +630,9 @@ is an optimization added later.
 
 ### 7.10 Time Windows
 
-Same as DESIGN.md §6.9: state keyed by `window_id`, with event-time TTL and
-a compaction filter that drops state past the input watermark.
+Same as DESIGN.md §6.9: state keyed by `window_id`, with event-time TTL and a
+frontier-aware compaction filter. TTL alone is not a correctness rule; the
+operator also checks input/output frontiers before state becomes reclaimable.
 
 ### 7.11 Top-K (`detect_topk_pattern` in pg_trickle)
 
@@ -627,7 +675,8 @@ pub trait Operator: Send + Sync {
     ///
     /// Inputs are received via the OpInputs handle (one queue per input port).
     /// Output deltas + state mutations are accumulated in EpochOutput.
-    /// At end of epoch, the runtime commits EpochOutput atomically.
+    /// At end of epoch, the shard-level epoch coordinator commits outputs from
+    /// all ready operators on the shard in one or more coalesced WriteBatches.
     async fn process_epoch(
         &mut self,
         epoch:  Epoch,
@@ -668,6 +717,7 @@ struct OperatorTask {
     inputs:  HashMap<InputPort, mpsc::Receiver<EpochBatch>>,
     outputs: HashMap<OutputPort, BroadcastSender<EpochBatch>>,
     shard:   Arc<ShardDb>,
+    commit_tx: mpsc::Sender<ShardCommitFragment>,
 }
 
 async fn run(self) {
@@ -676,10 +726,11 @@ async fn run(self) {
         let mut inputs = OpInputs::collect(&mut self.inputs, epoch).await;
         let output = self.op.process_epoch(epoch, &mut inputs, &mut self.ctx).await?;
 
-        // Single atomic commit: state + outputs + frontier
-        self.shard.commit_epoch(epoch, &output).await?;
+        // Send mutations to the shard-level epoch coordinator. The coordinator
+        // coalesces all ready operators' fragments into WriteBatch commits.
+        self.commit_tx.send(ShardCommitFragment::new(self.op.id(), epoch, output)).await?;
 
-        // Distribute outputs (locally via channels, cross-shard via Exchange)
+        // Distribute outputs after the commit coordinator confirms durability.
         for (port, batch) in output.deltas {
             self.outputs[&port].broadcast(EpochBatch { epoch, batch })?;
         }
@@ -687,7 +738,9 @@ async fn run(self) {
 }
 ```
 
-This is **Feldera's circuit-runtime model** adapted to async tasks and SlateDB.
+This is **Feldera's circuit-runtime model** adapted to async tasks and SlateDB,
+with shard-level group commit added to avoid one object-store/WAL durability
+event per operator per epoch.
 
 ### 8.3 Code Generation vs. Interpretation
 
@@ -746,8 +799,13 @@ applied lazily during reads and compactions — exactly the property that
 makes high-throughput aggregations practical on an LSM.
 
 Concretely, our `AggregateMergeOp` decodes both operands as `(sum, count)`
-tuples and emits their sum. For distinct/union, the merge is just `i64`
-addition.
+tuples and emits their sum. For distinct/union, the merge is `i64` addition,
+but a zero-crossing must still be materialized as a visible delete/tombstone if
+readers need the row to disappear immediately.
+
+Merge operators are only used for associative state. MIN/MAX, Top-K, window
+rankings, and recursive DRed state are maintained as explicit sorted
+arrangements because their retractions require reading sibling entries.
 
 ### 9.4 Arrangement Lookups Are Always SlateDB `scan()` or `get()`
 
@@ -757,6 +815,22 @@ addition.
 - Range scan: same pattern.
 - Cross-shard lookup is forbidden in the hot path; if needed, the operator
   must be preceded by an Exchange so the data is co-located.
+
+### 9.5 Segments, Retention, and Cleanup
+
+Each shard should be created with a SlateDB segment extractor keyed by namespace
+and arrangement prefix. Segmenting keeps large join arrangements, shuffle
+buffers, and view outputs from sharing one undifferentiated compaction policy.
+
+RockStream does not rely on SlateDB range deletion. Cleanup is expressed as:
+
+- explicit point deletes/tombstones for correctness-sensitive zero-crossings;
+- bounded prefix scan + batched deletes for shuffle and migration cleanup;
+- frontier-aware compaction filters for old merge operands or expired windows;
+- checkpoint/clone/projection for large rebalancing jobs.
+
+Compaction filters must honor `retention_min_seq`/frontier constraints and must
+avoid `Drop` decisions that could resurrect older versions of the same key.
 
 ---
 
@@ -779,27 +853,42 @@ loop {
     let futures = ready.into_iter().map(|op| op.process_epoch(self.current_epoch));
     let outputs = join_all(futures).await;
     
-    // Commit each operator's epoch atomically
-    for output in outputs {
-        op.shard.commit_epoch(self.current_epoch, output).await?;
-    }
+    // Coalesce ready operators' outputs by shard and commit as grouped batches.
+    self.shard_commit_coordinator.commit(self.current_epoch, outputs).await?;
     
     self.current_epoch += 1;
 }
 ```
 
+The scheduler is intentionally **async and ownership-free**. Feldera's
+`DynamicScheduler` (see `crates/dbsp/src/circuit/schedule.rs`) tracks
+stream ownership and rejects topologies with `OwnershipConflict` so it can
+statically choose owned-vs-borrowed reads. That model is right for a single
+worker process; in a distributed shard mesh, the same logical stream is
+consumed from many shards and many query gateways. RockStream therefore
+does not enforce single-ownership of streams. Operators consume from
+arrangements via `DbReader` (which is multi-reader by construction) and
+receive data via the Exchange subsystem, which makes "ownership" a
+non-question.
+
 ### 10.2 Stream-Level Cadence (Inspired by pg_trickle's DAG)
 
 pg_trickle exposes per-stream-table schedules (`1s`, `100ms`, `IMMEDIATE`,
-`CALCULATED`). RockStream provides the same:
+`CALCULATED`). RockStream keeps the cadence idea but changes the defaults:
 
-- **IMMEDIATE**: synchronous — the source connector's commit triggers the
-  pipeline to drain to the relevant view sink before the source ACKs. Used
-  for transactional read-your-writes consistency.
+- **DEFERRED LOW-LATENCY** (default): source connectors close frequent epochs
+  (for example 10-100 ms) and the runtime drains them through the circuit.
+  This preserves scale without distributed source-transaction coupling.
+- **IMMEDIATE** (restricted): supported only for simple, single-shard scan
+  chains unless a future distributed lock manager is added. pg_trickle's
+  transition-table mode and lock inference are valuable references, but a
+  cluster-wide transactional immediate mode would fight RockStream's scaling
+  goal.
 - **PERIODIC(d)**: produce one epoch per `d` ms; batches incoming data into
   that window for higher throughput.
 - **CALCULATED**: a downstream's cadence is the min of its consumer-facing
-  views' cadences. Pulled from pg_trickle's demand-driven model verbatim.
+  views' cadences. This preserves pg_trickle's demand-driven scheduling idea
+  while using RockStream frontiers for distributed consistency.
 
 The cadence is enforced by the source connector (it decides when to close an
 epoch and emit the deltas).
@@ -813,11 +902,29 @@ groups them in a SAVEPOINT. We achieve the same via the frontier protocol:
 the join operator waits for both inputs' frontiers to reach the same epoch
 before processing.
 
+### 10.4 Per-Shard Adaptive Cost Model
+
+pg_trickle's adaptive model (B-4) chooses between FULL recomputation and
+DIFFERENTIAL refresh by measuring `avg_ms_per_delta` against `avg_ms_per_full`.
+RockStream lifts this decision **to the shard**, not the cluster:
+
+- Each shard records local `ms_per_delta` and `ms_per_full` exponentially
+  weighted moving averages per operator.
+- The shard-local planner picks DIFFERENTIAL when its own EWMA says so;
+  otherwise it requests a snapshot rebuild for its partition only.
+- A hot shard can recompute while sibling shards continue with deltas. The
+  rebuilt shard publishes a frontier discontinuity that downstream operators
+  handle the same way they handle a backfill (§12).
+
+This avoids the centralized-scheduler assumption baked into pg_trickle and
+matches the per-shard autonomy that the rest of the design depends on.
+
 ---
 
 ## 11. Recursion (`WITH RECURSIVE`)
 
-Adopted from Feldera's `IterativeCircuit`:
+The runtime shape is adopted from Feldera's `IterativeCircuit`, with the
+strategy selection lessons from pg_trickle:
 
 ```
 Recursive {
@@ -827,7 +934,16 @@ Recursive {
 }
 ```
 
-At runtime:
+The compiler first classifies the recursive query:
+
+- **Monotone + insert-only delta**: semi-naive incremental propagation.
+- **Monotone + mixed insert/delete/update delta**: DRed (delete-and-rederive).
+- **Non-monotone term** (`EXCEPT`, aggregate, distinct, window, intersect, or
+  unsupported multiple self-reference): full recomputation fallback.
+- **Column mismatch between recursive CTE and stored output**: full
+  recomputation fallback.
+
+At runtime for the semi-naive path:
 
 ```
 // Outer time: source_epoch (advancing once per ingestion epoch)
@@ -849,11 +965,48 @@ loop {
 // after the inner loop converges.
 ```
 
-Convergence detection is **automatic via the frontier protocol** — the inner
-loop terminates when the change distinct-collapses to empty.
+Convergence detection uses both data and progress: the inner loop terminates
+when the change distinct-collapses to empty and the inner frontier can advance.
+Every recursive operator also has a configured maximum iteration count and a
+frontier-stall alarm; exceeding either fails the epoch conservatively instead
+of looping forever.
 
 This is the same model Feldera uses (`crates/dbsp/src/operator/recursive.rs`,
-`IterativeCircuit`, `Z1`); we just rebuild it for our async runtime.
+`IterativeCircuit`, `Z1`), extended with pg_trickle's practical DRed and
+recomputation fallback rules.
+
+### 11.1 Distributed Recursion
+
+Feldera's `IterativeCircuit` is **local to one worker** — the inner loop
+runs on a single thread with shared in-process state. RockStream allows the
+recursive scope to span shards by lifting two pieces into the distributed
+layer:
+
+1. **`Exchange` operators inside the recursive scope.** Each inner iteration
+   can re-partition data on a different key, so `Arr` itself is sharded.
+   The exchange runs once per iteration; backpressure is the normal
+   credit-based mechanism.
+2. **Per-iteration inner frontier.** The `Timestamp::iteration` component is
+   aggregated across shards by the same frontier aggregator that handles
+   source epochs. Convergence is declared when the cluster-level inner
+   frontier stops advancing and every participating shard reports an empty
+   delta for that iteration. There is no synchronous global barrier; the
+   exit condition is observed via frontier progress.
+
+Distributed recursion has additional safety controls beyond single-worker
+recursion:
+
+- **Max-iteration cap** per recursion node fails the epoch if exceeded.
+- **Inner-frontier stall timeout** fails the epoch if the inner frontier
+  fails to advance for a configured wall-clock window (catches dead shards
+  inside the loop).
+- **Per-shard cost guard**: if any shard's iteration cost spikes beyond a
+  multiple of the cluster median, the planner falls back to recomputation on
+  that shard.
+
+Non-monotone recursion (EXCEPT, aggregate, distinct, window, intersect in the
+recursive term) always falls back to `RecursionStrategy::Recompute`, exactly
+as pg_trickle's `recursive_cte.rs` does.
 
 ---
 
@@ -907,8 +1060,12 @@ This expands [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) Phases 2 and 3
   no joins, no aggregates.
 - Implement `differentiate` for Source / Filter / Project / Map (trivial —
   these are linear).
-- Implement `Operator` trait + `OperatorTask` + `Circuit` runtime.
+- Implement `Operator` trait + `OperatorTask` + `Circuit` runtime + shard-level
+  epoch commit coordinator.
 - Hard-code a single-shard runtime (no Exchange) for now.
+- Implement `ShardDb` with SlateDB `WriteBatch`, `DbReader`, checkpoints,
+  WAL reader smoke tests, segment extractor configuration, and explicit
+  scan-and-delete cleanup helpers.
 - Source connector that feeds a `Vec<RecordBatch>` as delta batches.
 - View sink that writes Arrow-encoded rows to `view_output/`.
 - **Reference oracle**: implement a brute-force "compute the view from
@@ -940,25 +1097,31 @@ This expands [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) Phases 2 and 3
 - Add `InnerJoin` PlanNode.
 - Distribution pass: insert `Exchange` whenever the join key differs from the
   child's partition key. (No-op in single-shard mode; just placeholder.)
-- Implement two-arrangement join with the corrected bilinear expansion
-  (EC-01 fix, Q07 correction). Port the rule literally from
-  [`pg-trickle1/src/dvm/operators/join.rs`](../pg-trickle1/src/dvm/operators/join.rs).
+- Implement two-arrangement DBSP join with staged pre-change/current-change
+  state and correction metadata derived from
+  [`pg-trickle1/src/dvm/operators/join.rs`](../pg-trickle1/src/dvm/operators/join.rs)
+  (EC-01 fix, Q07 correction, Q21 SemiJoin context).
+- Add `JoinSemantics` metadata: inside-semi/anti context, child join depth,
+  pre-change snapshot mode, key-change tracking, and correction ownership.
 - Property test: 3-way join against oracle.
 - Run TPC-H Q1 (filter+aggregate), Q3 (joins+agg), Q5 (5-way join).
 
 ### Milestone IVM-5: Outer / Semi / Anti Joins
 
 - Add OuterJoin / SemiJoin / AntiJoin variants.
-- Port pg_trickle's implementations
+- Implement DBSP-native operators and validate against pg_trickle's implementations
   ([`outer_join.rs`](../pg-trickle1/src/dvm/operators/outer_join.rs),
   [`semi_join.rs`](../pg-trickle1/src/dvm/operators/semi_join.rs),
   [`anti_join.rs`](../pg-trickle1/src/dvm/operators/anti_join.rs)).
+- Track matched/unmatched side state explicitly so NULL-padding transitions
+  emit retractions and insertions deterministically.
 - Run TPC-H Q11, Q21 (notorious for SemiJoin corner cases).
 
 ### Milestone IVM-6: Distinct / Union / Intersect / Except
 
 - Implement weight-based arrangement with merge.
-- Compaction filter dropping zero-weight entries.
+- Explicit deletes/tombstones for zero-crossing entries; optional
+  frontier-aware compaction filter only after snapshot-safety audit.
 - Property tests on set semantics.
 
 ### Milestone IVM-7: Window Functions
@@ -971,12 +1134,17 @@ This expands [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) Phases 2 and 3
 
 - TUMBLE, HOP, SESSION windows.
 - Event-time TTL on arrangement entries.
-- Compaction filter against input watermark.
+- Frontier-aware compaction filter against input/output frontiers; TTL is a
+  retention hint, not the correctness rule.
 
 ### Milestone IVM-9: Recursion
 
 - Implement `Recursive` operator with nested-time scheduling.
-- Convergence detection via inner frontier.
+- Compiler classification: semi-naive for monotone insert-only recursion,
+  DRed for monotone mixed changes, recomputation fallback for non-monotone or
+  unsupported recursive terms.
+- Convergence detection via inner frontier + empty distinct delta; add maximum
+  iteration and frontier-stall safeguards.
 - Test: transitive closure on a 1M-edge graph; recursive employee hierarchy.
 
 ### Milestone IVM-10: Bootstrap & Snapshot Mode
@@ -989,8 +1157,8 @@ This expands [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) Phases 2 and 3
 ### Milestone IVM-11: View-on-View (DAG)
 
 - Implement `ViewRef` PlanNode that subscribes to an upstream view's CDC.
-- Port pg_trickle's DAG model with cadence propagation and diamond
-  consistency groups.
+- Model pg_trickle's DAG semantics with native frontier coordination: cadence
+  propagation, diamond consistency groups, and cycle rejection.
 - Test: 5-level chain of views; each one is delta-driven by its parent.
 
 ### Milestone IVM-12: Lateral / Set-Returning Functions
@@ -1000,11 +1168,14 @@ This expands [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) Phases 2 and 3
 
 ### Milestone IVM-13: Correctness Soak
 
-- Run the full pg_trickle TPC-H test suite (22 queries, ported) on
+- Run the adapted pg_trickle TPC-H test suite (22 queries) on
   RockStream and compare results to a non-incremental reference.
 - Run Nexmark for streaming-specific patterns.
 - Random query-fuzz harness: generate random SQL, run incremental vs.
   batch, compare.
+- Storage validation: prove no milestone relies on SlateDB range deletion;
+  audit every compaction filter for snapshot safety; benchmark shard-level
+  group commit against per-operator commit.
 
 After IVM-13, the IVM engine is feature-complete for single-shard. Phase 4
 of [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) (Multi-Shard & Exchange)
@@ -1057,11 +1228,12 @@ Two "ground truth" reference engines:
 
 ### 14.3 TPC-H Conformance
 
-Port pg_trickle's TPC-H test suite (22 queries, 3 modes — they have it at
-SF=0.01). Required to pass:
+Adapt pg_trickle's TPC-H test suite (22 queries, 3 modes in the reference suite
+at SF=0.01). Required to pass:
 - 22 / 22 queries produce identical results to DataFusion batch.
-- All produce identical results across DIFFERENTIAL, IMMEDIATE, snapshot
-  bootstrap.
+- All produce identical results across deferred differential mode and snapshot
+  bootstrap. Restricted IMMEDIATE mode is tested separately only for eligible
+  single-shard plans.
 - ≥ 10× speedup over batch at 1% change rate.
 
 ### 14.4 Determinism Tests (DST-style)
@@ -1103,11 +1275,10 @@ output across runs.
    arrangements are mostly point-accessed. Benchmark in Phase 3.
 
 5. **Materialize-style compaction of arrangements?**
-   Materialize aggressively compacts its arrangements past the consumer
-   frontier (drops historical versions no one will query). We get
-   approximately this for free via SlateDB compaction + the
-   weight-zero-drop compaction filter — but it's worth measuring whether we
-   need active arrangement consolidation.
+  Materialize aggressively compacts its arrangements past the consumer
+  frontier (drops historical versions no one will query). SlateDB compaction
+  filters can help only after a snapshot-safety proof; we may still need
+  active arrangement consolidation for long-running queries.
 
 These are explicitly open and will be answered with prototypes during
 Milestones IVM-1 through IVM-5.
