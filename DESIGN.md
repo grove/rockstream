@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.4. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.5. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -40,6 +40,14 @@ object storage.
 > alignment, shard-level checkpointing, shuffle fan-out limits, query freshness
 > tokens, backfill/recovery lifecycle states, and the production storage
 > profiles needed for predictable operation.
+>
+> **v3.5 fills the remaining design gaps**: authentication and authorization,
+> source statistics and cost-model inputs for `EXPLAIN ESTIMATE`, cluster
+> bootstrap and worker discovery, storage format versioning and rolling
+> upgrades, late-data policy connected to the frontier model, fault-driven
+> shard-state recovery path, the adaptive scheduling loop replaced with a
+> concrete source-rate throttle loop, and multi-region added as an explicit
+> non-goal.
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -118,6 +126,13 @@ attempting them would compromise the rest of the design:
   do not synthesize a cluster-wide sequence on top of it.
 - **Loading or linking pg_trickle / Feldera at runtime.** Neither is a Cargo
   dependency. They are reference material and test oracles only.
+- **Active-active multi-region writes.** The single-writer fence per shard is
+  a hard constraint against concurrent writers in different regions. Multi-region
+  active-passive (read replicas via `DbReader` on a cross-region object-store
+  bucket) is future work, not v1.
+- **Per-query cost accounting ($/query) in the hot path.** Cost visibility in
+  `EXPLAIN ESTIMATE` is a design goal; per-query billing middleware and
+  chargeback to tenants is an application-layer concern out of scope.
 
 ---
 
@@ -254,6 +269,24 @@ A worker is a process (typically one per host or container). It:
 - Maintains a network port for shuffle send/receive.
 - Reports frontiers and metrics to the control plane.
 
+### Cluster Bootstrap and Worker Discovery
+
+The control-plane address is passed as `--control=<url>` (or `ROCKSTREAM_CONTROL_URL`
+in the environment). Workers join by calling `control.register(worker_id, addr,
+capacity)` on startup; the control plane adds them to `topology/worker/` and begins
+assigning shards. No pre-configured member list is required beyond the control URL.
+
+For Tier 3 Raft bootstrap, the first control node starts with
+`rockstream start --role=control --bootstrap --storage=s3://...`. Subsequent
+control nodes start without `--bootstrap` and join the Raft group via the same
+control URL. Once a quorum of control nodes is formed, the Raft leader opens the
+control SlateDB for writing and the cluster is ready to accept workers.
+
+Network security: all inter-node gRPC (worker↔control, worker↔worker, gateway↔worker)
+and the public SQL port must use **mutual TLS (mTLS)**. Certificate rotation is handled
+out-of-band; the control plane enforces that every worker presents a valid certificate
+before being admitted into `topology/worker/`.
+
 ---
 
 ## 4. SQL Compilation Pipeline
@@ -301,6 +334,28 @@ SQL text
      • Workers materialize empty operator state on their SlateDB shards
      • Connectors start feeding source operators
 ```
+
+### 4.0 Source Statistics and Cost-Model Inputs
+
+Step [5] (distribution pass) and `EXPLAIN INCREMENTAL ESTIMATE` both require
+cardinality estimates. The planner obtains them in priority order:
+
+1. **Connector-reported statistics**: connectors expose `discover_stats()`
+   returning `{row_count, avg_row_bytes, key_cardinality, update_rate_per_s}`
+   after `discover_schema()`. Kafka connectors count committed offsets; Postgres
+   CDC connectors read `pg_class.reltuples`; S3/Parquet connectors read footer
+   metadata.
+2. **Cached catalog statistics**: the control plane stores the last-known stats
+   in `control: catalog/table/{id}/stats`, refreshed on each connector attach
+   and on `ANALYZE TABLE <name>`.
+3. **Heuristic fallback**: when neither is available, the planner uses
+   configurable defaults (`default_row_count = 1_000_000`,
+   `default_update_rate = 1000/s`) and marks the estimate as
+   `confidence=low` in `EXPLAIN INCREMENTAL ESTIMATE` output.
+
+Estimate accuracy is tracked over time: after 60 s of operation the real metrics
+feed back into the catalog stats, and `EXPLAIN INCREMENTAL` shows both the
+original estimate and the observed values side-by-side.
 
 ### Why DataFusion (not Calcite)
 
@@ -459,7 +514,26 @@ things to discover at runtime:
   state owned by another shard use `DbReader` pinned to a published
   checkpoint, never an undefined "live" read.
 
-### 5.5 Storage Profiles and Autotuner Defaults
+### 5.5 Storage Format Versioning and Rolling Upgrades
+
+Every shard carries a one-byte format version at a fixed key
+(`shard_meta/0x06 0xFV`). The current format is **version 1**.
+
+Compatibility rules:
+- A binary that supports format versions `[min, max]` will refuse to open a
+  shard whose stored version is outside that range, printing `RS-5001`.
+- New binaries must support at least the previous format version to enable
+  rolling upgrades (one worker restarted at a time).
+- Breaking format changes require a bump to the version and a migration tool
+  (`rockstream migrate --from=N --to=M --storage=s3://...`) that writes the new
+  format offline before the new binary is deployed.
+
+Rolling upgrade procedure: (1) deploy new binary to one worker; (2) verify it
+acquires its shards and processes epochs; (3) roll forward. The control plane
+rejects shard-lease acquisition from a binary whose supported version range does
+not overlap the shards' stored version, preventing silent data corruption.
+
+### 5.6 Storage Profiles and Autotuner Defaults
 
 The same binary supports two storage profiles with different default budgets:
 
@@ -626,6 +700,20 @@ full recomputation. See [IVM.md §11](IVM.md#11-recursion-with-recursive).
 SlateDB **TTL** based on event-time-derived deadlines and a frontier-aware
 compaction filter. The filter is only allowed to remove data older than both
 the event-time expiry and the relevant input/output frontiers.
+
+**Late-data policy.** A row is *late* for window `W` if its event-time falls
+below the operator's current input frontier minus `allowed_lateness`. Per
+pipeline or per time-window operator, the operator declares:
+
+| Policy | Behaviour |
+|---|---|
+| `drop` | Late rows are silently discarded before reaching the window operator. |
+| `update` | Late rows are applied to the window arrangement if it has not yet been garbage-collected; the window emits a corrected delta. |
+| `route_to_sink` | Late rows are forwarded to a designated dead-letter sink connector with the original event-time preserved. |
+
+The `allowed_lateness` budget is a duration attached to the time-window operator;
+default is 0 (no late data accepted). It is surfaced in `EXPLAIN INCREMENTAL` and
+counted as `connector_late_rows_total` in metrics.
 
 ### 6.10 Top-K
 
@@ -910,6 +998,17 @@ If a worker dies, its shards are re-leased to another worker. SlateDB's
 single-writer enforcement (via the manifest fence epoch) prevents split-brain:
 the old writer cannot commit after a new writer opens the same shard.
 
+State transfer on fault-driven reassignment differs from proactive rebalancing:
+there is no live donor to create a targeted checkpoint. Instead, the new worker
+obtains state by opening each shard's SlateDB directly (no snapshot needed —
+the shard's last durably committed epoch is already in the WAL). The new writer
+replays any WAL entries beyond the last manifest checkpoint, then resumes
+processing from the recovered epoch frontier. Recovery latency is bounded by
+the last shard checkpoint age (`checkpoint_age_seconds`), not by live data
+transfer. Proactive rebalancing (§10.2) uses checkpoint-based migration;
+fault-driven reassignment uses WAL replay. Both paths surface the pipeline as
+`RECOVERING` until the frontier catches up.
+
 ### 10.5 Per-Operator Parallelism
 
 Operator parallelism is independent of the cluster's shard count. A small
@@ -1024,6 +1123,9 @@ whether to retry against a fresher one.
 
 Clients can subscribe to a view's change stream. Implemented by tailing the
 shard's `WalReader` filtered to `view_output/` for the requested view-id prefix.
+Subscription connections are authenticated via the same token/certificate checked
+by the gateway (§12.5); the gateway proxies the subscription rather than exposing
+raw shard access to clients.
 
 ### 12.4 Freshness Tokens and Read-Your-Writes
 
@@ -1041,6 +1143,35 @@ frontier dominates the requested source epoch or until a caller-supplied
 timeout expires. The query result then explicitly says whether the token was
 satisfied. This gives application developers a simple contract without
 exposing antichains in the default path.
+
+### 12.5 Authentication and Authorization
+
+All external interfaces (SQL port, gRPC subscribe, REST/HTTP) enforce the same
+auth layer:
+
+- **Authentication**: bearer tokens (JWTs signed by a configurable OIDC
+  issuer) or mutual TLS client certificates. Tier 1 (`--auth=off`) skips auth
+  for local development.
+- **Authorization**: per-resource RBAC stored in the control-plane catalog
+  (`catalog/acl/`). Principals are identified by the JWT `sub` or certificate
+  CN. Default roles:
+
+| Role | Can do |
+|---|---|
+| `viewer` | `SELECT` from granted views; subscribe to granted views. |
+| `pipeline_owner` | Deploy, alter, pause, resume, drop pipelines they own; all viewer rights on owned pipelines. |
+| `admin` | Everything, including granting roles and viewing all audit-log entries. |
+
+- **Multi-tenancy isolation**: pipelines are namespaced by `tenant_id`. A
+  principal with `pipeline_owner` on tenant A cannot see or affect tenant B's
+  pipelines. Quota enforcement (§14.13) is per-pipeline, so tenants cannot
+  starve each other by default.
+- **Audit trail**: every query, subscription, deploy, and alter carries the
+  authenticated principal as the `actor` in the audit log (§14.11).
+
+`rockstream` CLI uses the same OIDC token flow (`rockstream login`) or a
+service-account key file. Unauthenticated requests are rejected at the gateway
+before they reach any shard or control-plane write path.
 
 ---
 
@@ -1213,7 +1344,7 @@ manual control.
 |---|---|---|---|
 | **Adaptive parallelism** | `operator.*.parallelism` | Operator `epoch_ms` p95 trends above SLO budget for > 30 s | `min_parallelism` ≤ N ≤ `max_parallelism` (per pipeline) |
 | **Adaptive epoch sizing** | `min_epoch_ms`, `max_epoch_ms` | Object-store write rate trends above quota, or SLO compliance < target | Floor: 10 ms; ceiling: 5 s |
-| **Adaptive scheduling** | Per-operator credit allocation | Backpressure detected at a downstream operator | Cooperative; never preempts |
+| **Adaptive source throttle** | Per-connector `max_poll_bytes_per_epoch` | `frontier_lag_ms` trends above `freshness_target_ms * 1.5` for > 20 s, indicating ingestion is outpacing processing | Minimum 1 row/epoch; maximum = connector's native batch ceiling |
 
 Every adjustment is recorded in the audit log (§14.11) with the metric
 reading that triggered it. Operators see *what the system decided and why*,
@@ -1403,8 +1534,8 @@ Every shard, operator instance, and pipeline reports:
 - `pipeline_slo_compliance` — the primary indicator (§14.4).
 - `pipeline_degraded_reason` — label when below 1.0 (§14.10).
 - `frontier_lag_ms` — raw lag, per pipeline.
-- `backfill_progress` — fraction of initial snapshot consumed.
-- `recovery_progress` — fraction of shards/operators caught up after restart.
+- `backfill_progress` — for snapshot-mode connectors: `offsets_consumed / snapshot_end_offset` (both reported by the connector's `discover_stats()`). Undefined (omitted) for live-only connectors with no snapshot boundary.
+- `recovery_progress` — fraction of shards whose recovered epoch frontier ≥ the cluster checkpoint epoch.
 - `rows_in_per_sec`, `rows_out_per_sec` — throughput.
 - `epoch_ms` — per operator, processing time per epoch.
 - `op_state_bytes`, `op_state_rows` — arrangement size.

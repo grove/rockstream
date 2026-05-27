@@ -286,6 +286,12 @@ join queries written as plain SQL.
   *without* deploying; reports predicted state size, per-operator
   `epoch_ms`, object-store request rate, and minimum achievable frontier
   lag. Estimation accuracy is tracked over time on the TPC-H suite.
+  Estimates are labelled `confidence=low` when only heuristic fallback stats
+  are available (DESIGN.md §4.0).
+- **Source statistics pipeline**: `discover_stats()` wired for Kafka (commit
+  offsets) and Postgres CDC (`pg_class.reltuples`) connectors; stats cached in
+  `catalog/table/{id}/stats`; live metrics feed back after 60 s of operation;
+  `ANALYZE TABLE` command refreshes on demand (DESIGN.md §4.0).
 - **`CREATE PIPELINE … WITH (…)`** SQL grammar parses `freshness_target_ms`,
   `state_budget_gb`, `object_store_rps`, `priority`, `max_parallelism`,
   `max_shards`. Values are stored in catalog; enforcement lands in Phase 3
@@ -739,8 +745,16 @@ production-ready.
 - **Freshness tokens**: query responses return the vector frontier used;
   clients can pass `wait_for=<token>` for read-your-writes semantics with a
   timeout and explicit satisfied/not-satisfied response.
-- **Authentication / authorization**: pluggable auth (initially: bearer
-  tokens); per-view RBAC.
+- **Authentication / authorization**: OIDC / bearer-token auth at the gateway;
+  per-view RBAC with `viewer` / `pipeline_owner` / `admin` roles stored in the
+  control-plane catalog (DESIGN.md §12.5). `rockstream login` CLI flow for
+  human principals; service-account key files for automated clients.
+- **Cluster bootstrap ceremony**: `--bootstrap` flag for first control node;
+  subsequent control nodes join the Raft group via `--control=<url>`; documented
+  join/leave procedure for Raft voters (DESIGN.md §3 Cluster Bootstrap).
+- **Storage format version gate**: binary reads `shard_meta/0x06 0xFV` on
+  shard open; refuses if version out of supported range (DESIGN.md §5.5,
+  error `RS-5001`). `rockstream migrate` tool skeleton.
 
 **Exit criteria**
 
@@ -789,9 +803,13 @@ production-ready.
   - Connector development guide.
   - Deployment playbooks (k8s, ECS, bare-metal).
 - **Security**:
-  - TLS everywhere (worker↔control, worker↔worker, gateway↔client).
+  - mTLS everywhere (worker↔control, worker↔worker, gateway↔client);
+    certificate rotation documented (DESIGN.md §3 Cluster Bootstrap).
   - At-rest encryption via object-store features.
-  - Audit log for catalog/control-plane operations.
+  - Auth integration tests: unauthenticated requests rejected; cross-tenant
+    pipeline access denied; audit log `actor` field populated on every event.
+  - Rolling-upgrade integration test: deploy N→N+1 with one worker at a time;
+    assert no epoch loss and format-version gate fires on incompatible binary.
 
 **Exit criteria**
 
@@ -927,6 +945,12 @@ Total: 8–9 engineers for ~12-month path to GA.
     recursive scope. Validate in Phase 4 with a sharded transitive-closure
     benchmark that convergence detection via the inner-iteration frontier
     scales without a synchronous global barrier.
+11. **Raft membership change safety**: adding or removing a Raft voter is a
+    joint-consensus operation and the most dangerous control-plane action
+    available. The CLI must gate this behind an explicit confirmation, show
+    current quorum health before proceeding, and record the change in the audit
+    log. Resolve the exact joint-consensus or single-server protocol in Phase 10
+    alongside the HA hardening milestone.
 
 These are explicitly to be revisited and answered with prototypes during
 Phases 1–4.
