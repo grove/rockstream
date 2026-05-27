@@ -1,597 +1,835 @@
-# RockStream: Incremental View Maintenance on SlateDB
+# RockStream: Massively-Parallel Incremental View Maintenance on SlateDB
 
-A design for a scalable IVM system in the spirit of Feldera (DBSP), RisingWave, and
-Snowflake Dynamic Tables, using SlateDB as the sole durable storage layer.
+A design for a horizontally-scalable, full-SQL incremental view maintenance (IVM)
+system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWave,
+and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
+object storage.
+
+> **Status**: Design v2 (supersedes v1). The v1 design had a single-writer
+> bottleneck, no SQL compiler, no shuffle operator, and a scalar watermark
+> protocol that could not correctly handle multi-input operators. This document
+> addresses all of those.
 
 ---
 
 ## Table of Contents
 
-1. [Background & Goals](#1-background--goals)
-2. [SlateDB Features Used](#2-slatedb-features-used)
-3. [Key-Space Layout](#3-key-space-layout)
-4. [Storage Namespaces In Detail](#4-storage-namespaces-in-detail)
-5. [System Architecture](#5-system-architecture)
-6. [Worker Processing Loop](#6-worker-processing-loop)
-7. [Atomicity & Consistency Guarantees](#7-atomicity--consistency-guarantees)
-8. [Fault Tolerance & Checkpointing](#8-fault-tolerance--checkpointing)
-9. [Scalability: Partitioned Workers](#9-scalability-partitioned-workers)
-10. [Downstream Consumption via CDC](#10-downstream-consumption-via-cdc)
-11. [SlateDB Feature→IVM Role Summary](#11-slatedb-featureivm-role-summary)
+1. [Design Principles](#1-design-principles)
+2. [Theoretical Foundation: DBSP & Differential Dataflow](#2-theoretical-foundation-dbsp--differential-dataflow)
+3. [System Topology](#3-system-topology)
+4. [SQL Compilation Pipeline](#4-sql-compilation-pipeline)
+5. [Per-Shard SlateDB Storage Layout](#5-per-shard-slatedb-storage-layout)
+6. [Operator Catalog & State Encodings](#6-operator-catalog--state-encodings)
+7. [The Exchange (Shuffle) Subsystem](#7-the-exchange-shuffle-subsystem)
+8. [Frontier Protocol & Progress Tracking](#8-frontier-protocol--progress-tracking)
+9. [Atomic Epoch Commit Protocol](#9-atomic-epoch-commit-protocol)
+10. [Elasticity: Adding, Removing, and Rebalancing Shards](#10-elasticity-adding-removing-and-rebalancing-shards)
+11. [Fault Tolerance & Exactly-Once Semantics](#11-fault-tolerance--exactly-once-semantics)
+12. [Query Serving](#12-query-serving)
+13. [Connectors & External I/O](#13-connectors--external-io)
+14. [Observability, Backpressure, Admission Control](#14-observability-backpressure-admission-control)
+15. [Comparison to Prior Art](#15-comparison-to-prior-art)
+16. [Appendix: Key Encoding Reference](#appendix-key-encoding-reference)
 
 ---
 
-## 1. Background & Goals
+## 1. Design Principles
 
-**Incremental View Maintenance (IVM)** keeps materialized query results up-to-date by
-processing only the *delta* (changes) of the input data rather than recomputing from
-scratch. The theoretical foundation used here is **DBSP** (Feldera's model): queries
-operate on *Z-sets* — multisets with integer weights — where +1 represents an insert
-and -1 represents a delete. This lets every relational operator (filter, project, join,
-aggregate, window) be expressed as an incremental streaming operator.
-
-### Goals
-
-- Use **SlateDB** as the only durable store (no separate state backend, no external
-  coordinator database).
-- Support the full operator set: filter, project, join, aggregation, distinct, window.
-- Allow a **scalable pool of workers** that own disjoint partitions of the keyspace and
-  process epochs concurrently.
-- Provide **exactly-once semantics** and **crash recovery** via SlateDB checkpoints.
-- Expose materialized view results as **sorted, range-scannable key-value pairs** for
-  low-latency ad-hoc queries.
-- Allow downstream systems to consume view changes via **CDC** on the WAL.
+| # | Principle | Consequence |
+|---|---|---|
+| P1 | **Compute and storage are separated.** | Workers are stateless; all state lives in SlateDB. Workers can be added, removed, or replaced freely. |
+| P2 | **Storage is sharded across many SlateDB databases.** | No global write bottleneck. Each shard is independent; SlateDB's single-writer constraint applies only within a shard. |
+| P3 | **Exchanges are first-class operators.** | Re-partitioning between stages is an explicit dataflow node, not a hidden bulk transfer. The same primitive handles joins, group-bys, distincts, and recursion. |
+| P4 | **Object storage is the universal substrate.** | State (SlateDB SSTs), shuffle payloads, checkpoints, and the WAL all live in S3/GCS/ABS. No node owns data exclusively. |
+| P5 | **Frontiers, not watermarks.** | Progress is tracked as an antichain of timestamps per operator input, following Differential Dataflow. This handles multi-input operators and out-of-order data correctly. |
+| P6 | **DBSP semantics.** | Every operator is a Z-set transformer. Updates are `(row, weight)` pairs. Negative weights express retractions. This gives mathematically provable equivalence with batch SQL. |
+| P7 | **Full SQL via a real compiler.** | SQL → DataFusion logical plan → incremental physical plan (with explicit exchanges) → distributed plan → operator graph. No DSL, no Turing-incomplete subset. |
+| P8 | **Exactly-once end-to-end.** | Source offsets and sink commits are integrated into the epoch commit protocol via a two-phase commit on connector state. |
+| P9 | **Adaptive parallelism per operator.** | Different operators in the same query can run at different widths. A hot aggregation can use 100 shards while a small lookup uses 4. |
+| P10 | **Idempotent everything.** | Every side effect — shuffle write, sink write, state mutation — is keyed so that replay is a no-op. |
 
 ---
 
-## 2. SlateDB Features Used
+## 2. Theoretical Foundation: DBSP & Differential Dataflow
 
-| SlateDB Feature | Why It's Needed |
-|---|---|
-| `WriteBatch` | Atomically commit operator-state + view-output + watermark in one epoch |
-| `MergeOperator` | Lock-free partial aggregation (SUM, COUNT, append-to-join-index) |
-| `DbTransaction` (SI / SSI) | Worker lease acquisition, partition assignment, coordinator elections |
-| `DbSnapshot` | Consistent read-only view of outputs served to query clients |
-| `Checkpoint` + `DbReader` | Pinned recovery point; read-only query serving without blocking writers |
-| `Clone` | Branch a pipeline for blue/green, testing, or debugging |
-| `WalReader` (CDC RFC-0019) | Stream view-output changes to downstream consumers |
-| `scan()` range queries | Prefix scans over operator state and view outputs |
-| `TTL` + compaction filters | Auto-expire old changelog entries and time-window state |
-| `CompactionFilter` | Drop zero-weight Z-set tombstones during compaction |
-| Sequence numbers | Causal ordering, idempotent replay after failure |
-| Seq → timestamp mapping | Watermark management, event-time window semantics |
+We adopt the **DBSP** formalism (Budiu et al., VLDB 2023) for the operator semantics
+and the **Differential Dataflow** progress model (Murray, McSherry et al., SOSP 2013)
+for distributed coordination.
 
----
+### Z-Sets
 
-## 3. Key-Space Layout
+A **Z-set** is a multiset with integer multiplicities. Every collection in the system
+— base tables, intermediate results, view outputs — is conceptually a Z-set. An
+*insert* contributes `(row, +1)`; a *delete* contributes `(row, -1)`; an *update* is
+`(old_row, -1)` plus `(new_row, +1)`. Aggregations sum weights group-wise.
 
-SlateDB exposes a **single sorted byte-string keyspace**. Column families are
-simulated via fixed-length key prefixes. All numeric components are encoded as
-**big-endian fixed-width integers** so the LSM sort order equals numeric order,
-enabling efficient range scans.
+### Incremental Operators
+
+For every relational operator `f`, DBSP defines its incremental form `f^Δ` such that
 
 ```
-Prefix  Namespace            Key Structure
+f^Δ(C, ΔC) = f(C ⊎ ΔC) - f(C)
+```
+
+— it computes the change in output given the current collection `C` and a delta `ΔC`,
+without re-reading all of `C`. The DBSP paper proves this works compositionally for
+the entire relational algebra including recursion.
+
+### Timestamps & Frontiers
+
+Each Z-set entry carries a **logical timestamp** (a vector that can include epoch,
+iteration count for recursion, and source-position metadata). A **frontier** is an
+antichain of timestamps such that an operator promises not to emit any future updates
+at timestamps `≤` any element of the frontier. Frontiers advance monotonically.
+
+This is the only correct way to track progress through multi-input operators
+(joins, unions, recursive queries). Materialize uses this; we use the same primitive.
+
+### Recursion
+
+Recursive queries (`WITH RECURSIVE`, transitive closure, graph algorithms) use
+**semi-naive evaluation** inside a fixed-point loop. DBSP gives this a clean
+formalization via the `I` (integrate) and `D` (differentiate) operators applied
+in nested time scopes.
+
+---
+
+## 3. System Topology
+
+```
+                       ┌────────────────────────────┐
+                       │   Control Plane (3 nodes)   │
+                       │   (Raft / HA via SlateDB    │
+                       │    catalog + DbReader fan-  │
+                       │    out for query routing)   │
+                       │                            │
+                       │  • SQL compiler            │
+                       │  • Plan optimizer          │
+                       │  • Cluster topology        │
+                       │  • Shard placement         │
+                       │  • Frontier aggregator     │
+                       │  • Connector orchestrator  │
+                       └─────────┬──────────────────┘
+                                 │ assignments
+       ┌─────────────────────────┼─────────────────────────┐
+       │                         │                         │
+┌──────▼──────┐         ┌────────▼─────┐          ┌───────▼──────┐
+│  Worker 0    │         │   Worker 1   │          │   Worker N   │
+│              │ ◄─────► │              │ ◄──────► │              │
+│ pin: shards  │ shuffle │ pin: shards  │  shuffle │ pin: shards  │
+│  S0, S3, S6  │         │  S1, S4, S7  │          │  S2, S5, S8  │
+└──┬─┬──┬──────┘         └──┬──┬──┬─────┘          └──┬──┬──┬─────┘
+   │ │  │                   │  │  │                   │  │  │
+   │ │  │                   │  │  │                   │  │  │   (one SlateDB
+   ▼ ▼  ▼                   ▼  ▼  ▼                   ▼  ▼  ▼    instance per
+ ┌──┐┌──┐┌──┐             ┌──┐┌──┐┌──┐             ┌──┐┌──┐┌──┐  shard; single-
+ │S0││S3││S6│             │S1││S4││S7│             │S2││S5││S8│  writer rule
+ └──┘└──┘└──┘             └──┘└──┘└──┘             └──┘└──┘└──┘  holds locally)
+
+       Shared Object Storage (S3/GCS/ABS) — holds:
+         • all SlateDB SSTs (per-shard prefixed)
+         • all WAL files (per-shard)
+         • all shuffle payloads (per-exchange / per-epoch)
+         • all checkpoint manifests
+         • all connector offset stores
+```
+
+### Three Logical Tiers
+
+1. **Control plane** (≥3 nodes, HA).
+   Stateless except for a dedicated **control SlateDB** holding the catalog,
+   cluster membership, and shard-placement map. Compiles SQL, places shards
+   on workers, aggregates frontiers, drives checkpoints.
+
+2. **Worker plane** (elastic, N ≫ 1).
+   Each worker hosts some number of **shards**. A shard is the unit of placement
+   and writer-exclusivity. A worker process opens the SlateDB for each shard it
+   owns as the sole writer. Other workers may open the same shard as readers
+   (`DbReader`) for joins/lookups.
+
+3. **Storage plane** (object storage).
+   Object storage holds *all* durable state. Workers and the control plane have
+   no local persistent state (modulo a small write-through cache).
+
+### Why Shards (and not "one SlateDB")
+
+SlateDB is single-writer per database. To exceed one writer's throughput we run
+**many SlateDBs**. A *shard* is one SlateDB instance. The system is a mesh of
+hundreds or thousands of shards. Each operator instance pins to a shard for its
+state. Throughput scales linearly with shard count; latency stays flat because
+each shard's working set is small.
+
+### What a "Worker" Owns
+
+A worker is a process (typically one per host or container). It:
+- Runs the writer for each of its assigned shards.
+- Hosts operator instances whose state lives on those shards.
+- Maintains a network port for shuffle send/receive.
+- Reports frontiers and metrics to the control plane.
+
+---
+
+## 4. SQL Compilation Pipeline
+
+```
+SQL text
+   │
+   ▼
+[1] Parse + bind (sqlparser-rs + custom catalog binder)
+   │
+   ▼
+[2] Logical plan (Apache DataFusion LogicalPlan)
+   │
+   ▼
+[3] Rule-based optimizer (DataFusion's optimizer + custom IVM rules:
+     predicate pushdown, projection pruning, constant folding,
+     join reordering, subquery decorrelation)
+   │
+   ▼
+[4] Incrementalization pass (SQL → DBSP):
+     • Replace every relational op with its incremental form
+     • Insert I/D operators around recursion blocks
+     • Lower window functions to incremental windowed Z-sets
+     • Lower aggregates to (group-key → partial state) maps
+   │
+   ▼
+[5] Distribution pass:
+     • Annotate every operator with its required input partitioning
+     • Insert Exchange operators wherever partitioning differs
+     • Assign per-operator parallelism width (cost-based)
+   │
+   ▼
+[6] Physical plan (DAG of (Operator, parallelism, partition-key))
+   │
+   ▼
+[7] Shard placement:
+     • Map each operator instance to a shard
+     • Reuse shards across operators where partition keys align
+     • Co-locate operators that share state to avoid cross-shard reads
+   │
+   ▼
+[8] Deployment:
+     • Write the plan to the catalog
+     • Push operator-instance assignments to workers
+     • Workers materialize empty operator state on their SlateDB shards
+     • Connectors start feeding source operators
+```
+
+### Why DataFusion (not Calcite)
+
+- Rust-native: integrates directly with the rest of the codebase, no JVM.
+- Mature SQL frontend with full ANSI coverage.
+- Pluggable logical plan; we extend it with DBSP-specific physical nodes.
+- Substrait support for cross-language tooling.
+- Active community; used by InfluxDB IOx, Comet, Ballista, etc.
+
+We borrow ideas (and possibly code) from Feldera's `sql-to-dbsp` for the
+incrementalization pass — that compiler has the most complete coverage of SQL
+semantics under incremental evaluation.
+
+---
+
+## 5. Per-Shard SlateDB Storage Layout
+
+Each shard has its own SlateDB. Within a shard, we use a layout designed
+specifically for the operator catalog and the shuffle subsystem.
+
+### 5.1 Shard-Local Namespaces
+
+```
+Prefix  Namespace            Purpose
 ──────  ─────────────────    ──────────────────────────────────────────────────
-0x01    catalog/             type_tag(1) / id(16 uuid)
-0x02    changelog/           table_id(16) / epoch(8 u64 BE) / seq(8 u64 BE)
-0x03    op_state/            op_type(1) / op_id(16) / partition(2 u16 BE) / subkey…
-0x04    view_output/         view_id(16) / partition(2 u16 BE) / output_key…
-0x05    worker_coord/        coord_type(1) / pipeline_id(16) / sub_id…
-0x06    delta_buffer/        pipeline_id(16) / epoch(8) / partition(2) / op_id(16) / key…
+0x01    op_state/            All operator state for operators placed on this shard
+0x02    op_index/            Secondary indexes over op_state (sorted MIN/MAX, etc.)
+0x03    view_output/         Materialized view outputs whose partition lives here
+0x04    shuffle_inbox/       Incoming shuffle batches awaiting consumption
+0x05    shuffle_outbox/      Outgoing shuffle batches awaiting upload/ack
+0x06    shard_meta/          Per-shard frontiers, epoch markers, connector offsets
 ```
 
-All prefixes are disjoint, so a `scan(0x03..)` stays entirely within `op_state/`.
+### 5.2 Control-Plane SlateDB
+
+A small SlateDB cluster (one writer, ≥2 readers) holds:
+
+```
+0x01    catalog/             Tables, views, pipelines, schemas
+0x02    plan/                Compiled physical plans, operator-instance assignments
+0x03    topology/            Worker registry, shard placement, lease state
+0x04    frontier/            Aggregated per-operator frontier (driven by workers)
+0x05    checkpoints/         Cluster-wide checkpoint references
+0x06    connector/           External-source offsets, sink commit state
+```
+
+Workers read this database (via `DbReader` pinned to fresh checkpoints) on
+startup and subscribe to its CDC feed (`WalReader`) for plan changes and
+topology updates. Writes to the control DB go through the control-plane leader.
 
 ---
 
-## 4. Storage Namespaces In Detail
+## 6. Operator Catalog & State Encodings
 
-### 4.1 `catalog/` — Schema & Pipeline Metadata
+Every operator instance has an `op_id` (16-byte ULID assigned by the compiler).
+State keys begin with the op_id so different operators on the same shard never
+collide.
 
-Stores the structural definitions of all tables, views, and pipelines.  
-Written only when a pipeline is created or altered; read at startup by workers.
+### 6.1 Stateless Operators
+
+`Map`, `Filter`, `Project`: no SlateDB state. Pure functions applied to incoming
+deltas; output deltas forwarded to the next operator (possibly through an
+Exchange).
+
+### 6.2 Aggregation (`SUM`, `COUNT`, `AVG` decomposed to SUM/COUNT)
 
 ```
-0x01 | 0x01 | table_id(16)     → Protobuf TableSchema
-                                  { name, columns[], primary_key[], source_connector }
-
-0x01 | 0x02 | view_id(16)      → Protobuf ViewDefinition
-                                  { name, sql, operator_dag[], dependency_view_ids[] }
-
-0x01 | 0x03 | pipeline_id(16)  → Protobuf PipelineConfig
-                                  { partition_count, parallelism, checkpoint_interval_ms }
+0x01 0xAG op_id(16) group_key(var) → partial_state_bytes
 ```
 
-**SlateDB usage**: plain `put`/`get`. Transactions guard concurrent ALTER operations.
+Updates use `db.merge()` with an associative `AggregateMergeOp`. Output deltas
+are computed lazily: on read, finalize partial state, compare with last-emitted
+value (kept in `op_index/`), emit `(old, -1), (new, +1)`.
+
+### 6.3 Aggregation with Retractions: `MIN`, `MAX`, `MEDIAN`, `PERCENTILE`
+
+These cannot use a pure merge operator because retraction (`weight = -1`) may
+require knowing all current values. We maintain an indexed multiset:
+
+```
+0x01 0xMM op_id(16) group_key(var) value_bytes(var) row_hash(8) → i64 weight
+0x02 0xMM op_id(16) group_key(var) → current_extremum
+```
+
+On insert with weight +1: scan to find new min/max; if changed, update the cached
+extremum and emit a delta.
+On delete with weight -1: if the deleted value was the extremum, scan the indexed
+multiset (sorted by value within the group prefix) to find the new extremum.
+
+### 6.4 Equi-Join
+
+Two-sided join state, indexed by join key. The `Exchange` operator before each
+side guarantees both inputs are partitioned by the join key, so each shard sees
+matching pairs locally.
+
+```
+0x01 0xJL op_id(16) join_key(var) row_id(16) → row_bytes  (left arrangement)
+0x01 0xJR op_id(16) join_key(var) row_id(16) → row_bytes  (right arrangement)
+```
+
+For each incoming left delta `(row_L, +1)`:
+- Scan `0x01 0xJR op_id(16) join_key(L)..` for matching right rows.
+- Emit `(row_L ⋈ row_R, +1)` for each match.
+- Insert `(row_L, +1)` into the left arrangement.
+
+Retractions handled symmetrically with -1.
+
+### 6.5 Theta-Join / Cross-Join
+
+Falls back to broadcast: one side is broadcast to all shards of the other side.
+The compiler picks the smaller side. Broadcast happens via Exchange with target
+list = `[all shards]`.
+
+### 6.6 Distinct / Union (Set Semantics)
+
+```
+0x01 0xDS op_id(16) row_hash(16) → i64 weight
+```
+
+`MergeOperator` sums weights. Output emits delta when weight transitions
+between zero and non-zero. Compaction filter drops weight-zero entries.
+
+### 6.7 Window Functions (ROW_NUMBER, RANK, LAG, LEAD, sliding aggregates)
+
+```
+0x01 0xWN op_id(16) partition_key(var) order_key(var) row_id(16) → row_bytes
+```
+
+The order_key in the key gives natural ordering. For LAG/LEAD, scan the
+neighboring entries. For sliding aggregates, maintain a segment tree per
+partition; segment-tree nodes are stored under `op_index/`.
+
+### 6.8 Recursion (`WITH RECURSIVE`, fixed points)
+
+State for the recursive variable is stored normally. Iteration is driven by the
+operator scheduler: each iteration produces new deltas that feed back as input
+deltas at the next iteration timestamp. The frontier protocol naturally handles
+the inner-time dimension (it's another component of the timestamp vector).
+
+Convergence detection: iteration stops when the input frontier advances past
+the iteration timestamp with no new deltas produced.
+
+### 6.9 Time Windows (Tumbling, Hopping, Session)
+
+```
+0x01 0xTW op_id(16) window_id(16) key(var) → partial_state
+```
+
+`window_id` is computed from the event-time of the row. Window expiry uses
+SlateDB **TTL** based on event-time-derived deadlines, combined with a
+compaction filter that drops state past the watermark.
+
+### 6.10 Top-K
+
+Sorted index keyed by value-descending:
+
+```
+0x01 0xTK op_id(16) partition_key(var) value_desc_bytes(var) row_id(16) → row_bytes
+```
+
+`scan(prefix..).take(K)` returns the top-K. Maintenance is incremental:
+insert/delete updates the index; if the change crosses the K-th boundary, emit a
+delta replacing the displaced entry.
 
 ---
 
-### 4.2 `changelog/` — Input Delta Log
+## 7. The Exchange (Shuffle) Subsystem
 
-Every change to every base table lands here, as a timestamped **Z-set entry**:
-a `(key, weight)` pair where `weight = +1` (insert) or `-1` (delete).
-Updates are represented as delete-old + insert-new.
+Exchange is the operator that re-partitions a stream from upstream's
+partition key to downstream's partition key. It is the only mechanism that
+crosses shard boundaries.
+
+### 7.1 Partition Function
+
+For partition key `k` and target width `W`:
 
 ```
-0x02 | table_id(16) | epoch(8 BE) | seq(8 BE)  →  DeltaRecord
-                                                    { key_bytes, row_bytes, weight: i8 }
+target_shard = consistent_hash(k, W)
 ```
 
-- **epoch** is a monotonically increasing batch number assigned by the ingestion layer.
-- **seq** is the SlateDB sequence number of the write, used for idempotency.
-- Old epochs are deleted via **range deletion** + **TTL** after the global frontier
-  advances past them (`db.delete_range(changelog_prefix(table, 0)..=changelog_prefix(table, committed_epoch))`).
+We use **rendezvous hashing** so that adding or removing one shard moves only
+`1/W` of the keyspace.
 
-**SlateDB usage**: `WriteBatch` (ingestion layer groups CDC events into atomic epoch batches).  
-TTL set to `retention_duration` on each entry. `scan(0x02 | table_id | epoch..)` to read all
-changes for a table in an epoch.
+### 7.2 Hybrid Transport: Direct + Object-Store
+
+Each shuffle has two paths:
+
+**Fast path (default)**: gRPC stream directly between worker processes. Low
+latency (≈ network RTT), no object-store cost. Each batch is buffered in the
+sender's `shuffle_outbox/` (in SlateDB on the sender's shard) until the
+receiver ACKs.
+
+**Durable path (fallback / recovery / large batches)**: sender uploads the batch
+as an object to `s3://bucket/shuffle/{exchange_id}/{epoch}/{src_shard}/{seq}.arrow`.
+Receiver polls / is notified of new objects and ingests them into its
+`shuffle_inbox/`.
+
+The fast path is used for small low-latency batches; the durable path is used
+when the receiver is unreachable, when batches exceed a threshold, or as the
+backup for fault tolerance. Either way, the canonical record is in object
+storage — direct delivery is an optimization.
+
+### 7.3 Outbox & Inbox Encoding
+
+```
+shuffle_outbox/ key:
+  0x05 exchange_id(16) target_shard(4) epoch(8 BE) seq(8 BE)
+  value: Arrow IPC batch (compressed)
+
+shuffle_inbox/ key:
+  0x04 exchange_id(16) src_shard(4) epoch(8 BE) seq(8 BE)
+  value: Arrow IPC batch (compressed)
+```
+
+Entries are deleted only after the consuming operator's frontier advances past
+the epoch (see §8).
+
+### 7.4 Why Arrow
+
+Arrow gives us:
+- Columnar, vectorized in-memory format that operators can process at SIMD speed.
+- Zero-copy slicing for sub-batches.
+- IPC format that doubles as the wire and on-disk format.
+- Native interop with DataFusion expression evaluation.
 
 ---
 
-### 4.3 `op_state/` — Operator State
+## 8. Frontier Protocol & Progress Tracking
 
-Persistent state for each stateful operator, sharded by `partition`. Workers scan only
-their assigned partitions, so there is zero cross-worker contention.
+### 8.1 Timestamp Type
 
-#### 4.3.1 Aggregation State (SUM, COUNT, MIN/MAX per group)
+A timestamp is a vector:
 
 ```
-0x03 | 0xAG | op_id(16) | partition(2) | group_key…  →  PartialAggregate
-                                                          { sum: i128, count: i64, min: Bytes,
-                                                            max: Bytes, ... }
-```
-
-Aggregation state is updated via **MergeOperator** — no read-modify-write cycle:
-
-```rust
-// Encoding: delta encoded as (sum_delta: i64, count_delta: i64)
-db.merge(agg_key, &encode_agg_delta(+5, +1)).await?;
-
-struct AggMergeOperator;
-impl MergeOperator for AggMergeOperator {
-    fn merge(&self, _key, existing, operand) -> Result<Bytes, _> {
-        let acc  = existing.map(decode_agg).unwrap_or_default();
-        let delta = decode_agg_delta(operand);
-        Ok(encode_agg(acc + delta))
-    }
+Timestamp {
+  source_epoch: u64,   // monotonic epoch from ingestion
+  iteration:    u32,   // for recursion; 0 outside recursive scopes
+  sub_epoch:    u32,   // for nested scopes (windows, scoped recursion)
 }
 ```
 
-MIN/MAX require a **sorted secondary index** within `op_state/` (see §4.3.4).
+Ordering is product order: `t1 ≤ t2` iff every component of `t1` ≤ corresponding
+component of `t2`. Two timestamps may be incomparable — hence we need antichains.
 
-#### 4.3.2 Join Index State (one side of every join)
+### 8.2 Frontier
 
-Each side of a binary join stores its rows indexed by the join key so the other side
-can efficiently look up matches.
+A frontier is a minimal antichain of timestamps. An operator's *input frontier*
+on a given input is the smallest antichain `F` such that no future delta on
+that input will have a timestamp `t` with `t ≮ any f ∈ F`. The operator's
+*output frontier* on a given output is derived from its input frontiers and its
+operator-specific delay (most operators: identity; recursion: increment iteration).
 
-```
-0x03 | 0xJL | op_id(16) | partition(2) | join_key… | row_id(8)  →  Row (left side)
-0x03 | 0xJR | op_id(16) | partition(2) | join_key… | row_id(8)  →  Row (right side)
-```
+### 8.3 Per-Shard Reporting
 
-- `scan(join_left_prefix(op_id, partition, join_key)..)` returns all left rows for a
-  given join key — this drives the nested-loop join for each delta row on the right.
-- Rows are inserted/deleted via `WriteBatch` as part of the same epoch commit.
-
-#### 4.3.3 Distinct / Deduplication State
-
-Tracks how many times each row has been seen (Z-set weight). Rows with weight > 0
-contribute to the output; reaching 0 removes them.
+Every shard maintains, per operator instance and per output:
 
 ```
-0x03 | 0xDS | op_id(16) | partition(2) | row_hash(8)  →  i64 (weight, via MergeOperator)
+shard_meta/ key:
+  0x06 0xFR op_id(16) output_port(2) → encoded_frontier (antichain bytes)
 ```
 
-Compaction filter drops entries where `weight == 0`.
+The shard's writer task periodically (e.g., every 10 ms or every epoch boundary)
+flushes its current output frontier to its shard SlateDB and pushes a small
+delta to the control plane.
 
-#### 4.3.4 Top-K / MIN / MAX Auxiliary Index
+### 8.4 Control-Plane Aggregation
 
-A sorted secondary index enabling efficient MIN/MAX computation without full scans:
-
-```
-0x03 | 0xTK | op_id(16) | partition(2) | group_key… | value_bytes(var) | row_id(8)  →  i64 weight
-```
-
-`scan(topk_prefix(op_id, partition, group_key)..)` gives the minimum value first,
-allowing O(log N) MIN/MAX updates.
-
-#### 4.3.5 Window State
-
-Time-windowed rows, stored with **TTL** equal to the window duration so they expire
-automatically without explicit cleanup.
+The control plane subscribes via `WalReader` to each shard's `shard_meta/0x06 0xFR`
+changes (cheap; one tiny write per operator per flush). It computes the
+**cluster frontier** for each operator as the meet (greatest lower bound) of all
+shard frontiers, and publishes:
 
 ```
-0x03 | 0xWN | op_id(16) | partition(2) | window_end_ts(8 BE) | row_id(8)  →  Row
-                                                               (TTL = window_duration)
+control: frontier/op_id → cluster_frontier
 ```
 
-`scan(window_prefix(op_id, partition, window_start)..window_prefix(op_id, partition, window_end))`
-retrieves all rows in a window range for re-aggregation when a window fires or closes.
+Downstream operators read input frontiers from the control plane (cached &
+subscribed). When the input frontier advances, the operator may:
+- Release retained state (e.g., close a window).
+- Compact garbage in its arrangements.
+- Acknowledge upstream shuffle batches for deletion.
+
+### 8.5 Garbage Collection of Shuffle Buffers
+
+When a receiver operator's input frontier on exchange `E` advances past epoch
+`e`, the receiver writes:
+
+```
+control: frontier/exchange_e/consumed → e
+```
+
+Senders observe this and **range-delete** all `shuffle_outbox/` entries with
+`epoch ≤ e`. Receivers similarly range-delete their `shuffle_inbox/` entries.
+This is exact (no TTL guessing).
 
 ---
 
-### 4.4 `view_output/` — Materialized View Results
+## 9. Atomic Epoch Commit Protocol
 
-The final query output. Updated atomically alongside `op_state/` in the same `WriteBatch`.
-Keyed so that the natural LSM sort order matches the query's output ordering.
+Each operator instance commits its state changes for an epoch as a single
+SlateDB `WriteBatch` on its shard. The batch includes:
 
-```
-0x04 | view_id(16) | partition(2) | output_key…  →  OutputRow (encoded result row)
-```
-
-- `scan(0x04 | view_id | partition..)` serves point and range queries.
-- `DbSnapshot` gives clients a consistent view without blocking ongoing epoch processing.
-- `DbReader` (read-only, from a `Checkpoint`) serves query traffic on a separate process.
-
-**Delta propagation**: when a downstream view depends on an upstream view, the upstream
-view's output changes are the downstream view's changelog. The system reads the upstream
-`view_output/` changes from the WAL via `WalReader` (CDC).
-
----
-
-### 4.5 `worker_coord/` — Worker Coordination
-
-Stores all cluster-coordination state. Written via **optimistic transactions**
-(`IsolationLevel::SnapshotIsolation`) to prevent split-brain.
-
-#### 4.5.1 Worker Leases
-
-```
-0x05 | 0xWL | pipeline_id(16) | worker_id(16)  →  WorkerLease
-                                                    { expires_at_ms: u64, partitions: [u16],
-                                                      last_heartbeat_seq: u64 }
-```
-
-Workers renew their lease every `lease_ttl / 3` ms. A coordinator steals expired leases
-and re-assigns those partitions to healthy workers.
-
-```rust
-// Lease renewal with optimistic transaction
-let txn = db.begin_transaction(IsolationLevel::SnapshotIsolation).await?;
-let existing: WorkerLease = txn.get(lease_key).await?.expect("lease gone");
-assert_eq!(existing.worker_id, my_worker_id, "lease stolen");
-txn.put(lease_key, &encode_lease(refreshed_lease));
-txn.commit().await?; // ConflictError → back-off and retry
-```
-
-#### 4.5.2 Watermarks
-
-Each worker records the highest epoch it has fully committed for each of its partitions.
-
-```
-0x05 | 0xWM | pipeline_id(16) | partition(2)  →  u64 BE epoch
-```
-
-#### 4.5.3 Global Frontier
-
-The minimum watermark across all partitions — the epoch up to which the entire view
-is consistent and queryable.
-
-```
-0x05 | 0xGF | pipeline_id(16)  →  u64 BE epoch (frontier)
-```
-
-Updated by the coordinator after scanning all per-partition watermarks.
-
-#### 4.5.4 Checkpoint References
-
-```
-0x05 | 0xCP | pipeline_id(16)  →  CheckpointRef { checkpoint_id: Uuid, frontier_epoch: u64 }
-```
-
----
-
-### 4.6 `delta_buffer/` — In-Flight Epoch Deltas (ephemeral)
-
-Intermediate deltas computed by operators but not yet committed to `view_output/`.
-Used when an operator graph has multiple levels (e.g., a view over a view); the
-inner view's output delta is materialized here before being fed to the outer operator.
-
-```
-0x06 | pipeline_id(16) | epoch(8) | partition(2) | op_id(16) | key…  →  DeltaRecord
-```
-
-These entries are given a short **TTL** (e.g., `2 × epoch_interval`) so they are
-automatically cleaned up by compaction even if an explicit delete is missed.
-
----
-
-## 5. System Architecture
-
-```
-┌────────────────────────────────────────────────────────────┐
-│                      Input Sources                         │
-│           Kafka / PostgreSQL CDC / HTTP / S3               │
-└──────────────────────┬─────────────────────────────────────┘
-                       │ decoded change events
-┌──────────────────────▼─────────────────────────────────────┐
-│                   Ingestion Layer                           │
-│  - groups events into epochs (micro-batches)               │
-│  - encodes (row, weight) as DeltaRecord                    │
-│  - writes changelog/ atomically via WriteBatch             │
-│  - assigns monotonic epoch numbers                         │
-└──────────────────────┬─────────────────────────────────────┘
-                       │ SlateDB WAL / WalReader
-┌──────────────────────▼─────────────────────────────────────┐
-│                  Pipeline Coordinator                       │
-│  - monitors worker leases in worker_coord/                 │
-│  - re-assigns expired partitions via DbTransaction (SSI)   │
-│  - advances global frontier (worker_coord/0xGF)            │
-│  - triggers checkpoints every N epochs                     │
-└──────┬───────────────┬─────────────────┬───────────────────┘
-       │               │                 │   partition assignments
-┌──────▼──────┐ ┌──────▼──────┐ ┌───────▼─────┐
-│  Worker 0   │ │  Worker 1   │ │  Worker N   │
-│ parts:0,3,6 │ │ parts:1,4,7 │ │ parts:2,5,8 │
-│             │ │             │ │             │
-│ reads:      │ │ reads:      │ │ reads:      │
-│  changelog/ │ │  changelog/ │ │  changelog/ │
-│  op_state/  │ │  op_state/  │ │  op_state/  │
-│             │ │             │ │             │
-│ writes:     │ │ writes:     │ │ writes:     │
-│  op_state/  │ │  op_state/  │ │  op_state/  │
-│  view_output│ │  view_output│ │  view_output│
-│  watermark  │ │  watermark  │ │  watermark  │
-└──────┬──────┘ └──────┬──────┘ └───────┬─────┘
-       └───────────────┴─────────────────┘
-                       │ all writes go to one logical SlateDB instance
-┌──────────────────────▼─────────────────────────────────────┐
-│              SlateDB  (object storage backed)               │
-│                                                            │
-│  catalog/       changelog/      op_state/                  │
-│  view_output/   worker_coord/   delta_buffer/              │
-│                                                            │
-│  WAL ──► WalReader CDC ──► Downstream consumers           │
-└────────────────────────────────────────────────────────────┘
-```
-
-**Deployment options**:
-
-- *Single process*: Coordinator + N workers share one `Db` handle (in-process
-  `Arc<Db>`). Suitable for a laptop or single-node deployment.
-- *Multi-process*: Each worker is a separate OS process opening the same SlateDB path
-  on shared object storage. The writer is one designated process; others use `DbReader`
-  for read-only access. The Coordinator is a third process. This matches SlateDB's
-  existing Writer + Compactor + GC separation.
-- *Distributed compaction*: RFC-0025 (accepted) describes distributed compaction which
-  allows the compactor to run as a separate scalable service — this offloads LSM
-  compaction from worker CPU entirely.
-
----
-
-## 6. Worker Processing Loop
-
-```
-for each assigned partition p:
-  1. Refresh lease (DbTransaction/SSI)
-  2. Read current watermark w  = worker_coord/watermark[pipeline_id][p]
-  3. Collect input deltas:
-       for each base table t in pipeline:
-         scan(changelog/ | t | epoch=w+1 .. epoch=latest_ingested)
-         → list of DeltaRecord[]
-  4. Process operator DAG (topological order):
-       for each operator op:
-         a. Read relevant op_state/ entries for partition p
-         b. Apply incremental operator logic → (new_op_state, output_deltas)
-         c. If op has downstream operators: write output_deltas to delta_buffer/
-         d. If op is a leaf (view output): accumulate (view_id, key, new_value) tuples
-  5. Atomic epoch commit (single WriteBatch):
-       for each modified op_state entry:   batch.put(op_state_key, new_state)
-                                           OR batch.merge(agg_key, delta_bytes)
-       for each view output change:        batch.put(view_output_key, row)
-                                           OR batch.delete(view_output_key)
-       watermark update:                   batch.put(watermark_key, (w+1).to_be_bytes())
-       db.write(batch).await?;             // atomic, durable, WAL-backed
-  6. Coordinator (async) scans all watermarks → advances global frontier
-  7. Coordinator triggers Checkpoint every checkpoint_interval epochs
-```
-
-### Crash Recovery
-
-On worker restart:
-1. Read `worker_coord/watermark[pipeline_id][partition]` → last committed epoch `w`.
-2. Re-process epoch `w+1` from `changelog/` (idempotent because the watermark only
-   advances *inside* the `WriteBatch` — if the process died before the batch landed, the
-   watermark is still at `w` and we replay correctly).
-3. Renew lease before processing.
-
----
-
-## 7. Atomicity & Consistency Guarantees
-
-### Within an epoch: `WriteBatch`
-
-All state changes for one epoch on one partition are submitted as a single `WriteBatch`.
-SlateDB's WAL guarantees these writes are atomic: either all are durable or none are.
+1. All `op_state/` puts/deletes/merges produced by the operator.
+2. All `op_index/` updates.
+3. All `view_output/` puts/deletes if this is a leaf operator.
+4. All `shuffle_outbox/` puts for batches that will be sent.
+5. All `shuffle_inbox/` deletes for batches just consumed.
+6. The new `shard_meta/0x06 0xFR` output frontier.
 
 ```rust
 let mut batch = WriteBatch::new();
 
-// operator state deltas
-batch.merge(agg_state_key,  &encode_agg_delta(sum_delta, count_delta));
-batch.put(join_index_key,   &encode_row(&new_row));
-batch.delete(join_index_key_for_deleted_row);
+// state updates (using merge where associative)
+for (k, delta) in agg_deltas    { batch.merge(k, delta); }
+for (k, row)   in join_inserts  { batch.put(k, row); }
+for k          in join_deletes  { batch.delete(k); }
 
-// view output
-batch.put(view_output_key,  &encode_output_row(&result));
+// view outputs (for leaf operators)
+for (k, v) in view_upserts { batch.put(k, v); }
+for k       in view_deletes { batch.delete(k); }
 
-// advance watermark — included atomically
-batch.put(watermark_key,    &epoch.to_be_bytes());
+// new shuffle outbox
+for (k, batch_bytes) in outbox_writes { batch.put(k, batch_bytes); }
 
-db.write(batch).await?; // <- single WAL append
+// consumed shuffle inbox cleanup
+for k in inbox_acks { batch.delete(k); }
+
+// frontier advance — included atomically so crash = retry same epoch
+batch.put(frontier_key, encode_frontier(&new_output_frontier));
+
+shard_db.write(batch).await?;
 ```
 
-### Cross-worker coordination: `DbTransaction` (SSI)
-
-Worker lease steal / renewal and partition re-assignment use
-`IsolationLevel::Serializable` transactions to prevent two workers from claiming the
-same partition simultaneously.
-
-### Serving consistent snapshots: `DbSnapshot` / `DbReader`
-
-Query clients open a `DbSnapshot` or a `DbReader` pinned to a `Checkpoint`.  
-These provide point-in-time reads that are unaffected by concurrent epoch processing —
-identical to Snapshot Isolation in a traditional OLTP database.
+This is the **only** durability event per epoch per operator instance. SlateDB's
+WAL guarantees atomicity. Recovery is automatic: on restart, the operator reads
+its current frontier and processes inputs from that frontier forward — by
+construction, idempotent.
 
 ---
 
-## 8. Fault Tolerance & Checkpointing
+## 10. Elasticity: Adding, Removing, and Rebalancing Shards
 
-SlateDB's `Checkpoint` API pins a version of the manifest. No SSTs referenced by a
-live checkpoint can be garbage-collected.
+### 10.1 The Shard Map
 
-### Checkpoint Protocol
+The control plane holds a versioned **shard map** for each exchange:
 
 ```
-Coordinator every N epochs:
-  1. Wait until global frontier >= target_epoch
-  2. db.create_checkpoint(None).await?   → CheckpointCreateResult { id, manifest_id }
-  3. WriteBatch:
-       put(worker_coord/checkpoint/pipeline_id,
-           CheckpointRef { checkpoint_id: id, frontier_epoch: frontier })
-  4. Delete old checkpoint reference (GC will collect unreferenced SSTs)
-```
-
-### Worker Recovery from Checkpoint
-
-```rust
-// On startup or after crash:
-let cp_ref: CheckpointRef = db.get(checkpoint_key).await?.unwrap();
-let reader = DbReaderBuilder::new(path, object_store)
-    .checkpoint(cp_ref.checkpoint_id)
-    .build().await?;
-
-// Replay changelog/ from cp_ref.frontier_epoch onward
-// (changes already in view_output/ at checkpoint time are intact)
-```
-
-### Clone for Blue/Green Deployments
-
-```rust
-// Fork the entire pipeline state for a schema migration or A/B test:
-let new_db_path = "/pipelines/v2";
-db.create_clone(checkpoint_id, new_db_path, object_store.clone()).await?;
-// New pipeline processes same base data independently, sharing immutable SSTs
-```
-
----
-
-## 9. Scalability: Partitioned Workers
-
-### Partition Assignment
-
-Base table rows are hash-partitioned by their primary key:
-```
-partition = hash(primary_key) % partition_count
-```
-
-All operator state keys include the partition number, so each worker's keyspace is
-strictly disjoint. Workers never need distributed locks for their hot path.
-
-### Adding Workers (Elastic Scale-Out)
-
-1. New worker process starts and registers a lease with an empty partition list.
-2. Coordinator detects under-loaded worker; transfers some partitions to the new worker
-   via an SSI transaction (reads old lease, writes new assignment atomically).
-3. The donating worker commits its in-flight epoch, then stops processing transferred
-   partitions. The new worker starts from the last committed watermark for those
-   partitions.
-4. No data migration is needed — SlateDB's sorted keyspace already contains all
-   partition data; the new worker simply starts scanning its assigned prefix ranges.
-
-### Multiple SlateDB Instances (Extreme Scale)
-
-For pipelines with very high write throughput, shard the keyspace across multiple
-SlateDB instances (one per group of partitions). Each instance is an independent
-object-storage-backed database. The `WalReader` CDC API is used to propagate
-cross-shard joins and view dependencies.
-
----
-
-## 10. Downstream Consumption via CDC
-
-SlateDB's `WalReader` (RFC-0019) reads WAL files in order from object storage, exposing
-a stream of raw key-value mutations. The `view_output/` prefix filter yields a clean
-stream of view result changes:
-
-```rust
-let wal_reader = WalReader::open(db_path, object_store).await?;
-let mut position = load_consumer_position(); // stored externally or in SlateDB
-
-loop {
-    for wal_file in wal_reader.list_after(position).await? {
-        for entry in wal_file.iter().await? {
-            if entry.key.starts_with(&VIEW_OUTPUT_PREFIX) {
-                let (view_id, partition, output_key) = decode_view_key(&entry.key);
-                match entry.value {
-                    ValueDeletable::Value(v) => emit_upsert(view_id, output_key, v),
-                    ValueDeletable::Tombstone   => emit_delete(view_id, output_key),
-                }
-            }
-        }
-        position = wal_file.id;
-        save_consumer_position(position);
-    }
-    tokio::time::sleep(poll_interval).await;
+control: topology/shard_map/exchange_id → ShardMap {
+  version: u64,
+  ring: Vec<(virtual_node_hash, shard_id)>,   // rendezvous ring
 }
 ```
 
-This enables:
-- **Kafka sink**: emit view output changes to a Kafka topic for downstream consumers.
-- **Cache invalidation**: invalidate Redis / Memcached entries when their backing row changes.
-- **Secondary index maintenance**: build inverted indexes over view outputs.
-- **Nested pipelines**: one pipeline's `view_output/` is another pipeline's `changelog/`.
+When a new shard is added, the control plane bumps the version and publishes
+a new ring. Workers observe the version change and gracefully cut over at an
+epoch boundary.
+
+### 10.2 Adding a Shard
+
+1. Provision a new SlateDB instance (just a path on object storage).
+2. Assign it to a worker (capacity-based scheduling).
+3. Compute the new shard map; identify keys that will move from existing shards
+   to the new one (consistent hashing ⇒ small fraction).
+4. For each existing shard losing keys:
+   - Snapshot the relevant key range via SlateDB `Checkpoint`.
+   - The new shard reads the range from the donor shard's checkpoint (via
+     `DbReader`) and ingests into its own SlateDB.
+   - Once caught up, the control plane atomically flips the shard map to the
+     new version at a chosen epoch boundary.
+5. After cutover, the donor shards range-delete the migrated keys.
+
+### 10.3 Removing a Shard (Graceful)
+
+Reverse of the above. The shard's keys are migrated to other shards via
+checkpoint reads, then the SlateDB is decommissioned. SST GC will eventually
+reclaim its object-store footprint.
+
+### 10.4 Fault-Driven Reassignment
+
+If a worker dies, its shards are re-leased to another worker. SlateDB's
+single-writer enforcement (via the manifest fence epoch) prevents split-brain:
+the old writer cannot commit after a new writer opens the same shard.
+
+### 10.5 Per-Operator Parallelism
+
+Operator parallelism is independent of the cluster's shard count. A small
+aggregation might pin to 4 shards; a hot join might span 200 shards. The
+compiler picks parallelism per operator based on:
+- Estimated cardinality.
+- Available cluster capacity.
+- Historical execution statistics (collected via the observability stack).
+
+Adaptive re-planning: if an operator's metrics show skew, the control plane can
+re-shard that operator's state online while the rest of the pipeline keeps
+running.
 
 ---
 
-## 11. SlateDB Feature→IVM Role Summary
+## 11. Fault Tolerance & Exactly-Once Semantics
 
-| SlateDB Feature | IVM Role | Namespace Used |
+### 11.1 The Three Boundaries
+
+| Boundary | Mechanism |
+|---|---|
+| **Within an epoch on one operator** | `WriteBatch` is atomic. |
+| **Across operators in the same cluster** | Frontier protocol + idempotent operator state keyed by source epoch. |
+| **External sources & sinks** | Two-phase commit on connector state; sink writes are keyed by `(source_epoch, output_position)`. |
+
+### 11.2 Cluster Checkpoints
+
+Every `T` seconds (or every `N` epochs), the control plane runs a
+**barrier-based** checkpoint inspired by Flink Chandy-Lamport:
+
+1. Inject a checkpoint barrier into every source operator with a fresh
+   `checkpoint_id`.
+2. Barriers flow through the DAG, aligned at multi-input operators (the operator
+   waits until the barrier arrives on all inputs).
+3. When a barrier passes through an operator, that operator creates a SlateDB
+   `Checkpoint` on its shard and records `(checkpoint_id, shard_checkpoint_id)`
+   in the control plane.
+4. When all operators have reported, the control plane commits the cluster
+   checkpoint atomically: writes `control: checkpoints/{checkpoint_id}` with the
+   full map of per-shard checkpoints.
+5. Old cluster checkpoints (beyond the retention horizon) are released, allowing
+   SlateDB GC to reclaim SSTs.
+
+### 11.3 Recovery
+
+To recover the cluster:
+1. Pick the latest committed cluster checkpoint.
+2. Open every shard's `DbReader` pinned to its recorded checkpoint.
+3. Each worker brings up its assigned shards as writers, starting from the
+   checkpointed state.
+4. Source connectors resume from offsets recorded in `control: connector/`.
+5. Frontiers held in the checkpoint resume; processing continues.
+
+### 11.4 Exactly-Once Sinks
+
+Sink connectors implement the standard two-phase commit:
+
+```
+Pre-commit (during epoch):
+  - Stage outgoing rows in a sink-specific transactional buffer.
+    For Kafka: producer transaction, no flush yet.
+    For S3:    write to "_pending/{epoch}/..." path.
+  - Stage atomically committed in the shard's WriteBatch via a
+    sink_state/ entry recording the pending position.
+
+Commit (after cluster checkpoint succeeds):
+  - For Kafka: commit producer transaction.
+  - For S3:    atomic rename _pending → final.
+  - Update sink_state/ to mark epoch as committed.
+```
+
+Replay after crash: on recovery, the connector inspects `sink_state/`:
+- If pre-committed but not committed: re-run commit (idempotent).
+- If neither: epoch's data will be reproduced; nothing to do.
+
+---
+
+## 12. Query Serving
+
+### 12.1 Three Query Modes
+
+| Mode | Mechanism | Latency |
 |---|---|---|
-| `WriteBatch` | Atomic epoch commit (state + output + watermark) | all |
-| `MergeOperator` | Lock-free partial aggregation; append-to-join-list | `op_state/agg`, `op_state/distinct` |
-| `DbTransaction` (SSI) | Worker lease, partition re-assignment, coordinator election | `worker_coord/` |
-| `DbSnapshot` | Consistent point-in-time reads for query clients | `view_output/` |
-| `Checkpoint` | Durable epoch recovery point; SST pinning against GC | `worker_coord/checkpoint` |
-| `DbReader` | Read-only query serving on separate process/node | `view_output/` |
-| `Clone` | Blue/green pipeline deployments, schema migrations | top-level |
-| `WalReader` (CDC) | Stream view-output deltas to downstream consumers | `view_output/` |
-| `scan()` range queries | Join index lookup, window range, group aggregation | `op_state/`, `view_output/` |
-| TTL on entries | Auto-expire time-window state, old changelog epochs | `op_state/window`, `changelog/` |
-| `CompactionFilter` | Drop zero-weight Z-set entries at compaction time | `op_state/distinct` |
-| Range deletion | Bulk-delete committed changelog epochs | `changelog/` |
-| Sequence numbers | Causal ordering; idempotent epoch replay after crash | WAL |
-| Seq→timestamp map | Event-time watermark management | `worker_coord/watermark` |
-| Partitioned keyspace | Shard operator state across workers with no coordination | `op_state/`, `view_output/` |
-| Distributed compaction (RFC-0025) | Offload LSM compaction from worker processes | background |
+| **Materialized view lookup** | `DbReader` on the shard holding the view-output partition | µs–ms |
+| **Materialized view range scan** | `scan()` on the relevant shard(s); merge results on the gateway | ms |
+| **Ad-hoc SQL over views** | DataFusion query executes against a `Snapshot` of materialized views (no incremental engine involvement) | ms–s |
+
+### 12.2 Query Gateway
+
+A stateless query gateway service:
+1. Parses incoming SQL.
+2. Looks up which views satisfy the query (or rejects if none).
+3. Routes range scans to the appropriate shards via `DbReader` connections.
+4. Merges results with DataFusion's local executor.
+
+Gateways are stateless and horizontally scalable. They pin to a recent cluster
+checkpoint so concurrent queries see a consistent snapshot.
+
+### 12.3 Subscribe / Streaming Queries
+
+Clients can subscribe to a view's change stream. Implemented by tailing the
+shard's `WalReader` filtered to `view_output/` for the requested view-id prefix.
+
+---
+
+## 13. Connectors & External I/O
+
+### 13.1 Source Connectors
+
+Each source operator is connected to an external system via a **source
+connector** (Kafka, Postgres logical replication, S3 + manifest, HTTP webhook,
+…). The connector:
+- Reads from the external source.
+- Decodes records into Z-set deltas.
+- Assigns each delta a source epoch (typically the connector's native offset
+  packed into the `source_epoch` field).
+- Pushes deltas into the source operator (which lives on some shard).
+- Updates `control: connector/{connector_id}/offset` atomically with the
+  shard's commit.
+
+### 13.2 Sink Connectors
+
+Symmetric: a sink operator collects committed view-output deltas (from
+`WalReader`), buffers them per the 2PC protocol in §11.4, and commits to the
+external system after cluster checkpoints.
+
+### 13.3 Connector Catalog
+
+Connector types are pluggable. The control plane catalogs available connector
+types and routes connector instances to workers. Connector processes are
+independent of operator processes — they can be co-located or run as a separate
+"connector tier" for isolation.
+
+---
+
+## 14. Observability, Backpressure, Admission Control
+
+### 14.1 Metrics
+
+Every shard and every operator instance reports:
+- Throughput (rows/sec in & out).
+- Latency (epoch processing time, end-to-end frontier lag).
+- State size (bytes & rows in op_state).
+- Shuffle traffic (bytes sent/received per exchange).
+- Compaction stats.
+
+Exported via Prometheus / OpenTelemetry.
+
+### 14.2 Frontier Lag = Freshness
+
+The cluster-wide frontier lag = `now - max(source_epoch_timestamp ≤ frontier)`.
+This is the operational SLO: "how stale is the freshest queryable view?"
+
+### 14.3 Backpressure
+
+The exchange subsystem implements credit-based flow control:
+- Receivers grant N credits per sender.
+- Senders may have at most N unacked batches outstanding.
+- When credits exhaust, the sender blocks, which propagates upstream naturally.
+
+`shuffle_outbox/` size on a sender is itself a backpressure signal: if it grows
+beyond a threshold, the upstream operator pauses (its `WriteBatch` includes a
+wait on outbox-size).
+
+### 14.4 Admission Control
+
+The control plane refuses to start new pipelines if cluster utilization would
+exceed thresholds. It can pause low-priority pipelines to free capacity for
+high-priority ones (via a priority field in the pipeline config).
+
+---
+
+## 15. Comparison to Prior Art
+
+| Aspect | Feldera | Materialize | RisingWave | Snowflake DT | **RockStream** |
+|---|---|---|---|---|---|
+| **SQL coverage** | Full ANSI + recursion | Full ANSI + recursion | Full ANSI | Subset (no recursion) | Full ANSI + recursion |
+| **Theoretical model** | DBSP | Differential Dataflow | DBSP-like | Proprietary refresh | DBSP + DD frontiers |
+| **State backend** | RocksDB (local NVMe) | LSM in-memory + S3 spill | Hummock (S3-native) | Internal | **SlateDB** (S3-native) |
+| **Compute-storage split** | Tight | Tight | Decoupled | Decoupled | **Fully decoupled** |
+| **Single-node baseline** | Excellent | Excellent | Good | N/A | Good |
+| **Horizontal scale** | Limited (single-node focus) | Limited | Excellent | Excellent | **Excellent** |
+| **Object-storage native** | No | Partial | Yes | Yes | **Yes (end-to-end)** |
+| **Open source** | Yes | Yes | Yes | No | Yes |
+
+The unique positioning: **end-to-end object-storage native** (no NVMe required,
+no local-state assumptions) **+ full SQL via DBSP** (correctness guarantees) **+
+adaptive per-operator parallelism**.
 
 ---
 
 ## Appendix: Key Encoding Reference
 
 ```
-Notation: X(N) = field X encoded as N bytes, BE = big-endian.
+Per-shard SlateDB:
+  op_state/agg:        0x01 0xAG op_id(16) group_key(var)
+  op_state/minmax:     0x01 0xMM op_id(16) group_key(var) value(var) row_hash(8)
+  op_state/join_L:     0x01 0xJL op_id(16) join_key(var) row_id(16)
+  op_state/join_R:     0x01 0xJR op_id(16) join_key(var) row_id(16)
+  op_state/distinct:   0x01 0xDS op_id(16) row_hash(16)
+  op_state/window:     0x01 0xWN op_id(16) part_key(var) order_key(var) row_id(16)
+  op_state/timewin:    0x01 0xTW op_id(16) window_id(16) key(var)
+  op_state/topk:       0x01 0xTK op_id(16) part_key(var) value_desc(var) row_id(16)
 
-catalog/table:     0x01 0x01 table_id(16)
-catalog/view:      0x01 0x02 view_id(16)
-catalog/pipeline:  0x01 0x03 pipeline_id(16)
+  op_index/cached_extremum: 0x02 0xMM op_id(16) group_key(var)
+  op_index/segtree:         0x02 0xST op_id(16) part_key(var) node_id(8)
 
-changelog entry:   0x02 table_id(16) epoch(8 BE) seq(8 BE)
+  view_output:         0x03 view_id(16) output_key(var)
 
-op_state/agg:      0x03 0xAG op_id(16) partition(2 BE) group_key(var)
-op_state/join_L:   0x03 0xJL op_id(16) partition(2 BE) join_key(var) row_id(8 BE)
-op_state/join_R:   0x03 0xJR op_id(16) partition(2 BE) join_key(var) row_id(8 BE)
-op_state/distinct: 0x03 0xDS op_id(16) partition(2 BE) row_hash(8 BE)
-op_state/topk:     0x03 0xTK op_id(16) partition(2 BE) group_key(var) value(var) row_id(8)
-op_state/window:   0x03 0xWN op_id(16) partition(2 BE) window_end_ts(8 BE) row_id(8 BE)
+  shuffle_inbox:       0x04 exchange_id(16) src_shard(4) epoch(8 BE) seq(8 BE)
+  shuffle_outbox:      0x05 exchange_id(16) target_shard(4) epoch(8 BE) seq(8 BE)
 
-view_output:       0x04 view_id(16) partition(2 BE) output_key(var)
+  shard_meta/frontier: 0x06 0xFR op_id(16) output_port(2 BE)
+  shard_meta/sink:     0x06 0xSK connector_id(16) epoch(8 BE)
+  shard_meta/epoch:    0x06 0xEP
 
-coord/lease:       0x05 0xWL pipeline_id(16) worker_id(16)
-coord/watermark:   0x05 0xWM pipeline_id(16) partition(2 BE)
-coord/frontier:    0x05 0xGF pipeline_id(16)
-coord/checkpoint:  0x05 0xCP pipeline_id(16)
+Control-plane SlateDB:
+  catalog/table:       0x01 0x01 table_id(16)
+  catalog/view:        0x01 0x02 view_id(16)
+  catalog/pipeline:    0x01 0x03 pipeline_id(16)
 
-delta_buffer:      0x06 pipeline_id(16) epoch(8 BE) partition(2 BE) op_id(16) key(var)
+  plan/physical:       0x02 0x01 pipeline_id(16)
+  plan/assignment:     0x02 0x02 pipeline_id(16) op_id(16) instance(4 BE)
+
+  topology/worker:     0x03 0x01 worker_id(16)
+  topology/shard:      0x03 0x02 shard_id(16)
+  topology/shard_map:  0x03 0x03 exchange_id(16) → versioned ShardMap
+
+  frontier/op:         0x04 op_id(16) output_port(2 BE)
+  frontier/consumed:   0x04 0xEX exchange_id(16)
+
+  checkpoints/cluster: 0x05 checkpoint_id(16)
+
+  connector/offset:    0x06 0x01 connector_id(16)
+  connector/sink:      0x06 0x02 connector_id(16)
 ```
