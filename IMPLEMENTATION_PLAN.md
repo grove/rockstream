@@ -763,7 +763,17 @@ production-ready.
 - **Connector lifecycle**: deploy, pause, resume, delete; failure isolation.
 - **Connector contract**: built-in Rust traits and external gRPC protocol share
   the same `discover_schema`, `start_snapshot`, `poll_delta`, `commit_offset`,
-  `prepare`, `commit`, and `abort` surface from DESIGN.md §13.3.
+  `prepare`, `commit`, and `abort` surface from DESIGN.md §13.3. The contract
+  includes the three v3.8 additions: source offsets are opaque `OffsetToken`
+  bytes (so multi-partition sources like Kafka and Kinesis fit the same
+  trait); `poll_delta` returns a `watermark: Option<EventTimeWatermark>`
+  alongside the delta batch (so time-window operators in §6.9 can advance
+  the event-time frontier); and the source operator exposes
+  `credits_available()` so connectors throttle their poll rate to downstream
+  backpressure rather than consume at unbounded source rate.
+- **Dead-letter sink routing**: per-record decode errors become `RS-1003`
+  events and are routed to a configurable DLQ sink. Implemented as a
+  connector-tier concern; the IVM core never sees malformed records.
 - **Per-connector source-epoch vector** (DESIGN.md §8.1.1): each connector
   maintains a strictly increasing `source_epoch` and persists
   `control: connector/{id}/epoch_map/{source_epoch} → { partition →

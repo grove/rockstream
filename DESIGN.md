@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.7. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.8. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -63,6 +63,15 @@ object storage.
 > (§10.6), separation of the frontier aggregator from the Raft control plane
 > for scale-out (§3), per-connector source-epoch vector semantics for
 > multi-partition sources (§8.1.1), and a view output retention policy (§5.7).
+>
+> **v3.8 closes three gaps in the connector contract** (§13.3) before any
+> connector is implemented: sources must emit an event-time watermark
+> alongside delta batches so time-window operators (§6.9) can close windows
+> correctly; the source offset is an opaque `OffsetToken` (serialisable
+> bytes) so multi-partition sources like Kafka and Kinesis fit without
+> contract changes; and the source operator exposes a `credits_available()`
+> signal so the connector's poll rate is governed by downstream backpressure
+> rather than runaway ingestion.
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -765,6 +774,12 @@ SlateDB **TTL** based on event-time-derived deadlines and a frontier-aware
 compaction filter. The filter is only allowed to remove data older than both
 the event-time expiry and the relevant input/output frontiers.
 
+The operator's **event-time input frontier** is advanced by watermarks
+emitted by source connectors (§13.3). Without a connector-supplied
+watermark, event-time semantics degrade to best-effort guesswork; the
+connector contract therefore makes watermark emission a first-class return
+value of `poll_delta`, separate from the source-epoch dimension.
+
 **Late-data policy.** A row is *late* for window `W` if its event-time falls
 below the operator's current input frontier minus `allowed_lateness`. Per
 pipeline or per time-window operator, the operator declares:
@@ -1376,13 +1391,47 @@ Connector types are pluggable, but the contract is fixed. Built-in connectors
 implement it as Rust traits; external connectors use the same protocol over
 gRPC so they can run in a separate connector tier.
 
+**Opaque offset type.** Source positions are carried as an `OffsetToken`
+(serialisable opaque bytes), not as a scalar. Kafka encodes a
+`{ partition_id → offset }` map; Postgres CDC encodes an LSN; S3 / Iceberg /
+Delta encode a manifest pointer; Kinesis encodes a shard-sequence map.
+Making the type opaque keeps the trait stable across every realistic
+source and is what `control: connector/{id}/offset` and the epoch_map
+entries in §8.1.1 already store.
+
+**Event-time watermark channel.** Source-offset progress (`OffsetToken`) is
+processing-time progress. It is not sufficient for time-window operators
+(§6.9), which need to know when it is safe to close a window over
+out-of-order event streams. Source connectors therefore emit a second,
+independent signal: a monotonic `EventTimeWatermark` returned alongside
+the delta batch. The source operator propagates this as an event-time
+antichain advance through the frontier protocol (§8). A connector that
+cannot produce a watermark returns `None`; the corresponding event-time
+frontier never advances and the operator's late-data policy (§6.9) treats
+all windows as still open.
+
+**Backpressure feedback.** The credit-based backpressure system (§7.2, P14)
+governs operator-to-operator flow, but the connector sits upstream of the
+operator graph and would otherwise consume at full source rate while
+downstream is saturated. The source operator therefore exposes
+`credits_available() -> usize` (in the Rust trait, a `tokio::sync::Semaphore`
+permit count; over gRPC, a flow-controlled stream). `poll_delta` must check
+this before consuming and stop polling when the pool runs dry. This bounds
+the in-flight memory footprint at the connector boundary regardless of
+source burst rate.
+
 Source connectors must provide:
 
 ```
-discover_schema() -> SchemaVersion
-start_snapshot(frontier) -> SnapshotStream
-poll_delta(after_offset, max_bytes) -> Vec<RecordBatchDelta>
-commit_offset(epoch, offset) -> IdempotentResult
+discover_schema()                  -> SchemaVersion
+start_snapshot(frontier)           -> SnapshotStream
+poll_delta(after: OffsetToken,
+           max_bytes: usize,
+           credits_available: usize)
+  -> { batches: Vec<RecordBatchDelta>,
+       new_offset: OffsetToken,
+       watermark: Option<EventTimeWatermark> }
+commit_offset(epoch, offset: OffsetToken) -> IdempotentResult
 pause(reason) / resume()
 ```
 
@@ -1396,7 +1445,9 @@ abort(epoch, pending_handle) -> IdempotentResult
 
 Every emitted row includes the stable `row_id` rules from §6.4 and the schema
 version from §4.2. Connector failures use the `RS-1xxx` error range; schema
-drift that cannot be applied online becomes `BLOCKED(RS-1002)`.
+drift that cannot be applied online becomes `BLOCKED(RS-1002)`. Per-record
+decode errors are routed to a configurable dead-letter sink as `RS-1003`
+events; this is a connector-tier concern and does not enter the IVM core.
 
 ### 13.4 Connector Catalog and Isolation
 
