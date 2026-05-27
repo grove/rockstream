@@ -122,9 +122,31 @@ in progressively more detail:
 
 | Document | Audience | What it covers |
 |---|---|---|
-| [DESIGN.md](DESIGN.md) | Engineers / architects | Full system architecture: storage layout, operator state, worker coordination, fault tolerance, scaling model, and constraints discovered from SlateDB research |
+| [DESIGN.md](DESIGN.md) | Engineers / architects | Full system architecture: storage layout, operator state, worker coordination, fault tolerance, scaling model, deployment ladder, operational guide |
 | [IVM.md](IVM.md) | IVM specialists | How the incremental-view-maintenance engine itself works — DBSP-native operators, the differentiation pass, the circuit runtime, arrangements on SlateDB, and pg_trickle as a correctness oracle |
 | [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Implementers | Phase-by-phase build plan from empty repo to GA, including corrected IVM milestones and validation gates |
+
+## How Do I Know It’s Working?
+
+The system exposes one primary health signal: **frontier lag** — how many
+milliseconds behind the freshest queryable view is compared to the source data.
+
+- **Frontier lag ≤ your configured `max_epoch_ms`**: everything is healthy.
+- **Frontier lag growing slowly**: the source is producing faster than the
+  pipeline is processing. Add more workers or increase operator parallelism.
+- **Frontier lag stuck at a specific value**: one operator or exchange is the
+  bottleneck. Run `EXPLAIN INCREMENTAL <view_name>` to see which one (flagged
+  with a `⚠`).
+- **Frontier lag spiked and recovered**: a worker crashed and restarted; the
+  system recovered automatically from its last checkpoint.
+
+A Grafana dashboard template ships with the project at
+`deploy/dashboards/rockstream-overview.json`. It shows frontier lag,
+throughput, and state growth for every pipeline in one view.
+
+For development and evaluation, RockStream can run as a **single process** on
+a laptop with local storage (`rockstream start --mode=single --storage=./data`).
+No cluster setup, no cloud account, no configuration required.
 
 ## Contributing
 

@@ -49,9 +49,10 @@ object storage.
 11. [Fault Tolerance & Exactly-Once Semantics](#11-fault-tolerance--exactly-once-semantics)
 12. [Query Serving](#12-query-serving)
 13. [Connectors & External I/O](#13-connectors--external-io)
-14. [Observability, Backpressure, Admission Control](#14-observability-backpressure-admission-control)
+14. [Operations: Deploy, Monitor, Diagnose](#14-operations-deploy-monitor-diagnose)
 15. [Comparison to Prior Art](#15-comparison-to-prior-art)
-16. [Appendix: Key Encoding Reference](#appendix-key-encoding-reference)
+16. [Optimality Assessment (v3.1)](#16-optimality-assessment-v31)
+17. [Appendix: Key Encoding Reference](#appendix-key-encoding-reference)
 
 ---
 
@@ -74,6 +75,7 @@ object storage.
 | P13 | **Causal time.** | Progress is an antichain over `(shard_id, source_epoch)` pairs. There is no global LSN. The cluster frontier is computed asynchronously from per-shard frontiers and is allowed to lag by a bounded budget. |
 | P14 | **Async scheduling.** | Operators are long-lived async tasks. There is no synchronous global scheduler tick and no per-stream ownership checker. Backpressure flows via credits; progress flows via frontiers. |
 | P15 | **Bounded staleness for cross-shard reads.** | Query gateways pin to a published cluster frontier (a vector of per-shard checkpoints) rather than to wall-clock "fresh"; the staleness budget is documented and observable. |
+| P16 | **Simple to understand and operate.** | A one-person team must be able to deploy, monitor, and recover the system without deep internals knowledge. The system degrades predictably — never silently — and reports problems in terms of views and pipelines, not shards and antichains. One number (frontier lag) answers "is it healthy?"; four knobs cover 95% of tuning needs. |
 
 ### 1.1 Non-Goals (Explicit)
 
@@ -934,46 +936,140 @@ independent of operator processes — they can be co-located or run as a separat
 
 ---
 
-## 14. Observability, Backpressure, Admission Control
+## 14. Operations: Deploy, Monitor, Diagnose
 
-### 14.1 Metrics
+### 14.1 Deployment Ladder
+
+RockStream runs at any scale from a single laptop to hundreds of nodes. Start
+small; grow as needed.
+
+```
+Tier 1 — Single process (dev / eval)
+  One `rockstream` binary, in-process control plane, one worker,
+  a handful of shards, MinIO or a local directory as object storage.
+  Start with:  rockstream start --mode=single --storage=./data
+  This tier is how most contributors develop against the engine.
+
+Tier 2 — Single host (small production)
+  One control-plane process + one or more worker processes on the same host.
+  Shared object storage (S3/GCS or MinIO). 4–16 shards.
+  Horizontal scale within one box; survives worker restarts.
+
+Tier 3 — Multi-host cluster (full production)
+  3 control-plane nodes (HA) + N worker nodes + shared object storage.
+  Hundreds or thousands of shards. Elastic: add / remove workers online.
+```
+
+Every tier uses the same binary, the same storage layout (§5), and the same
+SQL interface. Moving from Tier 1 to Tier 2 means changing two config keys
+(`control.mode=distributed`, `storage.bucket=...`). No data migration is
+needed because all state is in object storage.
+
+### 14.2 The One Signal: Frontier Lag
+
+The cluster-wide **frontier lag** is the single number that answers "is the
+system healthy?":
+
+```
+frontier_lag = wall_clock_now − source_event_time_of_the_oldest_unprocessed_epoch
+```
+
+When frontier lag is at or below your configured `max_epoch_ms`, views are
+as fresh as they can be. When it grows:
+
+| Lag pattern | Likely cause | Where to look |
+|---|---|---|
+| Steady slow climb | Source ingestion rate exceeds processing capacity | `rows_in_per_sec` vs `rows_out_per_sec` per pipeline |
+| Sudden spike, then recovers | Worker crash + recovery | Worker health; checkpoint age |
+| Stuck at a specific operator | That operator is the bottleneck | `epoch_ms` per op; `op_state` size growth |
+| Stuck at a shuffle exchange | Receiver shard is overwhelmed or unreachable | `shuffle_outbox_depth` on sender; receiver health |
+| Steady but never zero | Source is slower than expected | Connector lag metric |
+
+All of these signals are emitted per pipeline, per operator, and per shard
+under the `rockstream_` Prometheus namespace. A recommended starter Grafana
+dashboard is included in `deploy/dashboards/`.
+
+### 14.3 Diagnosing a Slow or Stuck Pipeline
+
+Run `EXPLAIN INCREMENTAL <view_name>` to get a human-readable summary of the
+view's operator graph annotated with the latest per-operator statistics:
+
+```
+VIEW  sales_by_product  [lag: 450 ms ↑]  state: 12 GB
+ ├─ AGG  SUM(quantity) GROUP BY product_id  [avg_epoch: 3 ms]  [shards: 8]
+ │   └─ EXCHANGE  hash(product_id)  [depth: 0 batches]  [throughput: 1.2 M rows/s]
+ │       └─ JOIN  orders ⋈ products ON product_id  [avg_epoch: 180 ms ⚠]  [shards: 32]
+ │           ├─ EXCHANGE  hash(product_id)  [depth: 14 batches ⚠]  [throughput: 800 k rows/s]
+ │           │   └─ SCAN  orders  [connector_lag: 0 ms]
+ │           └─ SCAN  products  [connector_lag: 0 ms]
+```
+
+The `⚠` flags draw attention to operators whose `avg_epoch_ms` or
+`shuffle_outbox_depth` exceed their respective thresholds. In this example the
+join is slow and the upstream exchange has a growing outbox — both point to
+the join as the bottleneck. The action is to increase `parallelism` on that
+join (add more shards). The system can do this online via:
+
+```sql
+ALTER VIEW sales_by_product SET (operator.join.parallelism = 64);
+```
+
+Or let the control plane's adaptive re-planner do it automatically when
+`adaptive_parallelism = true` (the default).
+
+### 14.4 The Four Knobs
+
+For 95% of operational tuning, only four parameters matter:
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `min_epoch_ms` | 50 ms | Minimum time between commits. Raise this to reduce object-store write costs at low throughput. |
+| `max_epoch_ms` | 500 ms | Maximum allowed frontier lag before the system emits a warning and forces a commit. Drives freshness SLO. |
+| `frontier_agg_interval` | 100 ms | How often the control plane aggregates shard frontiers. Lower = fresher GC; higher = cheaper control plane. |
+| `operator.*.parallelism` | auto | Per-operator shard count. `auto` lets the cost model pick; override when you see a specific operator as the bottleneck in `EXPLAIN INCREMENTAL`. |
+
+Everything else is either set-and-forget (WAL listing cache, segment extractor,
+compaction schedule) or lives in the connector config (Kafka group-id, offset
+reset policy, etc.).
+
+### 14.5 Metrics Reference
 
 Every shard and every operator instance reports:
-- Throughput (rows/sec in & out).
-- Latency (epoch processing time, end-to-end frontier lag).
-- State size (bytes & rows in op_state).
-- Shuffle traffic (bytes sent/received per exchange).
-- Compaction stats.
+- `frontier_lag_ms` — per pipeline, the primary SLO metric.
+- `rows_in_per_sec`, `rows_out_per_sec` — throughput.
+- `epoch_ms` — per operator, processing time per epoch.
+- `op_state_bytes`, `op_state_rows` — arrangement size.
+- `shuffle_outbox_depth` — pending batches on each exchange sender.
+- `connector_lag_ms` — age of the oldest unread event in the source.
+- `compaction_backlog_bytes` — SST bytes awaiting compaction.
 
-Exported via Prometheus / OpenTelemetry.
+Exported via Prometheus / OpenTelemetry. A Grafana dashboard template is
+provided in `deploy/dashboards/rockstream-overview.json`.
 
-### 14.2 Frontier Lag = Freshness
-
-The cluster-wide frontier lag = `now - max(source_epoch_timestamp ≤ frontier)`.
-This is the operational SLO: "how stale is the freshest queryable view?"
-
-### 14.3 Backpressure
+### 14.6 Backpressure
 
 The exchange subsystem implements credit-based flow control:
 - Receivers grant N credits per sender.
 - Senders may have at most N unacked batches outstanding.
 - When credits exhaust, the sender blocks, which propagates upstream naturally.
 
-`shuffle_outbox/` size on a sender is itself a backpressure signal: if it grows
-beyond a threshold, the upstream operator pauses (its `WriteBatch` includes a
-wait on outbox-size).
+`shuffle_outbox/` depth on a sender is itself a backpressure signal: if it
+grows beyond a threshold, the upstream operator pauses. This always shows up
+as growing `frontier_lag_ms` well before it causes any data loss.
 
 Backpressure is **always cooperative**, never a synchronous global barrier.
-No operator blocks on a sibling operator's progress; it only blocks on its own
-credits and on its own input frontier. This is the structural reason RockStream
-does not adopt Feldera's `DynamicScheduler` ownership model, which would
-reject the multi-owner topologies that are normal in a distributed shard mesh.
+No operator blocks on a sibling's progress; it only blocks on its own credits
+and its own input frontier.
 
-### 14.4 Admission Control
+### 14.7 Admission Control
 
 The control plane refuses to start new pipelines if cluster utilization would
 exceed thresholds. It can pause low-priority pipelines to free capacity for
-high-priority ones (via a priority field in the pipeline config).
+high-priority ones (via a `priority` field in the pipeline config).
+
+A paused pipeline accumulates no new epochs; its frontier lag grows and it
+appears clearly as `PAUSED` in `EXPLAIN INCREMENTAL`. It resumes automatically
+when capacity frees up or when explicitly resumed.
 
 ---
 
