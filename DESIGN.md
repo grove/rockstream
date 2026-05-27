@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.5. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.6. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -48,6 +48,14 @@ object storage.
 > shard-state recovery path, the adaptive scheduling loop replaced with a
 > concrete source-rate throttle loop, and multi-region added as an explicit
 > non-goal.
+>
+> **v3.6 adds Postgres wire protocol compatibility**: pgwire gateway layer,
+> `READ COMMITTED` / `REPEATABLE READ` isolation via the vector-frontier model,
+> `pg_catalog` / `information_schema` stubs for ORM compatibility, Postgres type
+> OID mapping, and an internal source connector so clients can write rows
+> directly without an external Kafka or Postgres. `SERIALIZABLE` is explicitly
+> out of scope (§1.1, §12.6). Positioning: same tier as Materialize / RisingWave,
+> not a Neon-style Postgres drop-in.
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -117,11 +125,14 @@ attempting them would compromise the rest of the design:
   see a causally consistent vector frontier, not a single global LSN. Queries
   that demand global linearizability must opt in to a cluster checkpoint and
   accept higher latency.
-- **Cross-shard atomic SAVEPOINT-style transactions.** pg_trickle's diamond
-  consistency relies on PostgreSQL's local transaction manager. RockStream
-  expresses diamond consistency at the frontier layer (downstream waits for
-  all upstream members to reach the same epoch), not via a 2PC protocol that
-  blocks every shard.
+- **SERIALIZABLE isolation via cross-shard conflict detection.** True
+  `SERIALIZABLE` requires tracking read-write conflicts across shards via a
+  global conflict detector or per-shard SILock tables. This needs a global write
+  sequence number, which is an explicit non-goal (see below). `READ COMMITTED`
+  and `REPEATABLE READ` are fully supported by the existing vector-frontier
+  model (§12.6) and cover the vast majority of analytical and streaming
+  workloads. SERIALIZABLE is available only within a single shard as a future
+  extension.
 - **A global write sequence number.** SlateDB's per-DB sequence is local. We
   do not synthesize a cluster-wide sequence on top of it.
 - **Loading or linking pg_trickle / Feldera at runtime.** Neither is a Cargo
@@ -1173,6 +1184,41 @@ auth layer:
 service-account key file. Unauthenticated requests are rejected at the gateway
 before they reach any shard or control-plane write path.
 
+### 12.6 Postgres Wire Protocol Compatibility
+
+The query gateway speaks the **PostgreSQL wire protocol** (via the `pgwire`
+crate). Applications can connect with `psql`, standard JDBC/ODBC drivers, and
+any ORM that supports Postgres — without code changes for read-heavy and
+streaming workloads.
+
+**Isolation levels supported:**
+
+| Postgres level | RockStream implementation |
+|---|---|
+| `READ COMMITTED` | Each statement pins to the latest published vector frontier at statement start. |
+| `REPEATABLE READ` | `BEGIN` pins the session to a specific vector frontier; all statements in the transaction see that snapshot. |
+| `SERIALIZABLE` | **Not supported** (requires cross-shard conflict detection; see §1.1). Returns `RS-2003 isolation.serializable_not_supported`. |
+
+**Postgres catalog compatibility** required for ORMs:
+
+- `pg_catalog.pg_tables`, `pg_views`, `pg_class`, `pg_attribute`,
+  `pg_namespace`, `pg_type` — populated from the control-plane catalog.
+- `information_schema.tables`, `information_schema.columns` — generated views.
+- Postgres native **type OIDs** sent in row description messages so drivers can
+  decode column types without metadata round-trips.
+- `SET search_path`, `SHOW server_version`, `SHOW transaction_isolation` —
+  stub responses sufficient for ORM connection probes.
+
+**Postgres wire protocol does NOT imply a Postgres drop-in.** DDL (`CREATE
+TABLE`, `ALTER TABLE`) is handled via `CREATE PIPELINE` / `CREATE VIEW`
+semantics. Write DML goes through the internal source connector (§13.5).
+Extensions, `COPY`, `LISTEN`/`NOTIFY`, and advisory locks are out of scope.
+
+**Positioning**: with the Postgres wire layer plus the internal source connector
+(§13.5), RockStream operates as a *streaming SQL platform with Postgres-compatible
+read access* — the same tier as Materialize and RisingWave, not Neon. Clients
+write rows directly; the IVM engine keeps views fresh; `psql` queries views.
+
 ---
 
 ## 13. Connectors & External I/O
@@ -1230,6 +1276,45 @@ The control plane catalogs available connector types and routes connector
 instances to workers. Connector processes are independent of operator
 processes; they can be co-located for low latency or run as a separate
 "connector tier" for isolation.
+
+### 13.5 Internal (Direct-Write) Source Connector
+
+Clients do not need an external Kafka or Postgres to feed a pipeline. The
+**internal source connector** accepts DML (`INSERT`, `UPDATE`, `DELETE`) issued
+directly over the Postgres wire protocol (§12.6) and converts them to Z-set
+deltas on a dedicated **base-table shard**.
+
+```
+Client (psql / JDBC)  ──INSERT──►  Gateway  ──delta──►  Base-table shard
+                                                               │
+                                                    Internal source connector
+                                                               │
+                                                        Pipeline IVM engine
+```
+
+**Write semantics:**
+
+- Each `INSERT`/`UPDATE`/`DELETE` is appended to a per-connection write buffer
+  (analogous to a Postgres transaction buffer).
+- On `COMMIT`, the buffer is flushed as a single atomic Z-set delta to the
+  base-table shard via `WriteBatch`. The delta receives the shard's next
+  `source_epoch`, identical to any other source connector.
+- On `ROLLBACK`, the buffer is discarded without touching the shard.
+- On `BEGIN`, the session pins to the current published vector frontier for
+  `REPEATABLE READ` reads within the same transaction.
+
+**Isolation guarantees:**
+
+| Isolation | Within a session | Across sessions |
+|---|---|---|
+| `READ COMMITTED` | Reads see every committed delta before statement start. | ✅ |
+| `REPEATABLE READ` | Reads see the snapshot at `BEGIN`. Writes are session-local until `COMMIT`. | ✅ |
+| `SERIALIZABLE` | Not supported (§1.1, §12.6). | ✗ |
+
+**Self-contained operation**: with the internal source connector, a pipeline
+needs no external broker or database. Deploy RockStream, issue SQL `INSERT`
+statements, query IVM views — no Kafka, no Postgres, no infrastructure beyond
+object storage.
 
 ---
 
@@ -1587,6 +1672,9 @@ story told in docs; it is a button anyone can press.
 | **Single-node baseline** | Excellent | Excellent | Good | N/A | Good |
 | **Horizontal scale** | Limited (single-node focus) | Limited | Excellent | Excellent | **Excellent** |
 | **Object-storage native** | No | Partial | Yes | Yes | **Yes (end-to-end)** |
+| **Postgres wire protocol** | No | Yes | Yes | No | **Yes (§12.6)** |
+| **Direct DML writes** | No | No (CDC only) | No (CDC only) | No | **Yes (§13.5)** |
+| **SERIALIZABLE isolation** | No | Emulated | Emulated | N/A | **No (§1.1)** |
 | **Open source** | Yes | Yes | Yes | No | Yes |
 
 The unique positioning: **end-to-end object-storage native** (no NVMe required,

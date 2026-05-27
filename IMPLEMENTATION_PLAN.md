@@ -727,21 +727,44 @@ production-ready.
 
 ---
 
-## Phase 9 — Query Gateway
+## Phase 9 — Query Gateway & Postgres Compatibility
 
-**Goal**: Serve materialized views to applications.
+**Goal**: Serve materialized views to applications over the Postgres wire
+protocol. Make RockStream self-contained (no external broker required).
 
 **Deliverables**
 
-- **Gateway service** (stateless, horizontally scalable):
-  - PostgreSQL wire protocol compatibility (using `pgwire`).
+- **pgwire gateway** (stateless, horizontally scalable):
+  - Postgres wire protocol (`pgwire` crate): startup, query, extended-query,
+    copy-out, terminate message flows.
   - Routes lookups & range scans to the correct shards via `DbReader`.
   - Ad-hoc SQL over materialized views (DataFusion on a snapshot).
   - Connection pooling, query timeouts, rate limiting.
+- **Postgres catalog stubs** required by ORMs:
+  - `pg_catalog.pg_tables`, `pg_views`, `pg_class`, `pg_attribute`,
+    `pg_namespace`, `pg_type` — generated from the control-plane catalog.
+  - `information_schema.tables`, `information_schema.columns`.
+  - `SHOW server_version`, `SHOW transaction_isolation`, `SET search_path`
+    stub responses.
+- **Postgres type OID mapping**: every column in every view carries a
+  Postgres-native OID in the row-description message so JDBC/ODBC drivers
+  decode without metadata round-trips.
+- **Session isolation levels** (DESIGN.md §12.6):
+  - `READ COMMITTED`: each statement pins to latest published vector frontier.
+  - `REPEATABLE READ`: `BEGIN` captures a vector frontier; all statements in
+    the transaction see that snapshot; `COMMIT`/`ROLLBACK` releases it.
+  - `SERIALIZABLE`: rejected with `RS-2003 isolation.serializable_not_supported`.
+- **Internal (direct-write) source connector** (DESIGN.md §13.5):
+  - `INSERT`/`UPDATE`/`DELETE` DML over the Postgres wire protocol appended to
+    a per-connection write buffer.
+  - `COMMIT` flushes as an atomic Z-set delta via `WriteBatch` to a dedicated
+    base-table shard, receiving the shard's next `source_epoch`.
+  - `ROLLBACK` discards the buffer without shard writes.
+  - Exit criterion: `psql` can `INSERT INTO t VALUES (...); SELECT * FROM view`
+    and see the view reflect the insert within `freshness_target_ms`.
 - **Subscribe API**: gRPC streaming endpoint that tails view changes (via
-  `WalReader` on the relevant shards).
-- **Snapshot consistency**: gateways pin to a recent cluster checkpoint so
-  multiple gateway hops see consistent data.
+  `WalReader` on the relevant shards). Gateway proxies subscriptions; raw
+  shard access is never exposed to clients.
 - **Freshness tokens**: query responses return the vector frontier used;
   clients can pass `wait_for=<token>` for read-your-writes semantics with a
   timeout and explicit satisfied/not-satisfied response.
@@ -759,7 +782,11 @@ production-ready.
 **Exit criteria**
 
 - `psql` connects, runs `SELECT * FROM my_view LIMIT 10`, returns < 10 ms.
+- `psql` runs `INSERT INTO t VALUES (...); COMMIT` and view reflects it within
+  `freshness_target_ms`.
+- SQLAlchemy ORM reflects view schema without errors.
 - Subscribe stream survives gateway restart with no data loss.
+- `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` returns `RS-2003`.
 
 ---
 
