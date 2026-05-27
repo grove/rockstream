@@ -174,7 +174,7 @@ RockStream brings these ideas to an open, cloud-native storage foundation.
 
 ## Status
 
-This project is in the **design phase** (current revision: **v3.7**). Three
+This project is in the **design phase** (current revision: **v3.7**). Four
 documents describe the system in progressively more detail:
 
 | Document | Audience | What it covers |
@@ -182,6 +182,7 @@ documents describe the system in progressively more detail:
 | [DESIGN.md](DESIGN.md) | Engineers / architects | Full system architecture: storage layout, operator state, worker coordination, fault tolerance, scaling model, deployment ladder, operational guide |
 | [IVM.md](IVM.md) | IVM specialists | How the incremental-view-maintenance engine itself works — DBSP-native operators, the differentiation pass, the circuit runtime, arrangements on SlateDB, and pg_trickle as a correctness oracle |
 | [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Implementers | Phase-by-phase build plan from empty repo to GA, including corrected IVM milestones and validation gates |
+| [ROADMAP.md](ROADMAP.md) | Builders / planners | Version-by-version delivery roadmap, with each roadmap version sized at about 10 person-weeks and tied to concrete proof |
 
 ## How Do I Know It’s Working?
 
