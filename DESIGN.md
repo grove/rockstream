@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.3. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.4. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -34,6 +34,13 @@ object storage.
 > 2. **Scheduling is async** (P14).
 > 3. **SlateDB is respected as-is** (P12).
 >
+> **v3.4 is a coherence and hardening pass.** It resolves the control-plane
+> HA contradiction, specifies merge-backed read semantics, outer-join state,
+> stable row identity, schema evolution, connector contracts, bounded barrier
+> alignment, shard-level checkpointing, shuffle fan-out limits, query freshness
+> tokens, backfill/recovery lifecycle states, and the production storage
+> profiles needed for predictable operation.
+>
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
 >   itself (PlanIR, the differentiation pass, the per-operator rules, the
@@ -61,7 +68,7 @@ object storage.
 13. [Connectors & External I/O](#13-connectors--external-io)
 14. [Operations: Deploy, Monitor, Diagnose](#14-operations-deploy-monitor-diagnose)
 15. [Comparison to Prior Art](#15-comparison-to-prior-art)
-16. [Optimality Assessment (v3.1)](#16-optimality-assessment-v31)
+16. [Optimality Assessment (v3.4)](#16-optimality-assessment-v34)
 17. [Appendix: Key Encoding Reference](#appendix-key-encoding-reference)
 
 ---
@@ -171,9 +178,10 @@ synchronous barrier.
 
 ```
                        ┌────────────────────────────┐
-                       │   Control Plane (3 nodes)   │
-                       │   (Raft / HA via SlateDB    │
-                       │    catalog + DbReader fan-  │
+                       │Control Plane (1/3/5 nodes) │
+                       │   (single writer in dev;    │
+                       │    Raft-elected writer in   │
+                       │    production; DbReader fan-│
                        │    out for query routing)   │
                        │                            │
                        │  • SQL compiler            │
@@ -209,10 +217,15 @@ synchronous barrier.
 
 ### Three Logical Tiers
 
-1. **Control plane** (≥3 nodes, HA).
-   Stateless except for a dedicated **control SlateDB** holding the catalog,
-   cluster membership, and shard-placement map. Compiles SQL, places shards
-   on workers, aggregates frontiers, drives checkpoints.
+1. **Control plane** (1 node in Tier 1/2; 3 or 5 nodes in Tier 3).
+  The durable control state is a dedicated **control SlateDB** holding the
+  catalog, cluster membership, shard-placement map, audit log, and checkpoint
+  index. In Tier 3, control nodes form a small Raft group that elects exactly
+  one control writer lease for that SlateDB. Followers serve reads via
+  `DbReader`, replay the control WAL, and can take over the writer lease after
+  Raft leadership changes. Raft protects *control-plane leadership and leases*;
+  SlateDB remains the storage engine for the catalog. This removes any hidden
+  dependency on a global data-plane transaction manager.
 
 2. **Worker plane** (elastic, N ≫ 1).
    Each worker hosts some number of **shards**. A shard is the unit of placement
@@ -329,6 +342,27 @@ The incrementalization step (4) and operator runtime are specified in detail in
 See [IVM.md §4–7](IVM.md#4-the-rockstream-ivm-architecture) for the full
 operator catalogue, runtime trait, and per-operator rules.
 
+### 4.2 Schema Evolution and Plan Replacement
+
+Every source, view, and pipeline carries an explicit schema version. Connectors
+publish schemas into `control: schema/` before they emit data, and every
+`RecordBatch` delta carries the schema version used to decode it.
+
+Schema changes are classified before they reach the runtime:
+
+| Change | Handling |
+|---|---|
+| Add nullable column or add column with default | Compatible. Existing arrangements keep their old row encoding; readers project the new column as NULL/default until rewritten by fresh deltas. |
+| Widen numeric type or compatible string/binary widening | Compatible if DataFusion can cast losslessly; recorded as a schema-version edge. |
+| Rename, drop, narrow, or change join/group/window key type | Breaking. Requires `CREATE PIPELINE ... REPLACE` or `ALTER PIPELINE ... REPLACE VIEW`, producing a blue/green plan clone (§10.5). |
+| Connector reports unexpected incompatible schema | Pipeline transitions to `BLOCKED(RS-1002)` and stops consuming new offsets until the operator approves a migration. |
+
+Online replacement uses a checkpoint/clone path: create the new plan at a
+published frontier, backfill only state whose encoding changed, run old and new
+plans in parallel until the new plan reaches the old frontier, then flip query
+routing atomically in the catalog. This is the default mechanism for `ALTER
+VIEW`, join-key changes, and breaking source-schema updates.
+
 ---
 
 ## 5. Per-Shard SlateDB Storage Layout
@@ -357,7 +391,7 @@ Prefix  Namespace            Purpose
 
 ### 5.2 Control-Plane SlateDB
 
-A small SlateDB cluster (one writer, ≥2 readers) holds:
+A dedicated control SlateDB (one writer, >=2 readers in Tier 3) holds:
 
 ```
 0x01    catalog/             Tables, views, pipelines, schemas
@@ -366,11 +400,16 @@ A small SlateDB cluster (one writer, ≥2 readers) holds:
 0x04    frontier/            Aggregated per-operator frontier (driven by workers)
 0x05    checkpoints/         Cluster-wide checkpoint references
 0x06    connector/           External-source offsets, sink commit state
+0x07    audit/               Durable event log for every control-plane action
+0x08    state_accounting/    Per-pipeline state bytes, shard count, quota usage
+0x09    schema/              Versioned source/view schemas and compatibility data
 ```
 
 Workers read this database (via `DbReader` pinned to fresh checkpoints) on
 startup and subscribe to its CDC feed (`WalReader`) for plan changes and
-topology updates. Writes to the control DB go through the control-plane leader.
+topology updates. Writes to the control DB go through the control-plane leader;
+in Tier 3, that leader must hold the current Raft-issued writer lease before it
+can open the control SlateDB for writing.
 
 ### 5.3 SlateDB API Constraints Used by This Design
 
@@ -420,6 +459,20 @@ things to discover at runtime:
   state owned by another shard use `DbReader` pinned to a published
   checkpoint, never an undefined "live" read.
 
+### 5.5 Storage Profiles and Autotuner Defaults
+
+The same binary supports two storage profiles with different default budgets:
+
+| Profile | Used by | Default tuning |
+|---|---|---|
+| `local_fs` | Tier 1 (`rockstream start --storage=./data`) | Low-latency epochs, aggressive flush cadence, small local cache. Intended to feel like an embedded database on a laptop. |
+| `object_store` | Tier 2/3 (`s3://`, `gs://`, `az://`) | Larger `min_epoch_ms`, request-rate budget enforcement, WAL listing cache, coalesced shuffle objects. Intended to minimize PUT/LIST/manifest churn. |
+
+The control plane detects the profile from the storage URL and seeds the
+auto-tuner with the correct latency/cost assumptions. Operators can still
+override SLOs and quotas, but they should not have to know whether a dev laptop
+or a 1,000-shard S3 cluster is underneath them.
+
 ---
 
 ## 6. Operator Catalog & State Encodings
@@ -446,6 +499,15 @@ Updates use `db.merge()` with an associative `AggregateMergeOp`. Output deltas
 are computed lazily: on read, finalize partial state, compare with last-emitted
 value (kept in `op_index/`), emit `(old, -1), (new, +1)`.
 
+Operators never read merge-backed keys through raw SlateDB `get()`. They read
+through `ShardDb::get_merged()` / `ShardDb::scan_merged()`, which resolve the
+base value plus all visible merge operands at the epoch snapshot being used.
+If a future SlateDB API cannot provide read-path merge resolution for a storage
+profile, RockStream falls back to a batched read-modify-write for that
+arrangement kind and marks the profile as lower throughput in `EXPLAIN
+INCREMENTAL ESTIMATE`. This makes merge laziness a performance choice, not a
+correctness assumption.
+
 ### 6.3 Aggregation with Retractions: `MIN`, `MAX`, `MEDIAN`, `PERCENTILE`
 
 These cannot use a pure merge operator because retraction (`weight = -1`) may
@@ -467,6 +529,13 @@ Two-sided join state, indexed by join key. The `Exchange` operator before each
 side guarantees both inputs are partitioned by the join key, so each shard sees
 matching pairs locally.
 
+`row_id` is a stable 128-bit identity assigned by the source connector, never a
+fresh random value at replay time. For log sources it is derived from
+`(source_id, partition, offset, row_ordinal)`; for CDC sources from the table
+primary key plus source LSN; for keyless snapshots from
+`(snapshot_id, file_path, row_group, row_ordinal)`. Idempotent replay therefore
+rewrites the same arrangement key instead of duplicating rows.
+
 ```
 0x01 0xJL op_id(16) join_key(var) row_id(16) → row_bytes  (left arrangement)
 0x01 0xJR op_id(16) join_key(var) row_id(16) → row_bytes  (right arrangement)
@@ -478,6 +547,27 @@ For each incoming left delta `(row_L, +1)`:
 - Insert `(row_L, +1)` into the left arrangement.
 
 Retractions handled symmetrically with -1.
+
+### 6.4.1 Outer Join Match Accounting
+
+LEFT, RIGHT, and FULL OUTER JOIN need explicit match-count state so null-padded
+rows flip correctly when the last match appears or disappears:
+
+```
+0x01 0xJL op_id(16) join_key(var) row_id(16) → row_bytes
+0x01 0xJR op_id(16) join_key(var) row_id(16) → row_bytes
+0x02 0xJM op_id(16) side(1) row_id(16)       → i64 match_count
+```
+
+For LEFT JOIN, a left insert with no right matches emits `(left,NULL,+1)` and
+stores `match_count=0`. A right insert scans left rows for the key: for each
+left row whose count was 0, it first retracts `(left,NULL,-1)`, increments the
+count, and emits `(left,right,+1)`. A right delete emits `(left,right,-1)`,
+decrements the left count, and if the count reaches 0 emits `(left,NULL,+1)`.
+RIGHT JOIN is symmetric. FULL JOIN runs the same accounting on both sides so
+both null-padded projections are retracted or restored exactly once. This is
+the native operator state required by the EC-01 / FULL JOIN NULL cases in the
+oracle suite.
 
 ### 6.5 Theta-Join / Cross-Join
 
@@ -577,10 +667,20 @@ latency (≈ network RTT), no object-store cost. Each batch is buffered in the
 sender's `shuffle_outbox/` (in SlateDB on the sender's shard) until the
 receiver ACKs.
 
+The fast path is **worker-to-worker**, not shard-to-shard. A worker opens at
+most one pooled bidirectional stream to each peer worker per traffic class and
+multiplexes all shard/exchange batches over it. The framing header carries
+`exchange_id`, `src_shard`, `target_shard`, `epoch`, and `seq`. This bounds
+connection count at `O(workers^2)` instead of `O(shards^2)` and keeps large
+clusters operable.
+
 **Durable path (fallback / recovery / large batches)**: sender uploads the batch
-as an object to `s3://bucket/shuffle/{exchange_id}/{epoch}/{src_shard}/{seq}.arrow`.
-Receiver polls / is notified of new objects and ingests them into its
-`shuffle_inbox/`.
+as a coalesced object to
+`s3://bucket/shuffle/{exchange_id}/{epoch}/{src_worker}/{target_worker}/{part}.arrow`.
+One object may contain many `(src_shard,target_shard,seq)` frames plus an index
+footer. The object key is written into the sender's `shuffle_outbox/`; the
+receiver learns about it through direct notification or by tailing the sender's
+outbox metadata. Receivers do **not** LIST the shuffle prefix on the hot path.
 
 The fast path is used for small low-latency batches; the durable path is used
 when the receiver is unreachable, when batches exceed a threshold, or as the
@@ -622,12 +722,16 @@ A timestamp is a vector:
 Timestamp {
   source_epoch: u64,   // monotonic epoch from ingestion
   iteration:    u32,   // for recursion; 0 outside recursive scopes
-  sub_epoch:    u32,   // for nested scopes (windows, scoped recursion)
 }
 ```
 
 Ordering is product order: `t1 ≤ t2` iff every component of `t1` ≤ corresponding
-component of `t2`. Two timestamps may be incomparable — hence we need antichains.
+component of `t2`. Two timestamps may be incomparable — hence we need
+antichains. Additional nested scopes are represented by a stack of timestamp
+components in the in-memory type (`Vec<ScopeTime>`), but the storage encoding
+starts with the two components above because they cover the v1 hot path:
+source epochs and recursive iterations. A new timestamp component is a storage
+format change and must be added through the schema/format compatibility policy.
 
 ### 8.2 Frontier
 
@@ -840,13 +944,20 @@ Every `T` seconds (or every `N` epochs), the control plane runs a
    `checkpoint_id`.
 2. Barriers flow through the DAG, aligned at multi-input operators (the operator
    waits until the barrier arrives on all inputs).
-3. When a barrier passes through an operator, that operator creates a SlateDB
-   `Checkpoint` on its shard and records `(checkpoint_id, shard_checkpoint_id)`
-   in the control plane.
-4. When all operators have reported, the control plane commits the cluster
+3. Each shard tracks which local operators have observed the barrier. When all
+   operators on that shard have durably committed through the barrier, the
+   shard creates **one** SlateDB `Checkpoint` and records
+   `(checkpoint_id, shard_checkpoint_id)` in the control plane. Checkpoints are
+   per shard, not per operator, which bounds manifest-write bursts.
+4. Barrier alignment buffers are bounded by the same credit system as shuffle:
+   if a fast input reaches its alignment credit limit while waiting for a slow
+   input's barrier, the operator stops granting upstream credits and
+   backpressure propagates to sources. A `checkpoint_alignment_timeout` turns
+   excessive waiting into `RECOVERING` or `BLOCKED`, never unbounded memory.
+5. When all shards have reported, the control plane commits the cluster
    checkpoint atomically: writes `control: checkpoints/{checkpoint_id}` with the
    full map of per-shard checkpoints.
-5. Old cluster checkpoints (beyond the retention horizon) are released, allowing
+6. Old cluster checkpoints (beyond the retention horizon) are released, allowing
    SlateDB GC to reclaim SSTs.
 
 ### 11.3 Recovery
@@ -914,6 +1025,23 @@ whether to retry against a fresher one.
 Clients can subscribe to a view's change stream. Implemented by tailing the
 shard's `WalReader` filtered to `view_output/` for the requested view-id prefix.
 
+### 12.4 Freshness Tokens and Read-Your-Writes
+
+Every source commit, sink commit, and query response can carry a **freshness
+token**:
+
+```
+FreshnessToken { source_id, source_epoch, cluster_frontier_hash }
+```
+
+For normal low-latency reads, the gateway pins to the freshest published vector
+frontier and returns the token it used. For read-your-writes, clients pass
+`wait_for=<FreshnessToken>`; the gateway waits until the published vector
+frontier dominates the requested source epoch or until a caller-supplied
+timeout expires. The query result then explicitly says whether the token was
+satisfied. This gives application developers a simple contract without
+exposing antichains in the default path.
+
 ---
 
 ## 13. Connectors & External I/O
@@ -937,11 +1065,39 @@ Symmetric: a sink operator collects committed view-output deltas (from
 `WalReader`), buffers them per the 2PC protocol in §11.4, and commits to the
 external system after cluster checkpoints.
 
-### 13.3 Connector Catalog
+### 13.3 Connector Contract
 
-Connector types are pluggable. The control plane catalogs available connector
-types and routes connector instances to workers. Connector processes are
-independent of operator processes — they can be co-located or run as a separate
+Connector types are pluggable, but the contract is fixed. Built-in connectors
+implement it as Rust traits; external connectors use the same protocol over
+gRPC so they can run in a separate connector tier.
+
+Source connectors must provide:
+
+```
+discover_schema() -> SchemaVersion
+start_snapshot(frontier) -> SnapshotStream
+poll_delta(after_offset, max_bytes) -> Vec<RecordBatchDelta>
+commit_offset(epoch, offset) -> IdempotentResult
+pause(reason) / resume()
+```
+
+Sink connectors must provide:
+
+```
+prepare(epoch, rows) -> pending_handle
+commit(epoch, pending_handle, checkpoint_id) -> IdempotentResult
+abort(epoch, pending_handle) -> IdempotentResult
+```
+
+Every emitted row includes the stable `row_id` rules from §6.4 and the schema
+version from §4.2. Connector failures use the `RS-1xxx` error range; schema
+drift that cannot be applied online becomes `BLOCKED(RS-1002)`.
+
+### 13.4 Connector Catalog and Isolation
+
+The control plane catalogs available connector types and routes connector
+instances to workers. Connector processes are independent of operator
+processes; they can be co-located for low latency or run as a separate
 "connector tier" for isolation.
 
 ---
@@ -1007,11 +1163,23 @@ WITH (
     priority            = normal       -- low | normal | high
 )
 AS
+    CREATE SOURCE orders FROM kafka (...);
+
     CREATE VIEW sales_by_product AS
         SELECT product_id, SUM(quantity) AS qty
         FROM   orders
         GROUP BY product_id;
+
+    CREATE VIEW sales_by_region AS
+        SELECT region, SUM(quantity) AS qty
+        FROM   orders
+        GROUP BY region;
 ```
+
+A pipeline may contain many sources and many views. The compiler builds one
+shared operator DAG so common subplans are maintained once and fanned out to
+multiple view sinks. `ALTER PIPELINE ... ADD VIEW` and `ALTER PIPELINE ...
+REPLACE VIEW` use the schema/plan replacement path from §4.2.
 
 The control plane auto-tunes the four mechanism knobs (§14.6) to satisfy the
 SLO inside the quota. Operators do not normally set those knobs; they set
@@ -1140,6 +1308,8 @@ drops data without an explicit, surfaced reason. States:
 | State | Meaning | Operator action |
 |---|---|---|
 | `HEALTHY` | SLO met, quota margin available. | None. |
+| `BACKFILLING` | Pipeline is loading historical source data. SLO compliance is not counted yet; `backfill_progress` is shown separately. | Wait or raise bootstrap parallelism/quota. |
+| `RECOVERING` | Worker or shard recovery is replaying from a checkpoint. SLO compliance is temporarily excluded from alerting until `recovery_deadline`. | Watch recovery progress; investigate only if deadline expires. |
 | `STRESSED` | SLO met, quota ≥ 80% utilised. | Plan capacity addition. |
 | `OVER_BUDGET_RELAXED` | SLO relaxed by the system because state budget is full. Freshness is degraded but data is correct. | Raise `state_budget_gb` or revise view to reduce state. |
 | `RPS_THROTTLED` | SLO relaxed because object-store quota is the bottleneck. | Raise `object_store_rps` or revise SLO. |
@@ -1233,12 +1403,15 @@ Every shard, operator instance, and pipeline reports:
 - `pipeline_slo_compliance` — the primary indicator (§14.4).
 - `pipeline_degraded_reason` — label when below 1.0 (§14.10).
 - `frontier_lag_ms` — raw lag, per pipeline.
+- `backfill_progress` — fraction of initial snapshot consumed.
+- `recovery_progress` — fraction of shards/operators caught up after restart.
 - `rows_in_per_sec`, `rows_out_per_sec` — throughput.
 - `epoch_ms` — per operator, processing time per epoch.
 - `op_state_bytes`, `op_state_rows` — arrangement size.
 - `shuffle_outbox_depth` — pending batches on each exchange sender.
 - `connector_lag_ms` — age of the oldest unread event in the source.
 - `compaction_backlog_bytes` — SST bytes awaiting compaction.
+- `checkpoint_age_seconds`, `checkpoint_duration_seconds`, `checkpoint_lag_ms` — recovery planning and checkpoint health.
 - `object_store_rps` — PUT+GET+LIST+DELETE per second per shard.
 - `autotune_decisions_total` — counter labeled by `(loop, direction)`.
 
@@ -1291,12 +1464,11 @@ adaptive per-operator parallelism**.
 
 ---
 
-## 16. Optimality Assessment (v3.1)
+## 16. Optimality Assessment (v3.4)
 
-The v3.1 review against `../feldera`, `../pg-trickle1`, and `../slatedb`
-asked five questions of this design. Each answer is the structural commitment
-this document now encodes; the open risks list what remains to validate in
-implementation.
+The v3.4 review asks whether the design is coherent, easy to operate, and
+optimal enough to build. Each answer is a structural commitment encoded in this
+document; the open risks list what remains to validate in implementation.
 
 ### 16.1 Is the storage substrate used correctly?
 
@@ -1334,7 +1506,16 @@ with a documented staleness budget (§8.4). Query reads pin to a published
 vector frontier (§12.2). Recursion participates in the same antichain via the
 inner `iteration` component.
 
-### 16.5 Where is the design still at risk?
+### 16.5 Is the system understandable and operable?
+
+**Yes, with an explicit operating contract.** Operators deploy pipelines and
+query views; shards, antichains, arrangements, checkpoints, and WAL segments
+are internal unless a drill-down is requested. SLO compliance is the primary
+signal (§14.4). `EXPLAIN INCREMENTAL`, `EXPLAIN INCREMENTAL ESTIMATE`, the
+audit log, named degraded states, support bundles, and freshness tokens make
+the system explain itself before and during failure.
+
+### 16.6 Where is the design still at risk?
 
 The following items are the explicit validation backlog and feed the
 implementation plan's Phase 3.5 and Phase 4 acceptance criteria:
@@ -1357,8 +1538,21 @@ implementation plan's Phase 3.5 and Phase 4 acceptance criteria:
   windowed expiry. Every filter has a written argument that no `Drop`
   decision could resurrect a version observable by an active reader.
 - **Control-plane HA**. A single SlateDB writer with hot readers is good
-  enough for MVP; production HA likely needs an external consensus or lease
-  layer. Tracked as IMPLEMENTATION_PLAN.md open question 7.
+  enough for Tier 1/2; production uses a Raft-elected writer lease over the
+  control SlateDB (§3). The remaining risk is implementation complexity, not an
+  architectural gap.
+- **Schema evolution and blue/green plan replacement**. Compatible changes are
+  straightforward; breaking changes require clone/backfill/flip and must prove
+  they preserve exactly-once source offsets.
+- **Exchange object count and connection fan-out**. The design now bounds both
+  with worker-level multiplexing and coalesced durable shuffle objects (§7.2),
+  but Phase 4 must validate the request-rate math at thousands of shards.
+- **Barrier alignment under skew**. Checkpoint buffering is bounded by credits
+  (§11.2), but Phase 6 must prove it does not starve quiet inputs or trigger
+  false recovery under bursty sources.
+- **Auto-tuner stability**. Hysteresis and auditability are specified (§14.5),
+  but workloads with step-function traffic still need soak tests to ensure the
+  tuner does not oscillate.
 
 The design is considered structurally sound modulo these validations.
 
@@ -1372,6 +1566,7 @@ Per-shard SlateDB:
   op_state/minmax:     0x01 0xMM op_id(16) group_key(var) value(var) row_hash(8)
   op_state/join_L:     0x01 0xJL op_id(16) join_key(var) row_id(16)
   op_state/join_R:     0x01 0xJR op_id(16) join_key(var) row_id(16)
+  op_index/join_match: 0x02 0xJM op_id(16) side(1) row_id(16)
   op_state/distinct:   0x01 0xDS op_id(16) row_hash(16)
   op_state/window:     0x01 0xWN op_id(16) part_key(var) order_key(var) row_id(16)
   op_state/timewin:    0x01 0xTW op_id(16) window_id(16) key(var)
@@ -1409,4 +1604,9 @@ Control-plane SlateDB:
 
   connector/offset:    0x06 0x01 connector_id(16)
   connector/sink:      0x06 0x02 connector_id(16)
+
+  audit/event:          0x07 ulid(16)
+  state_accounting:    0x08 pipeline_id(16) metric_id(2)
+  schema/source:        0x09 0x01 source_id(16) version(8 BE)
+  schema/view:          0x09 0x02 view_id(16) version(8 BE)
 ```

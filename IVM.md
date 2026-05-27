@@ -554,8 +554,28 @@ pg_trickle has dedicated implementations
 [`full_join.rs`](../pg-trickle1/src/dvm/operators/full_join.rs)) that handle
 unmatched-side NULL padding and the matched→unmatched transitions.
 
-**RockStream**: same logic; one extra arrangement per side tracking
-"currently unmatched" rows so transitions can emit retractions.
+**RockStream**: same logic; one extra match-count arrangement per side tracks
+whether each row is currently unmatched:
+
+```
+left_arr[join_key, row_id]  -> row bytes
+right_arr[join_key, row_id] -> row bytes
+match_count[side, row_id]  -> i64
+```
+
+LEFT JOIN rules:
+- Left insert: scan right. If no matches, emit `(left,NULL,+1)` and store
+  `match_count=0`; otherwise emit `(left,right,+1)` for each right row and
+  store the count.
+- Right insert: scan left. For every left row whose previous count was 0,
+  retract `(left,NULL,-1)` before emitting `(left,right,+1)`, then increment
+  the count.
+- Right delete: emit `(left,right,-1)`, decrement the left count, and if the
+  count reaches 0 emit `(left,NULL,+1)`.
+
+RIGHT JOIN is symmetric. FULL JOIN applies the same accounting to both sides.
+This is the native operator state behind the EC-01 and FULL JOIN NULL-padding
+oracle cases.
 
 ### 7.5 Semi-Join / Anti-Join (`semi_join.rs`, `anti_join.rs`)
 
@@ -774,9 +794,13 @@ SlateDB value:
   Arrow IPC row(s) packed as bytes  +  weight: i64
 ```
 
-The `tiebreak_id` is a 16-byte stable row identifier (PK hash or random ULID
-for keyless tables) that makes keys unique even when multiple rows share the
-same arrangement key (e.g., the join key).
+The `tiebreak_id` is a 16-byte stable row identifier that makes keys unique
+even when multiple rows share the same arrangement key (e.g., the join key).
+It is never generated randomly during replay. Source connectors derive it from
+durable input identity: `(source_id, partition, offset, row_ordinal)` for log
+sources, table primary key plus source LSN for CDC, or `(snapshot_id,
+file_path, row_group, row_ordinal)` for keyless snapshots. This keeps replay
+idempotent: the same source row rewrites the same arrangement entry.
 
 ### 9.2 Standard Encodings (Mirrors [DESIGN.md §6](DESIGN.md#6-operator-catalog--state-encodings))
 
@@ -785,6 +809,7 @@ same arrangement key (e.g., the join key).
 | `0xAG` | SUM/COUNT/AVG group state | `group_key` | `(sum: i128, count: i64, …)` |
 | `0xMM` | MIN/MAX sorted multiset | `group_key + value_bytes + row_id` | `weight: i64` |
 | `0xJL` / `0xJR` | Join arrangement (left / right side) | `join_key + row_id` | `row Arrow bytes` |
+| `0xJM` | Outer-join match count | `side + row_id` | `i64 match_count` |
 | `0xDS` | Distinct/union | `row_hash + row_id` | `weight: i64` |
 | `0xWN` | Window function | `partition_key + order_key + row_id` | `row Arrow bytes` |
 | `0xTW` | Time-window state | `window_id + key` | `partial_state` |
@@ -794,9 +819,14 @@ same arrangement key (e.g., the join key).
 ### 9.3 Why MergeOperator Matters Here
 
 For algebraic aggregates and distinct/union, `MergeOperator` lets us issue
-`db.merge(key, delta)` without a read-modify-write cycle. The merge is
-applied lazily during reads and compactions — exactly the property that
-makes high-throughput aggregations practical on an LSM.
+`db.merge(key, delta)` without a read-modify-write cycle. The merge is applied
+lazily, so every runtime read of a merge-backed arrangement goes through
+`ShardDb::get_merged()` / `ShardDb::scan_merged()` rather than raw SlateDB
+`get()` / `scan()`. That wrapper resolves the base value plus all visible merge
+operands at the epoch snapshot being read. If a storage profile cannot provide
+correct read-path merge resolution, that arrangement kind falls back to batched
+read-modify-write and `EXPLAIN INCREMENTAL ESTIMATE` reports the throughput
+penalty.
 
 Concretely, our `AggregateMergeOp` decodes both operands as `(sum, count)`
 tuples and emits their sum. For distinct/union, the merge is `i64` addition,

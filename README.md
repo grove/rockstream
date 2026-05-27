@@ -141,12 +141,16 @@ the fraction of the recent window for which your declared freshness target was m
 
 - **SLO compliance = 1.0**: pipeline is healthy.
 - **SLO compliance < 1.0**: a `degraded_reason` label says *why* in plain terms
-  (`OVER_BUDGET_RELAXED`, `RPS_THROTTLED`, `BLOCKED`, etc.) so you know whether to
-  add capacity, raise a quota, or fix a connector.
+  (`BACKFILLING`, `RECOVERING`, `OVER_BUDGET_RELAXED`, `RPS_THROTTLED`,
+  `BLOCKED`, etc.) so you know whether to wait, add capacity, raise a quota,
+  or fix a connector.
 - **`rockstream explain <view>`**: shows the operator tree with per-operator
   diagnostics and what the auto-tuner is currently doing.
 - **`rockstream explain <view> --estimate`**: previews cost, state size, and
   achievable freshness *before* you deploy a new view.
+- **Freshness tokens**: query responses can include the source frontier they
+  observed; clients that need read-your-writes behavior can ask the gateway to
+  wait until that frontier is visible.
 - **`rockstream support bundle --pipeline=foo`**: collects everything needed to
   debug an issue in one command.
 - **`rockstream audit tail`**: shows every control-plane action — every scale

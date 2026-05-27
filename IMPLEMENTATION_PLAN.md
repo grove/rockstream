@@ -203,6 +203,10 @@ join queries written as plain SQL.
     later: learned from stats).
 - Plan persistence: encode physical plans as Substrait + RockStream extensions;
   store in control plane.
+- **Schema-version catalog**: source/view schemas are stored in
+  `control: schema/`; compatible changes (nullable/default columns, lossless
+  widening) are accepted online, while breaking changes produce
+  `BLOCKED(RS-1002)` until a blue/green replacement plan is approved.
 - SQL coverage delivered incrementally inside the milestones below, in this
   order: filter → project → group-by aggregates → inner join → outer joins
   → semi/anti → set ops → subqueries (correlated decorrelated by optimizer)
@@ -213,6 +217,9 @@ join queries written as plain SQL.
 
 - Add `InnerJoin` PlanNode + dual arrangements (`0xJL`, `0xJR` from
   DESIGN.md §6.4).
+- Implement stable source-derived `row_id` handling. Replay must rewrite the
+  same join/window/top-k arrangement key; keyless snapshots use
+  `(snapshot_id, file_path, row_group, row_ordinal)`, never random replay IDs.
 - Implement a DBSP-native two-arrangement join and validate it against the
   corrected bilinear-expansion behavior in
   [`pg-trickle1/src/dvm/operators/join.rs`](../pg-trickle1/src/dvm/operators/join.rs):
@@ -283,6 +290,9 @@ join queries written as plain SQL.
   `state_budget_gb`, `object_store_rps`, `priority`, `max_parallelism`,
   `max_shards`. Values are stored in catalog; enforcement lands in Phase 3
   (state budget) and Phase 4 (parallelism/shard caps).
+- **Multi-view pipeline DDL.** `CREATE PIPELINE ... AS (...)` accepts multiple
+  `CREATE SOURCE` and `CREATE VIEW` statements, compiles them into one shared
+  DAG, and stores dependency metadata for `ALTER PIPELINE ... ADD/REPLACE VIEW`.
 
 ---
 
@@ -447,6 +457,10 @@ distribution and fault tolerance. (IVM.md §13 IVM-13.)
 - **Storage correctness audit**: verify every cleanup path works without SlateDB
   range deletion; prove each compaction filter is snapshot-safe; run a WAL
   retention/listing-cost test with long-lived readers.
+- **Merge-read correctness test**: for every merge-backed arrangement, prove
+  `ShardDb::get_merged()` / `scan_merged()` observes all visible merge operands
+  at the epoch snapshot. If the storage profile cannot support this, the test
+  must force the read-modify-write fallback and update cost estimates.
 - **Commit-cost benchmark**: compare shard-level group commit against
   per-operator commits at 10, 100, and 1000 operators per shard.
 - **Object-store request budget**: measure GET/LIST/PUT/DELETE rates for
@@ -494,7 +508,12 @@ production-ready.
     (two writers can't commit to the same shard).
 - **Exchange subsystem** (`rockstream-runtime::exchange`):
   - gRPC service for direct shuffle (`proto/shuffle.proto`).
+  - Worker-to-worker connection pooling/multiplexing: one stream per peer
+    worker per traffic class, with shard/exchange IDs in the frame header.
   - Object-store fallback writer & reader.
+  - Coalesced durable shuffle objects: one object may contain many shard-to-
+    shard frames plus an index footer. Receivers never LIST the shuffle prefix
+    on the hot path; they consume outbox metadata / notifications.
   - Hybrid dispatcher: chooses path per-batch based on receiver health and
     batch size.
   - `shuffle_outbox/` and `shuffle_inbox/` encoders integrated into the
@@ -530,6 +549,9 @@ production-ready.
 - Killing one worker process causes its shards to be re-leased to another
   worker; processing continues without data loss (verified by output equality
   vs. uninterrupted run).
+- Connection count is bounded by worker count, not shard count; a 1,000-shard
+  exchange stress test must stay within configured connection and durable
+  shuffle-object budgets.
 
 **→ Operability deliverables (Phase 4)**
 
@@ -601,7 +623,10 @@ production-ready.
 - **Cluster checkpoint coordinator** (control-plane component):
   - Barrier injection at sources.
   - Barrier alignment at multi-input operators.
-  - Per-shard `Checkpoint` creation tied to barrier passage.
+  - Bounded barrier alignment buffers tied to shuffle credits; exhausted
+    credits propagate backpressure instead of growing memory.
+  - One per-shard `Checkpoint` creation after all local operators have durably
+    committed through the barrier (not one checkpoint per operator).
   - Atomic cluster-checkpoint commit in `checkpoints/cluster`.
   - Old-checkpoint GC.
 - **Recovery driver**: from a cluster checkpoint, brings up every shard via
@@ -624,6 +649,8 @@ production-ready.
 - 24-hour chaos run on a 32-shard cluster with continuous Kafka input and
   Kafka output: zero data loss, zero duplicates, output matches reference.
 - Recovery from full cluster outage in < 60 s for state size < 1 TB.
+- Routine worker restart surfaces `RECOVERING` with `recovery_progress` and
+  suppresses false SLO alerts until `recovery_deadline`; missed deadlines alert.
 
 ---
 
@@ -678,6 +705,12 @@ production-ready.
   - HTTP webhook (idempotency-key driven).
   - SlateDB CDC sink.
 - **Connector lifecycle**: deploy, pause, resume, delete; failure isolation.
+- **Connector contract**: built-in Rust traits and external gRPC protocol share
+  the same `discover_schema`, `start_snapshot`, `poll_delta`, `commit_offset`,
+  `prepare`, `commit`, and `abort` surface from DESIGN.md §13.3.
+- **Schema evolution integration**: connectors publish schema versions before
+  data; incompatible drift returns `RS-1002` and blocks consumption before any
+  offset advances.
 - **Connector marketplace structure**: SDK + example crates; documented
   contract.
 
@@ -703,6 +736,9 @@ production-ready.
   `WalReader` on the relevant shards).
 - **Snapshot consistency**: gateways pin to a recent cluster checkpoint so
   multiple gateway hops see consistent data.
+- **Freshness tokens**: query responses return the vector frontier used;
+  clients can pass `wait_for=<token>` for read-your-writes semantics with a
+  timeout and explicit satisfied/not-satisfied response.
 - **Authentication / authorization**: pluggable auth (initially: bearer
   tokens); per-view RBAC.
 
@@ -833,7 +869,10 @@ These run in parallel with every phase.
 | Distributed recursion stalls or diverges | Per-iteration inner frontier, max-iteration cap, inner-frontier stall timeout, per-shard recompute fallback. |
 | Operator skew | Adaptive re-sharding in Phase 7; sub-key partitioning for extreme skew. |
 | Hardware/network partitions | Chaos testing; documented degraded-mode behavior. |
-| Schema evolution | Versioned plan storage; online plan replacement via `Clone`. |
+| Schema evolution | Versioned schema catalog; compatible online changes; incompatible drift becomes `BLOCKED(RS-1002)` until blue/green replacement via `Clone`. |
+| Shuffle connection/object explosion | Worker-level stream multiplexing; coalesced durable shuffle objects; Phase 4 budget test at 1,000 shards. |
+| Checkpoint barrier alignment buffers grow without bound | Alignment buffers are credit-bounded and propagate backpressure; Phase 6 chaos test injects slow inputs during checkpointing. |
+| Merge-backed arrangements read stale values | All merge-backed reads go through `ShardDb::get_merged()` / `scan_merged()`; Phase 3.5 test forces fallback if the storage profile cannot resolve operands on read. |
 | **Auto-tuner oscillation** | Hysteresis bands on every adaptive loop (scale up after K consecutive over-budget windows, scale down only after 4× K under-budget windows); upper/lower bounds per pipeline; every decision recorded in the audit log so oscillation is visible. Property test: random workload sequence must reach a stable parallelism within bounded time. |
 | **SLO unmet for structural reasons (skew, source slow, downstream sink slow) goes unnoticed** | `pipeline_degraded_reason` is always populated when `pipeline_slo_compliance < 1.0`; ships in Phase 10 alongside the dashboard. Default alerting rule fires on any pipeline with `degraded_reason ≠ HEALTHY` for > 5 min. |
 | **Quota enforcement adds hot-path overhead** | Token-bucket admission and state accounting are per-shard, lock-free; benchmark in Phase 3.5 must show < 2% throughput cost. |
@@ -865,27 +904,25 @@ Total: 8–9 engineers for ~12-month path to GA.
 4. **State format on SlateDB**: Arrow IPC framing per arrangement value
    (current plan, IVM.md §9.1) vs. Apache Arrow Row format for point-access
    arrangements. Benchmark in Phase 3 / Phase 3.5.
-5. **Control plane HA**: lean on SlateDB's single-writer (with hot standby
-   readers) and a leader election above it (etcd? Raft over SlateDB?), or use
-   external Raft like the standard Kubernetes pattern? Start with a single
-   writer + cold standby; harden in Phase 10.
+5. **Control plane HA** — **resolved**: Tier 3 uses a 3- or 5-node Raft group
+  to elect exactly one control SlateDB writer lease. Followers serve catalog
+  reads via `DbReader` and replay the control WAL. Phase 10 hardens the lease
+  handoff and split-brain tests.
 6. **Arrangement compaction frontier**: Materialize aggressively compacts
    arrangements past the consumer frontier. SlateDB compaction filters may help,
    but only after snapshot-safety proof; active arrangement consolidation may
    still be needed for long-running queries. Resolve in Phase 3.5 soak.
-7. **Control DB implementation detail**: a single SlateDB writer with hot
-   readers may be enough for MVP catalog/control operations, but production HA
-   likely needs an external consensus/lease layer. Prototype in Phase 4 and
-   finalize before Phase 10.
+7. **Control DB implementation detail** — **resolved**: control data lives in
+  the control SlateDB; Raft owns only leadership, membership, and writer-lease
+  fencing. No data-plane state enters the Raft log.
 8. **Frontier-aggregator staleness budget**: the aggregator is async with a
    `frontier_agg_interval` tunable (DESIGN.md §8.4). Pick a default value and
    confirm it satisfies window-close, shuffle-GC, and query-freshness SLOs at
    target scale during Phase 5.
-9. **Vector-frontier query semantics**: query gateways pin to a published
-   cluster vector frontier (DESIGN.md §12.2). Confirm in Phase 9 that
-   client-facing freshness metadata (vector frontier age) is sufficient for
-   common BI/serving workloads, and decide whether to expose an opt-in
-   "wait-for-this-source-epoch" hint.
+9. **Vector-frontier query semantics** — **resolved**: query gateways pin to a
+  published cluster vector frontier (DESIGN.md §12.2) and return freshness
+  tokens (DESIGN.md §12.4). Clients that need read-your-writes pass
+  `wait_for=<token>` with a timeout; Phase 9 validates the API ergonomics.
 10. **Distributed recursion shape**: IVM.md §11.1 allows `Exchange` inside the
     recursive scope. Validate in Phase 4 with a sharded transitive-closure
     benchmark that convergence detection via the inner-iteration frontier
