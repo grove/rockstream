@@ -9,6 +9,14 @@ object storage.
 > bottleneck, no SQL compiler, no shuffle operator, and a scalar watermark
 > protocol that could not correctly handle multi-input operators. This document
 > addresses all of those.
+>
+> **Companion documents**:
+> - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
+>   itself (PlanIR, the differentiation pass, the per-operator rules, the
+>   circuit runtime, arrangements on SlateDB). This DESIGN document tells you
+>   *what* the system is; IVM.md tells you *how the IVM core works*.
+> - [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — phased build plan that
+>   operationalizes both.
 
 ---
 
@@ -227,6 +235,32 @@ We borrow ideas (and possibly code) from Feldera's `sql-to-dbsp` for the
 incrementalization pass — that compiler has the most complete coverage of SQL
 semantics under incremental evaluation.
 
+### 4.1 The Differentiation Pass & PlanIR
+
+The incrementalization step (4) and operator runtime are specified in detail in
+[IVM.md](IVM.md). In summary:
+
+- The logical plan is lowered into **PlanIR** — an explicit enum with one
+  variant per operator (Scan, Filter, Project, InnerJoin, Aggregate, Distinct,
+  Window, TopK, TimeWindow, Recursive, Exchange, …). PlanIR is modelled on
+  pg_trickle's `OpTree`.
+- A **`DiffCtx`** walks PlanIR and emits a runtime operator graph (`OpNode`s)
+  using per-operator differentiation rules ported from pg_trickle's `diff_*`
+  functions. Each rule is a direct implementation of the corresponding DBSP
+  derivation, with documented edge-case corrections (the EC-01 join fix, the
+  Q07 double-counting correction, the Q21 SemiJoin correction, FULL JOIN NULL
+  handling in SUM, etc.).
+- The runtime is a **long-lived circuit of typed operators** (Feldera's model)
+  rather than per-epoch SQL re-execution (pg_trickle's model). Each operator
+  is a long-lived async task that consumes `RecordBatch` deltas and maintains
+  one or more **arrangements** (indexed Z-sets) on its assigned SlateDB shard.
+- We deliberately reject Feldera's compile-to-Rust-binary model in favour of
+  interpreting a fixed physical plan; the vectorized `RecordBatch` inner loop
+  is fast enough via DataFusion's expression executor.
+
+See [IVM.md §4–7](IVM.md#4-the-rockstream-ivm-architecture) for the full
+operator catalogue, runtime trait, and per-operator rules.
+
 ---
 
 ## 5. Per-Shard SlateDB Storage Layout
@@ -270,7 +304,9 @@ topology updates. Writes to the control DB go through the control-plane leader.
 
 Every operator instance has an `op_id` (16-byte ULID assigned by the compiler).
 State keys begin with the op_id so different operators on the same shard never
-collide.
+collide. The state behind each operator is an **arrangement** — an indexed,
+sorted Z-set whose key is the lookup column(s) for the operator. Arrangements
+are specified in [IVM.md §9](IVM.md#9-arrangements-state-on-slatedb).
 
 ### 6.1 Stateless Operators
 
@@ -348,13 +384,20 @@ partition; segment-tree nodes are stored under `op_index/`.
 
 ### 6.8 Recursion (`WITH RECURSIVE`, fixed points)
 
-State for the recursive variable is stored normally. Iteration is driven by the
-operator scheduler: each iteration produces new deltas that feed back as input
-deltas at the next iteration timestamp. The frontier protocol naturally handles
-the inner-time dimension (it's another component of the timestamp vector).
+```
+0x01 0xRC op_id(16) row_hash(16) iteration(4 BE) → i64 weight
+```
+
+State for the recursive variable is stored as a weighted set. Iteration is
+driven by the operator scheduler: each iteration produces new deltas that
+feed back as input deltas at the next iteration timestamp. The frontier
+protocol naturally handles the inner-time dimension (the `iteration` component
+of the timestamp vector).
 
 Convergence detection: iteration stops when the input frontier advances past
-the iteration timestamp with no new deltas produced.
+the iteration timestamp with no new deltas produced. See
+[IVM.md §11](IVM.md#11-recursion-with-recursive) for the full algorithm,
+which is modelled on Feldera's `IterativeCircuit`.
 
 ### 6.9 Time Windows (Tumbling, Hopping, Session)
 
@@ -800,6 +843,7 @@ Per-shard SlateDB:
   op_state/window:     0x01 0xWN op_id(16) part_key(var) order_key(var) row_id(16)
   op_state/timewin:    0x01 0xTW op_id(16) window_id(16) key(var)
   op_state/topk:       0x01 0xTK op_id(16) part_key(var) value_desc(var) row_id(16)
+  op_state/recursion:  0x01 0xRC op_id(16) row_hash(16) iteration(4 BE)
 
   op_index/cached_extremum: 0x02 0xMM op_id(16) group_key(var)
   op_index/segtree:         0x02 0xST op_id(16) part_key(var) node_id(8)

@@ -110,9 +110,14 @@ RockStream brings these ideas to an open, cloud-native storage foundation.
 
 ## Status
 
-This project is in the **design phase**. The [DESIGN.md](DESIGN.md) document contains
-the full technical architecture, including the storage layout, operator state design,
-worker coordination protocol, and fault-tolerance strategy.
+This project is in the **design phase**. Three documents describe the system
+in progressively more detail:
+
+| Document | Audience | What it covers |
+|---|---|---|
+| [DESIGN.md](DESIGN.md) | Engineers / architects | Full system architecture: storage layout, operator state, worker coordination, fault tolerance, scaling model |
+| [IVM.md](IVM.md) | IVM specialists | How the incremental-view-maintenance engine itself works — the operators, the differentiation pass, the circuit runtime, the arrangements on SlateDB — synthesized from deep analysis of Feldera DBSP and pg_trickle |
+| [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Implementers | Phase-by-phase build plan from empty repo to GA, including the IVM-1 through IVM-13 milestones from IVM.md |
 
 ## Contributing
 

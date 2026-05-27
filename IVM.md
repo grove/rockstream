@@ -731,7 +731,7 @@ same arrangement key (e.g., the join key).
 |---|---|---|---|
 | `0xAG` | SUM/COUNT/AVG group state | `group_key` | `(sum: i128, count: i64, …)` |
 | `0xMM` | MIN/MAX sorted multiset | `group_key + value_bytes + row_id` | `weight: i64` |
-| `0xJN` | Join arrangement (per side) | `join_key + row_id` | `row Arrow bytes` |
+| `0xJL` / `0xJR` | Join arrangement (left / right side) | `join_key + row_id` | `row Arrow bytes` |
 | `0xDS` | Distinct/union | `row_hash + row_id` | `weight: i64` |
 | `0xWN` | Window function | `partition_key + order_key + row_id` | `row Arrow bytes` |
 | `0xTW` | Time-window state | `window_id + key` | `partial_state` |
