@@ -69,6 +69,12 @@ Durations are indicative effort, not calendar time, and assume a small dedicated
   - `rockstream-oracle` — batch reference engine + property-test harness
     asserting `incremental(query, deltas) == batch(query, accumulated)`
     (the DBSP soundness theorem, IVM.md §14.1). Used by every operator phase.
+  - `rockstream-sim` — deterministic simulation harness (DESIGN.md §17):
+    `Runtime` trait abstracting `now`, `spawn`, `sleep`, `object_store`,
+    `network`; `TokioRuntime` (production) and `SimRuntime` (in-memory,
+    seeded RNG) implementations; `buggify!()` macro (no-op in release, hot
+    in simulation builds). Threaded through every other crate from Phase 1
+    onward; no I/O surface in the codebase may bypass it.
 - CI: GitHub Actions running `cargo fmt --check`, `cargo clippy -D warnings`,
   `cargo test`, `cargo deny`, codecov.
 - Logging via `tracing` with OTEL exporter feature flag.
@@ -180,6 +186,17 @@ hard-coded plans only; the SQL parser comes in Phase 2.
 - **Audit-log skeleton.** Every control action goes through a single
   `record_event(...)` helper that writes to `control: audit/{ulid}` and to
   structured logs. Only a handful of events exist yet; the surface is wired.
+- **`SimRuntime` adoption from day one.** Every operator, scheduler, and
+  storage call site is parameterised on the `Runtime` trait from
+  `rockstream-sim` (DESIGN.md §17.1). Production binaries use
+  `TokioRuntime`; every unit and property test uses `SimRuntime` with a
+  seeded RNG so failures are deterministically reproducible. Retrofitting
+  this later is the single most expensive mistake the project can make.
+- **`buggify!()` discipline.** Race-prone code paths (partial `WriteBatch`
+  failures, fenced-writer commit attempts, manifest publish delays) carry
+  `buggify!()` annotations with a comment naming the race. CI fails any PR
+  touching coordination code that omits an annotation reviewed by a second
+  engineer.
 
 ---
 
@@ -649,12 +666,35 @@ production-ready.
 - **Chaos test suite**:
   - Random process kills, network partitions, disk-full, object-store throttle.
   - Verify output equivalence against a non-faulty reference.
+- **Simulation-test coverage** (under `SimRuntime` with `BUGGIFY` enabled,
+  DESIGN.md §17.3):
+  - Epoch commit interleavings across N shards — every partial-failure
+    permutation leaves the cluster frontier monotonic and exactly-once
+    intact.
+  - Frontier protocol — arbitrary report reorderings converge to the same
+    cluster vector frontier as serial delivery.
+  - Checkpoint barrier alignment under credit exhaustion — never deadlocks;
+    surfaces `RECOVERING` if it cannot complete.
+  - 2PC sink crash points — pre-commit / between / commit all recover
+    idempotently.
+- **Recovery-time SLO instrumentation**: emit `failure_detection_seconds`,
+  `shard_recovery_seconds`, `pipeline_freshness_recovery_seconds` histograms
+  (DESIGN.md §11.5). Pipelines that miss the 60 s freshness-recovery budget
+  surface `RECOVERING_SLOW`.
 
 **Exit criteria**
 
 - 24-hour chaos run on a 32-shard cluster with continuous Kafka input and
   Kafka output: zero data loss, zero duplicates, output matches reference.
 - Recovery from full cluster outage in < 60 s for state size < 1 TB.
+- **Recovery-time invariants (DESIGN.md §11.5) hold at
+  `target_shard_state_bytes` (default 20 GB)**: failure detection ≤ 5 s
+  (p99), single-shard reassignment ≤ 30 s (p99), pipeline freshness
+  recovery ≤ 60 s (p99). Measured under the chaos suite, not synthetic
+  micro-benchmarks.
+- **Simulation seeds**: ≥ 100k seeded `SimRuntime` runs across the
+  coordination suite pass cleanly; any failing seed is checked in as a
+  regression test.
 - Routine worker restart surfaces `RECOVERING` with `recovery_progress` and
   suppresses false SLO alerts until `recovery_deadline`; missed deadlines alert.
 
@@ -674,7 +714,14 @@ production-ready.
   - Cutover at an epoch boundary; shard map version bump.
   - Donor shard retires migrated keys and reclaims them via bounded
     scan-and-delete or a frontier-aware compaction filter after cutover.
-- **Online shard merge**: reverse of split.
+- **Proactive shard splitter** (DESIGN.md §10.6): each shard reports its
+  total state footprint on every epoch; the control plane schedules a split
+  when footprint crosses `1.5 × target_shard_state_bytes`
+  (default `target = 20 GB`). Splits are rate-limited to one per minute per
+  shard and respect the auto-tuner budget. The `target_shard_state_bytes`
+  knob is settable per storage profile.
+- **Online shard merge**: reverse of split. Cold-shard merge driven by
+  `min_shard_state_bytes` floor (default 4 GB) to prevent fragmentation.
 - **Worker scale-out**: new worker process joins, control plane assigns
   un-leased shards or rebalances from over-loaded workers.
 - **Skew detection**: per-shard load metrics trigger automatic re-sharding for
@@ -689,6 +736,9 @@ production-ready.
   uninterrupted, frontier lag returns to baseline within 30 s post-scale.
 - Hot-key benchmark: introduce a 100x skewed key; auto-rebalance brings
   worst-shard load within 1.5x median within 60 s.
+- **Proactive split test**: drive a single shard's state footprint to 30 GB;
+  the control plane initiates a split before the shard exceeds operational
+  thresholds, with no operator alert and no observable freshness-SLO impact.
 
 ---
 
@@ -714,6 +764,18 @@ production-ready.
 - **Connector contract**: built-in Rust traits and external gRPC protocol share
   the same `discover_schema`, `start_snapshot`, `poll_delta`, `commit_offset`,
   `prepare`, `commit`, and `abort` surface from DESIGN.md §13.3.
+- **Per-connector source-epoch vector** (DESIGN.md §8.1.1): each connector
+  maintains a strictly increasing `source_epoch` and persists
+  `control: connector/{id}/epoch_map/{source_epoch} → { partition →
+  committed_offset }` atomically with the epoch commit. Exactly-once
+  recovery looks up the highest committed `source_epoch` and resumes from
+  the recorded partition offsets.
+- **View output retention** (DESIGN.md §5.7): support
+  `CREATE VIEW WITH (retention = '7d')` (and `MATERIALIZED VIEW` default
+  forever); enforce via SlateDB TTL + compaction filter that keeps the
+  current value per primary key regardless of age. Retention bytes counted
+  against the pipeline's `state_budget_gb` quota and shown in
+  `EXPLAIN INCREMENTAL ESTIMATE`.
 - **Schema evolution integration**: connectors publish schema versions before
   data; incompatible drift returns `RS-1002` and blocks consumption before any
   offset advances.
@@ -813,6 +875,16 @@ protocol. Make RockStream self-contained (no external broker required).
   §14.17). Worker kills, object-store latency, shard fence loss, connector
   stalls; recovery is observable through `pipeline_slo_compliance` and the
   audit log.
+- **Simulation-test CI gate** (DESIGN.md §17): every commit runs N seeded
+  `SimRuntime` executions across the coordination suite (epoch commit,
+  frontier, checkpoint, 2PC sink, reassignment, schema evolution) with
+  `BUGGIFY` enabled. Pre-release runs scale N to millions of seeds; failing
+  seeds are checked in as regression tests and replayed on every subsequent
+  build.
+- **Frontier aggregator deployment** (DESIGN.md §3.1): document and ship
+  the `rockstream start --role=frontier` deployment topology for Tier 3.
+  Frontier-role processes are stateless and horizontally scalable; the
+  Raft control group remains 3–5 nodes regardless of cluster shard count.
 - **Full error-code documentation**: every `RS-XXXX` in the registry has a
   published doc page with cause, detection signal, and remediation. CI gate
   enforces.

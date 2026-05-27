@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.6. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.7. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -57,6 +57,13 @@ object storage.
 > out of scope (§1.1, §12.6). Positioning: same tier as Materialize / RisingWave,
 > not a Neon-style Postgres drop-in.
 >
+> **v3.7 is a future-proofing pass inspired by FoundationDB**: deterministic
+> simulation testing as a first-class testing strategy (§17), an explicit
+> recovery-time invariant (§11.5), proactive shard splitting at a target size
+> (§10.6), separation of the frontier aggregator from the Raft control plane
+> for scale-out (§3), per-connector source-epoch vector semantics for
+> multi-partition sources (§8.1.1), and a view output retention policy (§5.7).
+>
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
 >   itself (PlanIR, the differentiation pass, the per-operator rules, the
@@ -84,8 +91,9 @@ object storage.
 13. [Connectors & External I/O](#13-connectors--external-io)
 14. [Operations: Deploy, Monitor, Diagnose](#14-operations-deploy-monitor-diagnose)
 15. [Comparison to Prior Art](#15-comparison-to-prior-art)
-16. [Optimality Assessment (v3.4)](#16-optimality-assessment-v34)
-17. [Appendix: Key Encoding Reference](#appendix-key-encoding-reference)
+16. [Optimality Assessment (v3.7)](#16-optimality-assessment-v37)
+17. [Simulation Testing](#17-simulation-testing)
+18. [Appendix: Key Encoding Reference](#appendix-key-encoding-reference)
 
 ---
 
@@ -297,6 +305,30 @@ Network security: all inter-node gRPC (worker↔control, worker↔worker, gatewa
 and the public SQL port must use **mutual TLS (mTLS)**. Certificate rotation is handled
 out-of-band; the control plane enforces that every worker presents a valid certificate
 before being admitted into `topology/worker/`.
+
+---
+
+### 3.1 Frontier Aggregator as a Separable Process
+
+In Tier 3, the control-plane Raft group owns the *authoritative* shard map,
+schema catalog, and pipeline lifecycle decisions. It does **not** need to be on
+the hot path of frontier reporting. As shard count grows past a few hundred,
+per-shard frontier updates (§8.3) at every epoch dominate control-plane traffic.
+
+The frontier aggregator is therefore a separable role:
+
+```
+rockstream start --role=frontier --control=<raft-url> --storage=s3://...
+```
+
+Frontier-role processes are stateless: they subscribe to per-shard frontier
+reports (§8.3), maintain the cluster vector frontier in memory, persist the
+committed frontier to control SlateDB on a low-frequency cadence (§8.4), and
+serve `GET cluster.frontier` to query gateways. They can be scaled
+horizontally and re-elected freely; loss of a frontier process delays
+freshness-token issuance but does not block ingest or compromise correctness.
+This keeps the Raft group small (3–5 nodes) and its proposal rate independent
+of shard count.
 
 ---
 
@@ -557,6 +589,27 @@ The control plane detects the profile from the storage URL and seeds the
 auto-tuner with the correct latency/cost assumptions. Operators can still
 override SLOs and quotas, but they should not have to know whether a dev laptop
 or a 1,000-shard S3 cluster is underneath them.
+
+---
+
+### 5.7 View Output Retention and Garbage Collection
+
+Materialized view outputs grow without bound unless retention is specified.
+By default:
+
+- **`MATERIALIZED VIEW`**: retained forever (the view *is* the answer).
+- **`VIEW` declared incremental for streaming consumers only**: retained for
+  30 days, configurable via `CREATE VIEW WITH (retention = '7d')`.
+
+Retention is enforced by a SlateDB TTL plus a compaction filter that
+drops view-output rows whose commit timestamp is older than the retention
+window AND whose key is not the current value for that primary key (so a
+slow-changing dimension stays available even if older than the window).
+
+Retention bytes count against the pipeline's `state_budget_gb` quota
+(§14.13). `EXPLAIN INCREMENTAL ESTIMATE` includes a projected steady-state
+view-output footprint based on the declared retention and the source-rate
+estimate.
 
 ---
 
@@ -832,6 +885,29 @@ starts with the two components above because they cover the v1 hot path:
 source epochs and recursive iterations. A new timestamp component is a storage
 format change and must be added through the schema/format compatibility policy.
 
+### 8.1.1 Multi-Partition Source Epoch Semantics
+
+`source_epoch` is monotonic *per connector*, not per source partition. A Kafka
+connector reading 32 partitions still emits one strictly increasing
+`source_epoch` per epoch boundary it declares. The mapping from
+`source_epoch` to underlying partition offsets is recorded by the connector in
+a side table:
+
+```
+control: connector/{id}/epoch_map/{source_epoch}
+  → { partition_id → committed_offset, ... }
+```
+
+This table is the source of truth for connector replay (§13.3) and for
+exactly-once recovery: on restart, the connector reads the highest committed
+`source_epoch`, looks up the partition offsets, and resumes from there. Two
+operators consuming the same connector see the same source_epoch sequence,
+and the frontier model treats it as a single dimension regardless of physical
+partition count.
+
+`FreshnessToken` (§12.4) carries the opaque `source_epoch` only; clients never
+see partition offsets and need not know the connector's physical layout.
+
 ### 8.2 Frontier
 
 A frontier is a minimal antichain of timestamps. An operator's *input frontier*
@@ -1035,6 +1111,31 @@ running.
 
 ---
 
+### 10.6 Proactive Shard Splitting
+
+Shards are split *before* they become hot, not after. Each shard reports its
+total state footprint (sum of all `op_state/*` and `view_output/*` ranges)
+to the control plane on every epoch. When a shard's footprint crosses
+`1.5 × target_shard_state_bytes` (default `target = 20 GB`), the control plane
+schedules a background split:
+
+1. Pick a midpoint key by sampling the shard's hash-range.
+2. Allocate a new shard id; copy the upper half via SlateDB checkpoint + replay
+   of writes since the checkpoint (§10.2).
+3. Atomically update `shard_map/v{n+1}` to assign the new range to the new
+   shard.
+
+Splits are throttled (one per minute per shard) and respect the cluster's
+adaptive-tuner budget. Operators never see "shard X is too large" pages,
+because the split happens at 30 GB — well before any operational threshold.
+`target_shard_state_bytes` is itself tunable per storage profile (§5.6).
+
+The reverse operation — merging two cold shards — is also background and
+keyed to a `min_shard_state_bytes` floor (default 4 GB) to prevent fragmentation
+at low load.
+
+---
+
 ## 11. Fault Tolerance & Exactly-Once Semantics
 
 ### 11.1 The Three Boundaries
@@ -1101,6 +1202,33 @@ Commit (after cluster checkpoint succeeds):
 Replay after crash: on recovery, the connector inspects `sink_state/`:
 - If pre-committed but not committed: re-run commit (idempotent).
 - If neither: epoch's data will be reproduced; nothing to do.
+
+---
+
+### 11.5 Recovery Time as a Design Invariant
+
+Recovery is not exceptional — it is steady-state behavior that the system must
+hit reliably. RockStream commits to the following budgets at
+`target_shard_state_bytes` (§10.6):
+
+| Phase | Budget | Mechanism |
+|---|---|---|
+| Failure detection (worker silence → control-plane mark dead) | **≤ 5 s** | Heartbeat with `dead_after = 3 × interval`, default `interval = 1.5 s`. |
+| Single-shard reassignment (mark dead → new owner serving reads at last committed frontier) | **≤ 30 s** | Stateless workers + checkpoint-from-storage (§11.3); no per-shard WAL replay larger than the last epoch's writes. |
+| Pipeline freshness recovery (new owner serving → frontier within SLO) | **≤ 60 s** | Catch-up ingest at burst rate, bounded by `source_rate_max_burst` (§14.3). |
+
+These budgets are first-class metrics:
+
+```
+failure_detection_seconds          (histogram)
+shard_recovery_seconds             (histogram, by shard size bucket)
+pipeline_freshness_recovery_seconds (histogram, by pipeline)
+```
+
+A pipeline that misses the 60 s budget surfaces the `RECOVERING_SLOW` named
+degraded state (§14.10) and pages the operator. Phase 6 of the implementation
+plan must demonstrate the budgets hold under simulated worker death, network
+partition, and object-store throttling.
 
 ---
 
@@ -1683,7 +1811,7 @@ adaptive per-operator parallelism**.
 
 ---
 
-## 16. Optimality Assessment (v3.4)
+## 16. Optimality Assessment (v3.7)
 
 The v3.4 review asks whether the design is coherent, easy to operate, and
 optimal enough to build. Each answer is a structural commitment encoded in this
@@ -1772,8 +1900,82 @@ implementation plan's Phase 3.5 and Phase 4 acceptance criteria:
 - **Auto-tuner stability**. Hysteresis and auditability are specified (§14.5),
   but workloads with step-function traffic still need soak tests to ensure the
   tuner does not oscillate.
+- **Coordination correctness under message reordering**. The deterministic
+  simulation harness (§17) must cover the epoch commit, frontier aggregation,
+  checkpoint barrier alignment, and 2PC sink paths from Phase 1 onward.
+- **Recovery time invariants** (§11.5). Chaos tests must demonstrate the 5 s /
+  30 s / 60 s budgets hold at the target shard size on every release.
 
 The design is considered structurally sound modulo these validations.
+
+---
+
+## 17. Simulation Testing
+
+Distributed-systems bugs in RockStream are dominated by message reordering,
+shard restart sequences, partial failures during epoch commit, and network
+partitions. None of these are reliably exercised by integration tests or by
+`rockstream chaos` (§14.17), which can find symptoms but cannot enumerate the
+underlying races.
+
+RockStream adopts the **deterministic simulation** strategy pioneered by
+FoundationDB: the entire distributed system runs in a single process, with the
+network, the object store, and the wall clock replaced by deterministic
+in-memory fakes driven by a seeded random number generator. A failing seed
+replays the exact same execution every time, so any bug found is reproducible
+and bisectable.
+
+### 17.1 The `SimRuntime` Abstraction
+
+Every I/O surface in RockStream is mediated by a small trait:
+
+```rust
+trait Runtime {
+    fn now(&self) -> Instant;
+    fn spawn(&self, fut: BoxFuture<'static, ()>);
+    fn sleep(&self, dur: Duration) -> BoxFuture<'static, ()>;
+    fn object_store(&self) -> Arc<dyn ObjectStore>;
+    fn network(&self) -> Arc<dyn Network>;
+}
+```
+
+Production uses a `TokioRuntime` over real S3 and gRPC. Tests use a
+`SimRuntime` over an in-memory `ObjectStore` and an in-memory message-passing
+`Network`, both with seeded latency/error/reorder injection.
+
+The traits are introduced in Phase 1 and threaded through every subsequent
+phase. Retrofitting them after Phase 8 would be prohibitively expensive;
+introducing them early is cheap.
+
+### 17.2 `BUGGIFY`
+
+Production code paths contain `buggify!()` macros (no-op in release builds, hot
+in simulation) that randomly inject faults at known race-prone points: partial
+`WriteBatch` failures, dropped shuffle frames, delayed manifest publication,
+out-of-order epoch commits, fenced-writer attempts to commit after eviction.
+Every `buggify!()` site has a comment explaining the race it simulates. CI
+requires that any new race-prone code adds a `buggify!()` annotation reviewed
+by a second engineer.
+
+### 17.3 What Simulation Tests Cover
+
+| Subsystem | What the simulator must demonstrate |
+|---|---|
+| Epoch commit (§9) | Every interleaving of per-shard `WriteBatch` outcomes leaves the cluster frontier monotonic and the exactly-once contract intact. |
+| Frontier protocol (§8) | Arbitrary reorderings of per-shard frontier reports converge to the same cluster vector frontier as serial delivery. |
+| Cluster checkpoint (§11.2) | Barrier alignment under arbitrary credit exhaustion never deadlocks; checkpoint always either succeeds or surfaces `RECOVERING`. |
+| Fault-driven reassignment (§10.4) | Killing any subset of workers and restarting them in any order recovers to the same final state as no failure. |
+| Schema evolution (§4.2) | A schema-version change concurrent with an in-flight epoch produces no row decoded with the wrong version. |
+| 2PC sinks (§11.4) | Any crash during pre-commit, between pre-commit and commit, or during commit recovers idempotently. |
+
+### 17.4 Why This Is Worth the Cost
+
+FoundationDB's defining property in production is that *correctness bugs are
+rare*. The cause is not exceptional discipline; it is a test harness that runs
+millions of seeded executions on every commit. RockStream's coordination
+surface (epoch commit + frontier protocol + 2PC + checkpoint barrier) is small
+enough that a similar harness can exhaustively explore it. The investment
+pays back the first time a multi-shard race ships to production.
 
 ---
 

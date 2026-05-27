@@ -1,6 +1,6 @@
 # RockStream
 
-**Keep your reports and dashboards up-to-date automatically as your workload grows.**
+**Keep your reports and dashboards up-to-date automatically as your workload grows — and query them with the database tools you already know.**
 
 ---
 
@@ -97,6 +97,55 @@ GROUP BY product_id
 …and RockStream will maintain the answer to that query continuously, as new orders
 arrive.
 
+### Use the Database Tools You Already Know
+
+RockStream speaks the **Postgres wire protocol**. That means you can connect with
+`psql`, your favourite BI tool, or any client library that already knows how to talk
+to a Postgres database. Reading from a view looks exactly like reading from a
+Postgres table:
+
+```bash
+psql -h rockstream.example.com -U app -d analytics \
+  -c "SELECT * FROM sales_by_product ORDER BY total_sold DESC LIMIT 10;"
+```
+
+You can also **insert, update, and delete rows directly** into RockStream tables —
+no separate database or Kafka topic is required to get data in. The change feeds your
+views automatically, the same way an external source would. RockStream is not aiming
+to replace Postgres for high-concurrency transactional workloads; it sits in the same
+tier as streaming-SQL systems like Materialize and RisingWave, with the convenience
+of being reachable through standard Postgres tooling.
+
+### Self-Healing
+
+RockStream keeps itself in good shape without operator intervention:
+
+- **Shards split before they get too big.** When a slice of your data approaches the
+  configured size limit, RockStream quietly splits it into two smaller slices in the
+  background. You never see a "shard is too large" page.
+- **Workers recover in seconds, not minutes.** If a worker process dies, another one
+  takes over its slice in under 30 seconds, and your dashboards are back to fresh
+  within a minute. These targets are tested on every release, not aspirational.
+- **Quiet by default.** If everything is meeting its freshness target, you hear
+  nothing. If something slips, you get a named reason — not a wall of metrics.
+
+### Tested Like a Flight Simulator
+
+Distributed systems are full of rare timing bugs that show up only when the network
+is slow, a disk is full, and two workers crash within milliseconds of each other.
+Catching these in production is painful and expensive.
+
+RockStream borrows a technique from [FoundationDB](https://www.foundationdb.org/):
+the entire distributed system runs inside a deterministic simulator that replaces
+the network, the storage, and the wall clock with deterministic fakes. Before every
+release, this simulator runs **millions of seeded scenarios** with random crashes,
+message reorderings, and partial failures. Any bug it finds is reproducible from a
+single seed number, so it can be fixed once and never come back.
+
+The practical result: when you put RockStream into production, the kinds of
+distributed-systems surprises that usually fill a runbook have already been
+discovered — and fixed — on a developer's laptop.
+
 ## Inspiration
 
 RockStream is inspired by production systems and implementation research:
@@ -125,8 +174,8 @@ RockStream brings these ideas to an open, cloud-native storage foundation.
 
 ## Status
 
-This project is in the **design phase**. Three documents describe the system
-in progressively more detail:
+This project is in the **design phase** (current revision: **v3.7**). Three
+documents describe the system in progressively more detail:
 
 | Document | Audience | What it covers |
 |---|---|---|
@@ -172,6 +221,11 @@ There is one `rockstream` binary. Node roles are flags, not separate executables
 Moving up the ladder is additive: the same data files produced at Tier 1 against MinIO
 open at Tier 3 against S3. There is no data migration step because there is no
 node-local state to migrate.
+
+At every tier, you connect with `psql` (or any Postgres client). The development loop
+for a new view is: start the binary, open `psql`, write the SQL, insert a few rows,
+watch the view update in real time — the same loop you would use with a regular
+database, except the view stays current as data keeps arriving.
 
 ## Contributing
 
