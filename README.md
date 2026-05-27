@@ -58,16 +58,24 @@ services like Amazon S3 or Google Cloud Storage. This means:
 The underlying storage engine is [SlateDB](https://slatedb.io/), a modern database built
 from the ground up for the cloud era.
 
-### Scales With Your Workload
+### Scales With Your Workload — Without Touching Knobs
 
 RockStream splits the work across as many workers as you need. Each worker is responsible
-for a slice of the data. When traffic grows, you add more workers. When it quiets down,
-you remove them. Workers coordinate automatically — no manual reconfiguration required.
+for a slice of the data. When traffic grows, the system adds parallelism to the slow
+operators automatically. When it quiets down, it reduces it. Workers coordinate
+automatically — no manual reconfiguration required.
+
+You tell RockStream *what* you want — "keep this view fresh within 1 second; do not
+exceed 200 GB of state" — and the system figures out *how*: how many shards each
+operator needs, how often to commit to object storage, when to scale up or back. The
+mechanism knobs are still there if you need them, but you should not need to reach for
+them first.
 
 The design is intentionally honest about the limits of scale: object-storage request
 rates, skewed keys, network shuffle, and source/sink throughput still matter. RockStream's
 goal is to remove the single database writer as the central bottleneck by splitting state
-across many independent SlateDB-backed shards.
+across many independent SlateDB-backed shards, and to give you a clear, named reason
+when any of those underlying limits become the binding constraint.
 
 ### Never Loses Work
 
@@ -128,25 +136,38 @@ in progressively more detail:
 
 ## How Do I Know It’s Working?
 
-The system exposes one primary health signal: **frontier lag** — how many
-milliseconds behind the freshest queryable view is compared to the source data.
+The system exposes one primary health indicator per pipeline: **SLO compliance** —
+the fraction of the recent window for which your declared freshness target was met.
 
-- **Frontier lag ≤ your configured `max_epoch_ms`**: everything is healthy.
-- **Frontier lag growing slowly**: the source is producing faster than the
-  pipeline is processing. Add more workers or increase operator parallelism.
-- **Frontier lag stuck at a specific value**: one operator or exchange is the
-  bottleneck. Run `EXPLAIN INCREMENTAL <view_name>` to see which one (flagged
-  with a `⚠`).
-- **Frontier lag spiked and recovered**: a worker crashed and restarted; the
-  system recovered automatically from its last checkpoint.
+- **SLO compliance = 1.0**: pipeline is healthy.
+- **SLO compliance < 1.0**: a `degraded_reason` label says *why* in plain terms
+  (`OVER_BUDGET_RELAXED`, `RPS_THROTTLED`, `BLOCKED`, etc.) so you know whether to
+  add capacity, raise a quota, or fix a connector.
+- **`rockstream explain <view>`**: shows the operator tree with per-operator
+  diagnostics and what the auto-tuner is currently doing.
+- **`rockstream explain <view> --estimate`**: previews cost, state size, and
+  achievable freshness *before* you deploy a new view.
+- **`rockstream support bundle --pipeline=foo`**: collects everything needed to
+  debug an issue in one command.
+- **`rockstream audit tail`**: shows every control-plane action — every scale
+  decision, every degraded-state transition, every pipeline change — with the
+  metric reading that triggered it. No silent changes.
 
 A Grafana dashboard template ships with the project at
-`deploy/dashboards/rockstream-overview.json`. It shows frontier lag,
-throughput, and state growth for every pipeline in one view.
+`deploy/dashboards/rockstream-overview.json`. The above-the-fold panel is a single
+number per pipeline: SLO compliance over time.
 
-For development and evaluation, RockStream can run as a **single process** on
-a laptop with local storage (`rockstream start --mode=single --storage=./data`).
-No cluster setup, no cloud account, no configuration required.
+## One Binary, One Config, Three Tiers
+
+There is one `rockstream` binary. Node roles are flags, not separate executables.
+
+- **Laptop / evaluation**: `rockstream start --storage=./data` — zero config; survives crashes.
+- **Single host (small production)**: `rockstream start --role=all --storage=s3://bucket/...`.
+- **Multi-host cluster**: `--role=control` on control nodes, `--role=worker` on workers.
+
+Moving up the ladder is additive: the same data files produced at Tier 1 against MinIO
+open at Tier 3 against S3. There is no data migration step because there is no
+node-local state to migrate.
 
 ## Contributing
 

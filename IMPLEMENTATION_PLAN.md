@@ -4,6 +4,14 @@ A phased roadmap from empty repository to a production-grade,
 horizontally-scalable IVM system. Each phase delivers a working, testable
 system with progressively more capability.
 
+> **Operability is a phase deliverable, not Phase 10.** Per DESIGN.md P16
+> and §14, every phase below has explicit operability deliverables
+> ("→ Operability" callouts). The single binary, the error-code registry,
+> the audit log, the support bundle, `EXPLAIN INCREMENTAL [ESTIMATE]`,
+> quotas, and the auto-tuner all land incrementally inside the phases that
+> create the surface they cover — not in a single "hardening" sprint at
+> the end.
+
 > **Read first**:
 > - [DESIGN.md](DESIGN.md) — system architecture (storage, shards, exchange,
 >   fault tolerance, scaling).
@@ -158,6 +166,21 @@ hard-coded plans only; the SQL parser comes in Phase 2.
 - Oracle property test runs green for ≥ 100k randomized scenarios per
   operator combination.
 
+**→ Operability deliverables (Phase 1)**
+
+- **Single binary surface.** `rockstream` is one binary from day one;
+  `rockstream start --storage=./data` is a zero-config developer command.
+  Role flags exist but only `--role=all` is wired this phase.
+- **Error-code registry.** Crate `rockstream-errors` defines every error as
+  an `RS-XXXX` code with a doc-URL stub; CI fails the build if a returned
+  `Error` or logged `error!` has no code. Doc URLs may 404 until Phase 10 but
+  must exist in the registry.
+- **Support-bundle skeleton.** `rockstream support bundle` collects plan,
+  recent logs, and basic shard stats into a tarball. Redaction on by default.
+- **Audit-log skeleton.** Every control action goes through a single
+  `record_event(...)` helper that writes to `control: audit/{ulid}` and to
+  structured logs. Only a handful of events exist yet; the surface is wired.
+
 ---
 
 ## Phase 2 — SQL Frontend & Joins
@@ -247,6 +270,19 @@ join queries written as plain SQL.
 - All compiled plans round-trip through Substrait without loss.
 - Property-test harness extends to every operator combination implemented
   so far.
+
+**→ Operability deliverables (Phase 2)**
+
+- **`EXPLAIN INCREMENTAL`** prints the annotated operator tree from
+  DESIGN.md §14.8 against live statistics for any installed view.
+- **`EXPLAIN INCREMENTAL ESTIMATE`** runs the planner and cost model
+  *without* deploying; reports predicted state size, per-operator
+  `epoch_ms`, object-store request rate, and minimum achievable frontier
+  lag. Estimation accuracy is tracked over time on the TPC-H suite.
+- **`CREATE PIPELINE … WITH (…)`** SQL grammar parses `freshness_target_ms`,
+  `state_budget_gb`, `object_store_rps`, `priority`, `max_parallelism`,
+  `max_shards`. Values are stored in catalog; enforcement lands in Phase 3
+  (state budget) and Phase 4 (parallelism/shard caps).
 
 ---
 
@@ -369,6 +405,22 @@ standard for analytical workloads.
 - A 5-level view-on-view DAG with diamond consistency converges to a stable
   state under continuous input.
 
+**→ Operability deliverables (Phase 3)**
+
+- **Per-pipeline state-budget enforcement.** The runtime accounts
+  `op_state_bytes` per pipeline; reaching `state_budget_gb` transitions the
+  pipeline to `OVER_BUDGET_RELAXED` (DESIGN.md §14.10), surfaces a named
+  `RS-2002` reason, and records the transition in the audit log. No silent
+  growth past the budget.
+- **Object-store RPS quota.** Token-bucket admission on the per-shard
+  commit path enforces `object_store_rps`; over-limit transitions to
+  `RPS_THROTTLED`.
+- **Degraded-state surface.** `pipeline_slo_compliance` and
+  `pipeline_degraded_reason` metrics ship; `SHOW PIPELINE` reports the
+  current state. End-to-end test: a deliberately-too-tight
+  `freshness_target_ms` produces a visible degraded reason within one
+  observation window.
+
 ---
 
 ## Phase 3.5 — IVM Correctness Soak
@@ -479,6 +531,18 @@ production-ready.
   worker; processing continues without data loss (verified by output equality
   vs. uninterrupted run).
 
+**→ Operability deliverables (Phase 4)**
+
+- **Real role flags.** `--role=control|worker|gateway|all` selects which
+  services the node runs; the multi-host Tier-3 setup in DESIGN.md §14.2
+  works against this phase's binary unchanged.
+- **Auto-pause for unrecoverable shards.** A shard that loses its fence or
+  fails recovery transitions the owning pipeline to `BLOCKED(RS-3001)` or
+  `BLOCKED(RS-3002)` with full event-log trail; never crashes the cluster.
+- **Audit-log entries for shard moves.** Every shard add / remove /
+  rebalance is recorded with the trigger (operator request, lease loss,
+  rebalancer decision).
+
 ---
 
 ## Phase 5 — Frontier Protocol
@@ -511,6 +575,20 @@ production-ready.
 - Recursive query converges deterministically; frontier advances past
   iteration timestamps after convergence.
 - Shuffle storage usage is bounded under sustained throughput.
+
+**→ Operability deliverables (Phase 5)**
+
+- **SLO-driven planner.** The control plane derives `min_epoch_ms`,
+  `max_epoch_ms`, and initial per-operator parallelism from each pipeline's
+  declared `freshness_target_ms` and quotas (DESIGN.md §14.3). Manual knobs
+  remain as overrides; the audit log records both the derived value and any
+  override.
+- **Adaptive parallelism loop.** Implements the control loop from
+  DESIGN.md §14.5 (hysteresis bands; bounded by `max_parallelism`); every
+  scale decision is audit-logged with the metric reading that triggered it.
+- **Adaptive epoch sizing.** Same pattern, bounded 10 ms–5 s.
+- **Auto-tuner property test.** A random workload sequence must reach a
+  stable parallelism within bounded time (no oscillation).
 
 ---
 
@@ -654,6 +732,19 @@ production-ready.
 - **Web console** (optional, post-MVP): pipeline graph viewer, frontier lag
   charts, live throughput.
 - **Chaos testing automation**: Jepsen-style test harness.
+- **`rockstream chaos`**: in-tree fault-injection subcommand (DESIGN.md
+  §14.17). Worker kills, object-store latency, shard fence loss, connector
+  stalls; recovery is observable through `pipeline_slo_compliance` and the
+  audit log.
+- **Full error-code documentation**: every `RS-XXXX` in the registry has a
+  published doc page with cause, detection signal, and remediation. CI gate
+  enforces.
+- **Auto-tuner hardening**: long-running stability tests across diverse
+  workload mixes; tune hysteresis defaults; document override patterns.
+- **Support-bundle completeness**: redaction integration test asserts no
+  credential pattern leaves the bundle by default; bundle includes audit-log
+  entries, plan history, metric snapshots, frontier history, recent worker
+  logs.
 - **Performance baselines**: Nexmark, TPC-H continuous, recursive graph
   workloads with documented numbers.
 - **Documentation**:
@@ -743,6 +834,11 @@ These run in parallel with every phase.
 | Operator skew | Adaptive re-sharding in Phase 7; sub-key partitioning for extreme skew. |
 | Hardware/network partitions | Chaos testing; documented degraded-mode behavior. |
 | Schema evolution | Versioned plan storage; online plan replacement via `Clone`. |
+| **Auto-tuner oscillation** | Hysteresis bands on every adaptive loop (scale up after K consecutive over-budget windows, scale down only after 4× K under-budget windows); upper/lower bounds per pipeline; every decision recorded in the audit log so oscillation is visible. Property test: random workload sequence must reach a stable parallelism within bounded time. |
+| **SLO unmet for structural reasons (skew, source slow, downstream sink slow) goes unnoticed** | `pipeline_degraded_reason` is always populated when `pipeline_slo_compliance < 1.0`; ships in Phase 10 alongside the dashboard. Default alerting rule fires on any pipeline with `degraded_reason ≠ HEALTHY` for > 5 min. |
+| **Quota enforcement adds hot-path overhead** | Token-bucket admission and state accounting are per-shard, lock-free; benchmark in Phase 3.5 must show < 2% throughput cost. |
+| **Error-code registry rots** | CI gate: any new `tracing::error!` / returned `Error` without a registered `RS-XXXX` fails the build. Doc URL existence is checked. |
+| **Support bundle leaks secrets** | Default redaction is on and not config-overridable; only an explicit CLI flag (`--include-secrets`) can disable it; integration test asserts no credential pattern leaves the bundle by default. |
 
 ### Team Structure (Suggested)
 

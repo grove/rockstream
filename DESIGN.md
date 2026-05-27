@@ -5,24 +5,34 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.1. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.3. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
-> hard constraint. v3.1 incorporates a second source-level review of
-> `../feldera`, `../pg-trickle1`, and `../slatedb` and adds three structural
-> commitments that follow from it:
+> hard constraint. v3.1 added causal time, async scheduling, and explicit
+> SlateDB operational budgets. v3.2 added the operability foundation
+> (deployment ladder, `EXPLAIN INCREMENTAL`, frontier-lag diagnostics, four
+> knobs). **v3.3 raises operability to a first-class system property**:
 >
-> 1. **Time is causal, not global.** Cross-shard progress uses an antichain of
->    `(shard_id, source_epoch)` pairs, not a single global LSN. Per-shard
->    sequence numbers stay local to each SlateDB; the cluster frontier is a
->    meet over per-shard frontiers and is allowed to be slightly stale.
-> 2. **Scheduling is async.** Operators are long-lived async tasks coordinated
->    by data arrival and frontier updates. We deliberately do not adopt
->    Feldera's synchronous `DynamicScheduler` ownership model, which rejects
->    valid distributed topologies with `OwnershipConflict`.
-> 3. **SlateDB is respected as-is.** WAL listing cost, manifest churn,
->    compaction-filter snapshot safety, missing range deletion, and merge-
->    operator associativity are first-class constraints with explicit
->    handling rather than wishful assumptions.
+> 1. **SLO-driven, not knob-driven.** Operators state a freshness target;
+>    the system tunes epoch sizing, parallelism, and scheduling to meet it.
+>    Manual knobs remain as overrides, not primary controls.
+> 2. **Self-tuning by default.** Adaptive parallelism, adaptive epoch
+>    sizing, and adaptive scheduling are on out of the box. Operators set
+>    intent (SLOs, quotas, priorities); the control plane decides
+>    mechanism.
+> 3. **One binary, one CLI, one config.** Every node role is a flag on the
+>    same `rockstream` binary. The CLI surface is pipelines and views, never
+>    shards or antichains.
+> 4. **Unable to surprise you.** Cost preview before deploy
+>    (`EXPLAIN INCREMENTAL ESTIMATE`), enforced per-pipeline quotas, an
+>    auditable event log of every control action, a single-command support
+>    bundle, and a documented error-code taxonomy. Pipelines that cannot
+>    meet their SLO degrade with a named reason instead of failing
+>    silently.
+>
+> Carrying forward from earlier revisions:
+> 1. **Time is causal, not global** (P13).
+> 2. **Scheduling is async** (P14).
+> 3. **SlateDB is respected as-is** (P12).
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -75,7 +85,7 @@ object storage.
 | P13 | **Causal time.** | Progress is an antichain over `(shard_id, source_epoch)` pairs. There is no global LSN. The cluster frontier is computed asynchronously from per-shard frontiers and is allowed to lag by a bounded budget. |
 | P14 | **Async scheduling.** | Operators are long-lived async tasks. There is no synchronous global scheduler tick and no per-stream ownership checker. Backpressure flows via credits; progress flows via frontiers. |
 | P15 | **Bounded staleness for cross-shard reads.** | Query gateways pin to a published cluster frontier (a vector of per-shard checkpoints) rather than to wall-clock "fresh"; the staleness budget is documented and observable. |
-| P16 | **Simple to understand and operate.** | A one-person team must be able to deploy, monitor, and recover the system without deep internals knowledge. The system degrades predictably — never silently — and reports problems in terms of views and pipelines, not shards and antichains. One number (frontier lag) answers "is it healthy?"; four knobs cover 95% of tuning needs. |
+| P16 | **Operability is a first-class system property.** | The system is SLO-driven (operators state intent; the control plane chooses mechanism), self-tuning by default, deployable as a single binary, observable by construction, and unable to surprise its operator: every degradation has a named reason, every control action is auditable, and every pipeline runs inside enforced quotas. One number (frontier lag against the SLO) answers "is it healthy?"; everything else is a drill-down. |
 
 ### 1.1 Non-Goals (Explicit)
 
@@ -938,138 +948,327 @@ independent of operator processes — they can be co-located or run as a separat
 
 ## 14. Operations: Deploy, Monitor, Diagnose
 
-### 14.1 Deployment Ladder
+This section is a contract, not aspiration. Every primitive below has a
+corresponding milestone in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md);
+the design is not considered shipped until they exist and stay working.
 
-RockStream runs at any scale from a single laptop to hundreds of nodes. Start
-small; grow as needed.
+### 14.1 The Operator's Mental Model
+
+The operator interacts with **two nouns** and **one verb**:
+
+- **Pipelines**: a named compiled plan (a set of views fed by named
+  connectors). The unit of deployment, quota, priority, and SLO.
+- **Views**: SQL views maintained by a pipeline. The unit of query.
+- **Deploy**: submit/replace a pipeline. Everything else (sharding, shuffle,
+  recovery, compaction, GC, rebalancing) is implicit.
+
+The operator never names a shard, an operator instance, an arrangement, a
+frontier, a checkpoint, or a WAL segment in normal work. Those terms appear
+only inside drill-downs (`EXPLAIN INCREMENTAL`, support bundle, audit log)
+and only when something is wrong.
+
+### 14.2 Deployment Ladder
+
+One binary (`rockstream`), one config schema, three tiers. Every tier uses
+the same storage layout (§5) and the same SQL interface.
 
 ```
 Tier 1 — Single process (dev / eval)
-  One `rockstream` binary, in-process control plane, one worker,
-  a handful of shards, MinIO or a local directory as object storage.
-  Start with:  rockstream start --mode=single --storage=./data
-  This tier is how most contributors develop against the engine.
+  rockstream start --storage=./data
+  In-process control plane, one worker, local FS, a handful of shards.
+  Zero config needed. Survives crashes via local SlateDB.
 
 Tier 2 — Single host (small production)
-  One control-plane process + one or more worker processes on the same host.
-  Shared object storage (S3/GCS or MinIO). 4–16 shards.
-  Horizontal scale within one box; survives worker restarts.
+  rockstream start --role=all --storage=s3://bucket/...
+  Control plane and workers in one process; shared object storage.
+  Survives worker restarts; horizontally scales within one host.
 
 Tier 3 — Multi-host cluster (full production)
-  3 control-plane nodes (HA) + N worker nodes + shared object storage.
-  Hundreds or thousands of shards. Elastic: add / remove workers online.
+  On each control node:  rockstream start --role=control --storage=s3://...
+  On each worker node:    rockstream start --role=worker  --storage=s3://...
+  Elastic. Workers and control nodes can be added or removed online without
+  config rewrites; the control plane discovers and admits them.
 ```
 
-Every tier uses the same binary, the same storage layout (§5), and the same
-SQL interface. Moving from Tier 1 to Tier 2 means changing two config keys
-(`control.mode=distributed`, `storage.bucket=...`). No data migration is
-needed because all state is in object storage.
+Moving from Tier 1 to Tier 3 is purely additive: the same data files
+produced by Tier 1 against MinIO open in Tier 3 against S3. There is no
+migration step because there is no node-local state to migrate.
 
-### 14.2 The One Signal: Frontier Lag
+### 14.3 SLO-Driven Configuration
 
-The cluster-wide **frontier lag** is the single number that answers "is the
-system healthy?":
+The operator declares **what** they want; the control plane decides **how**:
+
+```sql
+CREATE PIPELINE sales_pipeline
+WITH (
+    freshness_target_ms = 1000,        -- views must be ≤ 1 s stale
+    state_budget_gb     = 200,         -- pipeline may use ≤ 200 GB state
+    object_store_rps    = 5000,        -- soft cap on PUT+GET per second
+    priority            = normal       -- low | normal | high
+)
+AS
+    CREATE VIEW sales_by_product AS
+        SELECT product_id, SUM(quantity) AS qty
+        FROM   orders
+        GROUP BY product_id;
+```
+
+The control plane auto-tunes the four mechanism knobs (§14.6) to satisfy the
+SLO inside the quota. Operators do not normally set those knobs; they set
+intent. If the SLO cannot be met inside the quota, the pipeline transitions
+to a named degraded state (§14.10) instead of silently missing the target.
+
+### 14.4 The One Signal: SLO Compliance
+
+For every pipeline the control plane reports a single rolling indicator:
 
 ```
-frontier_lag = wall_clock_now − source_event_time_of_the_oldest_unprocessed_epoch
+pipeline_slo_compliance{pipeline="sales_pipeline"}  =  0.0 .. 1.0
 ```
 
-When frontier lag is at or below your configured `max_epoch_ms`, views are
-as fresh as they can be. When it grows:
+Value `1.0` means the freshness target has been met for the full window
+(default 5 min). Anything below is the fraction of time it was met. A single
+Grafana panel showing this number per pipeline is enough to answer "is the
+platform healthy?" without operator training.
 
-| Lag pattern | Likely cause | Where to look |
+When SLO compliance dips, the corresponding `pipeline_degraded_reason` label
+reports a named reason from §14.10. Drill-down metrics break the reason down
+by operator and shard.
+
+### 14.5 Self-Tuning by Default
+
+Three control loops run continuously in the control plane. All three are on
+by default and can be disabled per pipeline (`autotune.* = off`) for audited
+manual control.
+
+| Loop | Adjusts | Trigger | Bounds |
+|---|---|---|---|
+| **Adaptive parallelism** | `operator.*.parallelism` | Operator `epoch_ms` p95 trends above SLO budget for > 30 s | `min_parallelism` ≤ N ≤ `max_parallelism` (per pipeline) |
+| **Adaptive epoch sizing** | `min_epoch_ms`, `max_epoch_ms` | Object-store write rate trends above quota, or SLO compliance < target | Floor: 10 ms; ceiling: 5 s |
+| **Adaptive scheduling** | Per-operator credit allocation | Backpressure detected at a downstream operator | Cooperative; never preempts |
+
+Every adjustment is recorded in the audit log (§14.11) with the metric
+reading that triggered it. Operators see *what the system decided and why*,
+not opaque magic.
+
+### 14.6 Manual Override Knobs
+
+For the cases auto-tuning cannot solve, the same four knobs from v3.2 remain
+available as per-pipeline or per-operator overrides:
+
+| Knob | Auto default | When to override |
 |---|---|---|
-| Steady slow climb | Source ingestion rate exceeds processing capacity | `rows_in_per_sec` vs `rows_out_per_sec` per pipeline |
-| Sudden spike, then recovers | Worker crash + recovery | Worker health; checkpoint age |
-| Stuck at a specific operator | That operator is the bottleneck | `epoch_ms` per op; `op_state` size growth |
-| Stuck at a shuffle exchange | Receiver shard is overwhelmed or unreachable | `shuffle_outbox_depth` on sender; receiver health |
-| Steady but never zero | Source is slower than expected | Connector lag metric |
+| `min_epoch_ms` | adaptive (10 ms–250 ms) | You have a known cost ceiling object storage cannot exceed. |
+| `max_epoch_ms` | = `freshness_target_ms / 2` | You want freshness tighter than what the SLO loop derives. |
+| `frontier_agg_interval` | 100 ms | Very large clusters (≥ 1000 shards) may relax to 500 ms. |
+| `operator.*.parallelism` | adaptive | `EXPLAIN INCREMENTAL` shows a specific operator stuck ⚠ and you want to pin it. |
 
-All of these signals are emitted per pipeline, per operator, and per shard
-under the `rockstream_` Prometheus namespace. A recommended starter Grafana
-dashboard is included in `deploy/dashboards/`.
+Manual overrides are sticky and visible in `SHOW PIPELINE` output so the
+next operator does not have to guess why a value was set.
 
-### 14.3 Diagnosing a Slow or Stuck Pipeline
+### 14.7 The CLI Surface
 
-Run `EXPLAIN INCREMENTAL <view_name>` to get a human-readable summary of the
-view's operator graph annotated with the latest per-operator statistics:
+Everything is one binary, one CLI:
 
 ```
-VIEW  sales_by_product  [lag: 450 ms ↑]  state: 12 GB
+rockstream start           --role=all|control|worker|gateway
+rockstream pipeline {list, show, deploy, replace, pause, resume, drop}
+rockstream view     {list, show, query, subscribe}
+rockstream explain  <view> [--estimate]
+rockstream cluster  {status, workers, quotas}
+rockstream support  bundle [--pipeline=<name>]   # see §14.12
+rockstream audit    {tail, query}                # see §14.11
+```
+
+No separate `rockstream-control`, `rockstream-worker`, `rockstream-gateway`
+binaries; no separate config files for each role. A node decides which roles
+it plays from its `--role` flag and what it can see from its `--storage` URL.
+A single uniform binary makes packaging, image building, and version
+upgrades trivial.
+
+### 14.8 Diagnosing a Slow or Stuck Pipeline
+
+Run `rockstream explain <view>` (equivalently `EXPLAIN INCREMENTAL <view>`)
+to get a human-readable summary of the view's operator graph annotated with
+the latest per-operator statistics:
+
+```
+VIEW  sales_by_product  [SLO: 1000 ms]  [lag: 450 ms ✅]  state: 12 GB / 200 GB
  ├─ AGG  SUM(quantity) GROUP BY product_id  [avg_epoch: 3 ms]  [shards: 8]
  │   └─ EXCHANGE  hash(product_id)  [depth: 0 batches]  [throughput: 1.2 M rows/s]
- │       └─ JOIN  orders ⋈ products ON product_id  [avg_epoch: 180 ms ⚠]  [shards: 32]
+ │       └─ JOIN  orders ⋈ products ON product_id  [avg_epoch: 180 ms ⚠]  [shards: 32 → 64 (adapting)]
  │           ├─ EXCHANGE  hash(product_id)  [depth: 14 batches ⚠]  [throughput: 800 k rows/s]
  │           │   └─ SCAN  orders  [connector_lag: 0 ms]
  │           └─ SCAN  products  [connector_lag: 0 ms]
 ```
 
 The `⚠` flags draw attention to operators whose `avg_epoch_ms` or
-`shuffle_outbox_depth` exceed their respective thresholds. In this example the
-join is slow and the upstream exchange has a growing outbox — both point to
-the join as the bottleneck. The action is to increase `parallelism` on that
-join (add more shards). The system can do this online via:
+`shuffle_outbox_depth` exceed thresholds. The `→ 64 (adapting)` annotation
+shows the adaptive-parallelism loop is already responding. Operators almost
+never need to touch these manually; the value of the tree is *understanding
+what the system is doing*, not driving it.
 
-```sql
-ALTER VIEW sales_by_product SET (operator.join.parallelism = 64);
+### 14.9 Cost Preview Before Deploy
+
+```
+rockstream explain <view> --estimate
 ```
 
-Or let the control plane's adaptive re-planner do it automatically when
-`adaptive_parallelism = true` (the default).
+or
 
-### 14.4 The Four Knobs
+```sql
+EXPLAIN INCREMENTAL ESTIMATE <CREATE VIEW …>;
+```
 
-For 95% of operational tuning, only four parameters matter:
+produces a predicted operator tree with:
 
-| Parameter | Default | Effect |
+- estimated state size per operator (from source-table statistics);
+- estimated steady-state object-store request rate;
+- estimated minimum frontier lag at the requested SLO;
+- whether the pipeline fits within its declared `state_budget_gb` and
+  `object_store_rps` quotas, and if not, by how much.
+
+This is the single biggest operator surprise eliminated: nobody has to
+deploy a view to discover it needs 4 TB of arrangement state.
+
+### 14.10 Named Degraded States
+
+When a pipeline cannot meet its SLO inside its quotas, it transitions to a
+**named** degraded state. The control plane never fails silently and never
+drops data without an explicit, surfaced reason. States:
+
+| State | Meaning | Operator action |
 |---|---|---|
-| `min_epoch_ms` | 50 ms | Minimum time between commits. Raise this to reduce object-store write costs at low throughput. |
-| `max_epoch_ms` | 500 ms | Maximum allowed frontier lag before the system emits a warning and forces a commit. Drives freshness SLO. |
-| `frontier_agg_interval` | 100 ms | How often the control plane aggregates shard frontiers. Lower = fresher GC; higher = cheaper control plane. |
-| `operator.*.parallelism` | auto | Per-operator shard count. `auto` lets the cost model pick; override when you see a specific operator as the bottleneck in `EXPLAIN INCREMENTAL`. |
+| `HEALTHY` | SLO met, quota margin available. | None. |
+| `STRESSED` | SLO met, quota ≥ 80% utilised. | Plan capacity addition. |
+| `OVER_BUDGET_RELAXED` | SLO relaxed by the system because state budget is full. Freshness is degraded but data is correct. | Raise `state_budget_gb` or revise view to reduce state. |
+| `RPS_THROTTLED` | SLO relaxed because object-store quota is the bottleneck. | Raise `object_store_rps` or revise SLO. |
+| `PAUSED` | Pipeline explicitly paused, or paused by admission control to free capacity for higher-priority work. | Resume when ready. |
+| `BLOCKED` | A non-recoverable error (e.g. connector authentication, schema mismatch). | Inspect `pipeline_blocked_reason`; fix; resume. |
 
-Everything else is either set-and-forget (WAL listing cache, segment extractor,
-compaction schedule) or lives in the connector config (Kafka group-id, offset
-reset policy, etc.).
+Every state transition is in the audit log (§14.11) with the metric or
+event that caused it. SLO compliance §14.4 dips together with the state
+transition so the dashboard tells the same story.
 
-### 14.5 Metrics Reference
+### 14.11 Audit Log
 
-Every shard and every operator instance reports:
-- `frontier_lag_ms` — per pipeline, the primary SLO metric.
+Every control-plane action is appended to a durable, queryable audit log in
+the control SlateDB:
+
+```
+control: audit/{ulid} → {
+  timestamp, actor ("system" | user_id), action, target (pipeline/view),
+  before, after, reason, related_metric
+}
+```
+
+Actions captured: pipeline deploy/replace/pause/resume/drop, autotuner
+parallelism change, autotuner epoch-size change, admission-control pause,
+shard add/remove/rebalance, worker join/leave, checkpoint commit, degraded-
+state transition.
+
+`rockstream audit tail` follows the log; `rockstream audit query` supports
+filters by pipeline, time range, action type. The log is the single source
+of truth for "what changed in the cluster yesterday at 03:00 UTC?".
+
+### 14.12 Support Bundle
+
+One command collects everything needed to debug an issue without ad-hoc
+requests for logs, metrics, plans, and configs:
+
+```
+rockstream support bundle --pipeline=sales_pipeline --since=1h --out=bundle.tar.gz
+```
+
+Includes: pipeline definition, last N compiled plans, last N audit-log
+entries scoped to the pipeline, the live `EXPLAIN INCREMENTAL` output, the
+relevant Prometheus metric series for the time window, recent worker logs,
+recent checkpoint references, anonymised sample of recent connector
+offsets, and the cluster topology snapshot. Sensitive values (credentials,
+user data) are redacted by default; `--include-secrets=false` is the
+default and cannot be overridden by config (only by an explicit CLI flag).
+
+### 14.13 Quotas and Multi-Tenancy
+
+Every pipeline declares its resource envelope at creation. The control
+plane enforces these as hard caps:
+
+| Quota | Enforced by |
+|---|---|
+| `state_budget_gb` | Sum of `op_state_bytes` across the pipeline; over-limit transitions to `OVER_BUDGET_RELAXED`. |
+| `object_store_rps` | Token-bucket admission on the shard commit path. |
+| `max_parallelism` | Upper bound for the adaptive-parallelism loop. |
+| `max_shards` | Upper bound on shards owned by this pipeline. |
+| `priority` | Used by admission control (§14.16) to choose which pipelines to pause first under contention. |
+
+Quotas are declared in `CREATE PIPELINE` and can be altered with
+`ALTER PIPELINE ... SET (...)`. They are visible in `SHOW PIPELINE` and in
+the audit log when changed.
+
+### 14.14 Error Code Taxonomy
+
+Every error returned to a user, written to a log, or recorded as a
+`pipeline_blocked_reason` carries a stable `RS-XXXX` code with a published
+doc URL. Examples (illustrative):
+
+```
+RS-1001  connector.authentication_failed
+RS-1002  connector.schema_drift
+RS-2001  view.unsupported_sql_construct
+RS-2002  view.state_budget_exceeded
+RS-3001  shard.fence_lost
+RS-3002  shard.recovery_replay_failed
+RS-4001  control.quota_violation
+RS-4002  control.autotune_bounds_exhausted
+```
+
+`rockstream` exits non-zero on any RS-coded error and prints a one-line
+remediation pointer. The codebase has a single error-code registry; CI
+fails if a new code is introduced without a doc entry. "Internal error"
+without a code is itself a bug.
+
+### 14.15 Metrics Reference
+
+Every shard, operator instance, and pipeline reports:
+- `pipeline_slo_compliance` — the primary indicator (§14.4).
+- `pipeline_degraded_reason` — label when below 1.0 (§14.10).
+- `frontier_lag_ms` — raw lag, per pipeline.
 - `rows_in_per_sec`, `rows_out_per_sec` — throughput.
 - `epoch_ms` — per operator, processing time per epoch.
 - `op_state_bytes`, `op_state_rows` — arrangement size.
 - `shuffle_outbox_depth` — pending batches on each exchange sender.
 - `connector_lag_ms` — age of the oldest unread event in the source.
 - `compaction_backlog_bytes` — SST bytes awaiting compaction.
+- `object_store_rps` — PUT+GET+LIST+DELETE per second per shard.
+- `autotune_decisions_total` — counter labeled by `(loop, direction)`.
 
-Exported via Prometheus / OpenTelemetry. A Grafana dashboard template is
-provided in `deploy/dashboards/rockstream-overview.json`.
+Exported via Prometheus / OpenTelemetry. A starter Grafana dashboard ships
+in `deploy/dashboards/rockstream-overview.json` and contains exactly one
+panel above the fold per pipeline: SLO compliance over time.
 
-### 14.6 Backpressure
+### 14.16 Backpressure and Admission Control
 
-The exchange subsystem implements credit-based flow control:
-- Receivers grant N credits per sender.
-- Senders may have at most N unacked batches outstanding.
-- When credits exhaust, the sender blocks, which propagates upstream naturally.
+Backpressure is cooperative credit flow: receivers grant credits to senders;
+senders block on credit exhaustion; this propagates upstream as growing
+`frontier_lag_ms` long before any data loss is possible. No operator blocks
+on a sibling's progress; only on its own credits and its own input
+frontier. This is the structural reason RockStream does not adopt Feldera's
+`DynamicScheduler` ownership model.
 
-`shuffle_outbox/` depth on a sender is itself a backpressure signal: if it
-grows beyond a threshold, the upstream operator pauses. This always shows up
-as growing `frontier_lag_ms` well before it causes any data loss.
+Admission control sits in front of every `CREATE PIPELINE` and every
+autotuner expansion. It refuses requests that would push cluster
+utilisation past configured thresholds, and it pauses lower-priority
+pipelines when higher-priority ones request capacity that is otherwise
+unavailable. Both decisions are recorded in the audit log with the
+relevant metric readings.
 
-Backpressure is **always cooperative**, never a synchronous global barrier.
-No operator blocks on a sibling's progress; it only blocks on its own credits
-and its own input frontier.
+### 14.17 Failure Injection (`rockstream chaos`)
 
-### 14.7 Admission Control
-
-The control plane refuses to start new pipelines if cluster utilization would
-exceed thresholds. It can pause low-priority pipelines to free capacity for
-high-priority ones (via a `priority` field in the pipeline config).
-
-A paused pipeline accumulates no new epochs; its frontier lag grows and it
-appears clearly as `PAUSED` in `EXPLAIN INCREMENTAL`. It resumes automatically
-when capacity frees up or when explicitly resumed.
+A built-in fault-injection subcommand makes the recovery story testable in
+the same environment as production. Inject worker kills, object-store
+latency, shard fence loss, or connector stalls and watch SLO compliance,
+degraded-state transitions, and the audit log respond. Recovery is not a
+story told in docs; it is a button anyone can press.
 
 ---
 
