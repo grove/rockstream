@@ -1,0 +1,10 @@
+[package]
+name = "rockstream-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared types for RockStream (timestamps, frontiers, Z-set rows, schemas)"
+
+[dependencies]
+serde = { workspace = true }

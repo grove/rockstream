@@ -1,0 +1,11 @@
+[package]
+name = "rockstream-ops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Operator trait and per-operator implementations for RockStream"
+
+[dependencies]
+rockstream-types = { workspace = true }
+rockstream-plan = { workspace = true }
