@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.14. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.20. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -170,6 +170,21 @@ object storage.
 > a native DuckLake server adds value only for deployments that are
 > DuckLake-first and want zero external endpoints. §13.8 documents the
 > design decision and the conditions under which it should be revisited.
+>
+> **v3.20 is a coherence pass addressing identified design gaps**: frontier
+> aggregator leader election via lease-based fencing (§3.2); first-class
+> secrets management with envelope encryption and worker-side token resolution
+> (§14.18); `rockstream.epochs` scalability via pre-aggregated checkpoint
+> summaries with mandatory filters (§12.6.1); `AS OF EPOCH` granularity
+> disclosure — resolution is checkpoint-bounded, not epoch-bounded (§12.4.1);
+> downstream lag inheritance validation at `CREATE PIPELINE` and in
+> `EXPLAIN INCREMENTAL ESTIMATE` (§14.9); namespace corrected from "analogous
+> to PostgreSQL schema" to "analogous to PostgreSQL database" with pgwire
+> routing semantics (§5.2); targeted compaction fallback when range-targeted
+> API is unavailable (§5.4); GA vs. Data Lake GA positioning scope clarified
+> (§15); Phase 12 decision gate given explicit "no" criteria
+> (IMPLEMENTATION_PLAN.md); data quality/expectations explicitly deferred to
+> post-1.0 with extension-point design (§15.1).
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -456,10 +471,30 @@ Frontier-role processes are stateless: they subscribe to per-shard frontier
 reports (§8.3), maintain the cluster vector frontier in memory, persist the
 committed frontier to control SlateDB on a low-frequency cadence (§8.4), and
 serve `GET cluster.frontier` to query gateways. They can be scaled
-horizontally and re-elected freely; loss of a frontier process delays
-freshness-token issuance but does not block ingest or compromise correctness.
-This keeps the Raft group small (3–5 nodes) and its proposal rate independent
-of shard count.
+horizontally; loss of a frontier process delays freshness-token issuance but
+does not block ingest or compromise correctness. This keeps the Raft group
+small (3–5 nodes) and its proposal rate independent of shard count.
+
+**Leader election among frontier processes.** When multiple frontier-role
+processes run, exactly one is the *elected publisher* — the process that
+writes the committed frontier to control SlateDB. Election uses a
+**lease-based leader** pattern on the control SlateDB:
+
+1. Each frontier process attempts to acquire a time-limited writer lease on
+   the `frontier/leader` key in the control DB (a compare-and-swap on a
+   lease-holder UUID with a TTL, e.g. 10 s).
+2. The holder refreshes the lease at `TTL / 3` intervals. If a refresh fails
+   (fenced or expired), the process demotes itself to follower immediately.
+3. Followers serve cached reads of the cluster frontier (stale by at most
+   `frontier_agg_interval`) but do not write to SlateDB.
+4. On holder loss (TTL expiry), any follower may attempt acquisition; the
+   first successful CAS becomes the new publisher.
+
+This is explicitly **not Raft** — there is no log replication, no quorum, and
+no membership protocol. The frontier role stores no durable state of its own;
+the lease exists only to prevent concurrent writers to the committed-frontier
+key. The mechanism is identical to a distributed lock with fencing tokens and
+is well-suited to the stateless, crash-tolerant nature of the frontier role.
 
 ---
 
@@ -646,12 +681,21 @@ catalog/pipeline:  0x01 0x03 namespace_id(16) pipeline_id(16)
 namespace/def:     0x0A 0x01 namespace_id(16) → { name, quotas, worker_pool }
 ```
 
-A namespace is the isolation boundary within one cluster — analogous to a
-PostgreSQL schema or a Databricks workspace. The control plane enforces that
-cross-namespace references are only allowed where explicitly permitted (e.g. a
-shared source namespace that multiple tenant namespaces can read from). The
-default namespace is `default` with `namespace_id = 0`; single-tenant
-deployments never need to think about namespaces.
+A namespace is the isolation boundary within one cluster — **analogous to a
+PostgreSQL database** (the `dbname` in the connection string), not a PostgreSQL
+schema. Each namespace is a separate connection target: the pgwire gateway
+routes connections to a namespace based on the `database` field in the startup
+message. Objects within a namespace are not schema-qualified further (there is
+no schema layer inside a namespace). Cross-namespace queries are not possible
+within a single connection; clients must reconnect to a different namespace.
+This matches Postgres `dbname` semantics (cross-database references require
+`dblink` or `postgres_fdw`) and differs from Postgres schemas (where
+`schema_a.table` and `schema_b.table` are accessible in the same connection
+via `search_path`). The control plane enforces that cross-namespace data
+sharing is only allowed where explicitly permitted (e.g. a shared source
+namespace that multiple tenant namespaces can read from). The default namespace
+is `default` with `namespace_id = 0`; single-tenant deployments never need to
+think about namespaces.
 
 This key scheme is required from day one. Retrofitting a namespace prefix into
 the catalog after data has been written would require a storage format migration.
@@ -735,10 +779,18 @@ things to discover at runtime:
   them, degrading read latency. Each shard reports a `tombstone_density`
   metric (tombstone count / total key count). When `tombstone_density >
   tombstone_compaction_threshold` (default 0.25), the worker schedules a
-  targeted compaction on that key range. Compaction filters clear Z-set
-  entries whose weight is zero AND whose epoch is older than the committed
-  checkpoint frontier — this is safe because no reader can observe a
-  zero-weight row at a past epoch.
+  targeted compaction on that key range via SlateDB's
+  `manual_compaction(key_range)` API (which triggers compaction of all SSTs
+  overlapping the specified range). **Note**: if SlateDB does not expose a
+  range-targeted `manual_compaction` API at implementation time, the fallback
+  is a full `manual_compaction()` of the shard — acceptable because each shard
+  is already bounded to `target_shard_state_bytes` (§10.6) and full compaction
+  of a single shard is bounded work. The key insight is that compaction is
+  requested *per shard* (each shard is its own SlateDB instance), so "targeted
+  compaction on that key range" never means compacting another shard's data.
+  Compaction filters clear Z-set entries whose weight is zero AND whose epoch
+  is older than the committed checkpoint frontier — this is safe because no
+  reader can observe a zero-weight row at a past epoch.
 
 ### 5.5 Storage Format Versioning and Rolling Upgrades
 
@@ -1219,7 +1271,7 @@ frontiers hierarchically without changing semantics:
     one compact `WorkerFrontierSummary` per `(pipeline, operator, output_port)`
     per `frontier_agg_interval`.
 3. Frontier-role processes compute the cluster meet from worker summaries.
-4. In clusters with multiple frontier roles, one elected publisher writes the
+4. In clusters with multiple frontier roles, one elected publisher (§3.2) writes the
   committed frontier to control SlateDB; followers serve cached reads.
 
 This keeps control-plane traffic proportional to active workers and active
@@ -1769,12 +1821,23 @@ SELECT * FROM orders_mv AS OF TIMESTAMP '2026-01-15T09:00:00Z';
 ```
 
 **Resolution.** The gateway resolves the requested point to the nearest
-committed cluster checkpoint:
+committed cluster checkpoint whose frontier dominates the requested epoch:
 
 - `AS OF EPOCH <n>`: look up `control: checkpoints/` for the checkpoint whose
   committed epoch frontier dominates epoch `n` on all relevant shards.
 - `AS OF TIMESTAMP <t>`: look up the checkpoint whose commit wall-clock time
   is the greatest value ≤ `t`.
+
+**Granularity disclosure.** The effective granularity of `AS OF` is
+**checkpoint-bounded, not epoch-bounded**. If the cluster checkpoint interval
+is 30 seconds and epochs are 100 ms, then `AS OF EPOCH 4201` and
+`AS OF EPOCH 4250` may resolve to the same checkpoint and return the same
+snapshot. The query response includes a `resolved_checkpoint_epoch` field so
+clients can observe the actual resolution point. Two queries with different
+epoch arguments that resolve to the same checkpoint are guaranteed to return
+identical results. Clients that need finer-grained history should reduce the
+checkpoint interval (at the cost of higher object-store writes) or use the
+subscribe API for epoch-level deltas.
 
 If no matching checkpoint exists (too old, or before the pipeline was created),
 the gateway returns `RS-2005 history.epoch_before_retention`.
@@ -1875,6 +1938,20 @@ through the standard SQL interface.
 | `rockstream.connectors` | `control: connector/` | Connector status, latest committed offset, lag. |
 | `rockstream.audit_log` | `control: audit/` | Recent audit events (bounded by a configurable window, default 7 days). |
 | `rockstream.schema_history` | `control: schema/` | Per-view schema version history: version, applied timestamp, actor, change summary. |
+
+**`rockstream.epochs` scalability.** On a busy cluster (e.g. 1,000 shards ×
+10 rows/s/shard × 100 ms epochs = 864 billion logical rows/day), storing one
+row per shard per epoch is infeasible for unbounded query. The system schema
+therefore provides `rockstream.epochs` as a **pre-aggregated, pipeline-scoped
+summary** — one row per *committed cluster checkpoint*, not per shard-epoch.
+At a 30-second checkpoint interval, this is ~2,880 rows/day regardless of
+shard count. Queries against `rockstream.epochs` **require** a `pipeline_id`
+filter and are served from the checkpoint index, not from raw shard metadata.
+Unfiltered `SELECT * FROM rockstream.epochs` is rejected with `RS-2006
+system_table.requires_filter` to prevent accidental full scans. For per-shard
+epoch detail, `rockstream.shard_epochs` is available as a detail table with
+mandatory `pipeline_id` + time-range predicates and cursor-based pagination
+(default page size 10,000 rows).
 
 Example queries:
 
@@ -2443,10 +2520,10 @@ successful snapshot flush. The data is always readable by path even if the
 catalog registration is temporarily behind.
 
 **Credential management.** Catalog credentials (`catalog_credentials`) are
-stored as a named secret in the control-plane catalog (`catalog/secrets/`),
-never in plain text in the `CREATE SINK` statement. Credentials are encrypted
-at rest using the cluster's key material (§14.x) and injected into the sink
-process at runtime.
+stored as a named secret in the control-plane catalog (`catalog/secrets/`,
+§14.18), never in plain text in the `CREATE SINK` statement. Credentials are
+encrypted at rest using the cluster's key material (§14.18) and injected into
+the sink process at runtime via the secret-token mechanism.
 
 **DuckLake detail.** DuckLake differs from other catalogs in that it stores
 both table metadata *and* Iceberg snapshot history in a DuckDB database (local
@@ -2872,6 +2949,18 @@ produces a predicted operator tree with:
 - estimated minimum frontier lag at the requested SLO;
 - whether the pipeline fits within its declared `state_budget_gb` and
   `object_store_rps` quotas, and if not, by how much.
+- **minimum achievable freshness through the DAG** — for views that depend
+  on upstream pipelines, the estimate propagates the upstream pipeline's
+  `freshness_target_ms` (or observed lag if already running) forward through
+  the dependency graph and reports the cumulative minimum lag at the leaf
+  view. If `pipeline B.freshness_target_ms = 100` but it depends on
+  `pipeline A` with `freshness_target_ms = 60000`, the estimate reports
+  `minimum_achievable_lag_ms: 60100` and flags the SLO as **structurally
+  unachievable** (`RS-4003 slo.downstream_lag_exceeds_target`). This
+  validation also runs at `CREATE PIPELINE` time: if the declared SLO is
+  below the minimum achievable lag from upstream dependencies, the pipeline
+  is created in `BLOCKED(RS-4003)` state rather than silently missing its
+  SLO.
 
 This is the single biggest operator surprise eliminated: nobody has to
 deploy a view to discover it needs 4 TB of arrangement state.
@@ -3025,6 +3114,65 @@ latency, shard fence loss, or connector stalls and watch SLO compliance,
 degraded-state transitions, and the audit log respond. Recovery is not a
 story told in docs; it is a button anyone can press.
 
+### 14.18 Secrets Management
+
+Every connector in the system needs credentials: Kafka SASL, Postgres
+replication users, AWS access keys, catalog API tokens. RockStream provides a
+first-class secrets subsystem rather than deferring credential handling to
+individual connectors.
+
+**Storage.** Secrets are stored in the control SlateDB under the key prefix
+`catalog/secrets/`:
+
+```
+catalog/secrets:   0x01 0x0B namespace_id(16) secret_name(var) → encrypted_blob
+```
+
+Each secret value is envelope-encrypted: a per-secret data encryption key (DEK)
+encrypts the credential payload; the DEK is itself encrypted by the cluster's
+key encryption key (KEK). The KEK source is configured at cluster bootstrap:
+
+| `secret_kek_source` | Description |
+|---|---|
+| `env` (default) | KEK loaded from `RS_SECRET_KEK` environment variable on the control-plane process. Suitable for single-node and dev. |
+| `aws_kms` | KEK is an AWS KMS key ARN; envelope encrypt/decrypt via KMS API. |
+| `gcp_kms` | KEK is a GCP Cloud KMS key resource; envelope encrypt/decrypt via Cloud KMS API. |
+| `vault` | KEK retrieved from HashiCorp Vault transit engine. |
+
+**DDL surface:**
+
+```sql
+CREATE SECRET kafka_prod (
+    TYPE = 'sasl_plain',
+    USERNAME = 'rockstream-ingest',
+    PASSWORD = '...'     -- value is encrypted before storage; never persisted in plaintext
+);
+
+CREATE SOURCE orders FROM KAFKA (
+    brokers = 'kafka:9092',
+    topic = 'orders',
+    secret = 'kafka_prod'
+);
+```
+
+**Worker-side resolution.** Workers never read raw secret values from the
+control DB. At pipeline startup, the control plane issues a short-lived
+*secret token* (an encrypted blob containing the decrypted credential,
+encrypted to the requesting worker's identity, with a TTL). Workers decrypt
+the token using their node key (derived from mTLS identity) and hold the
+credential in memory only for the lifetime of the connector process. Secret
+tokens are not written to logs, audit events, support bundles, or shard state.
+
+**Audit.** Every `CREATE SECRET`, `ALTER SECRET`, `DROP SECRET`, and secret-
+token issuance is recorded in the audit log with actor, timestamp, and target
+secret name (never the value). `SHOW SECRETS` displays names and types but
+never values.
+
+**Rotation.** `ALTER SECRET <name> SET (PASSWORD = '...')` updates the
+encrypted blob. Active connectors using that secret receive a rotation signal
+and re-acquire a fresh token on their next epoch boundary — no pipeline
+restart required.
+
 ---
 
 ## 15. Comparison to Prior Art
@@ -3046,6 +3194,49 @@ story told in docs; it is a button anyone can press.
 The unique positioning: **end-to-end object-storage native** (no NVMe required,
 no local-state assumptions) **+ full SQL via DBSP** (correctness guarantees) **+
 adaptive per-operator parallelism**.
+
+**GA vs. Data Lake GA scope.** The table above describes the system at
+full design scope (v0.54+). At Production Beta / v1.0 (v0.51), the cold-tier
+Iceberg sink, Iceberg REST Catalog server, and DuckDB/Spark/Trino discovery-
+by-name are **not yet shipped** — they are Phase 12 deliverables (v0.52–v0.54).
+The v1.0 positioning therefore rests on: object-storage-native IVM, full SQL,
+adaptive parallelism, Postgres wire access, direct DML writes, and the
+connector ecosystem. The "first-class Iceberg table" story (§12.7, §13.6,
+§13.7) is a differentiator at Data Lake GA, not at Production Beta. Marketing
+materials and competitive positioning prior to v0.52 must not claim cold-tier
+or external-catalog features as shipping capabilities.
+
+### 15.1 Explicitly Deferred: Data Quality / Expectations
+
+Systems like Delta Live Tables (Databricks), dbt tests, Dagster asset checks,
+and Soda provide declarative data-quality expectations: row-level assertions,
+column constraints, freshness checks, and anomaly detection integrated into the
+pipeline lifecycle. RockStream does **not** include a data-quality subsystem in
+v1.0.
+
+**Rationale for deferral.** Data-quality expectations are valuable but
+orthogonal to the IVM correctness guarantee. RockStream's core contract is
+"the view is a correct incremental materialization of the SQL definition."
+Quality assertions ("no NULL in `email`", "order_total > 0") are
+application-domain rules, not IVM semantics. Implementing them well requires
+a dedicated assertion language, DLQ routing, per-row vs. batch-level
+semantics, and integration with alerting — each of which is a meaningful
+scope addition.
+
+**Planned phase.** Data quality is targeted as a **post-1.0 extension**
+(tentatively v0.55+), designed as a plugin/extension layer:
+
+- `CREATE EXPECTATION <name> ON <view> AS <predicate>` DDL.
+- Failing rows routed to a configurable DLQ sink with the expectation name
+  and failure context.
+- Pipeline-level quality metrics (`expectation_pass_ratio`,
+  `expectation_fail_count`) exposed in `rockstream.expectations`.
+- Integration with the existing `BLOCKED` / degraded-state machinery: a view
+  whose quality drops below a threshold can transition to
+  `DEGRADED(RS-6001 quality.below_threshold)`.
+
+This is an explicit deferral, not an oversight. The extension point is the
+operator-layer hook after view-output commit and before sink delivery.
 
 ---
 

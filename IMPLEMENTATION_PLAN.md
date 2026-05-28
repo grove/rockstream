@@ -1092,6 +1092,10 @@ a gateway rewrite.
   - mTLS everywhere (worker↔control, worker↔worker, gateway↔client);
     certificate rotation documented (DESIGN.md §3 Cluster Bootstrap).
   - At-rest encryption via object-store features.
+  - **Secrets management** (DESIGN.md §14.18): `CREATE SECRET` DDL,
+    envelope encryption with configurable KEK source (env, AWS KMS, GCP KMS,
+    Vault), worker-side secret-token resolution, rotation without pipeline
+    restart, audit trail for all secret lifecycle events.
   - Auth integration tests: unauthenticated requests rejected; cross-tenant
     pipeline access denied; audit log `actor` field populated on every event.
   - Rolling-upgrade integration test: deploy N→N+1 with one worker at a time;
@@ -1137,6 +1141,24 @@ designed in DESIGN.md §12.7 and the cold-tier sink/catalog designed in §13.6�
 whether cold-tier storage is worth implementing or whether pushing Iceberg
 snapshots to external catalogs via sinks (§13.6.5 path only) is sufficient.
 If cold tier is confirmed, Phase 12 proceeds.
+
+**Decision criteria — "no" case.** Phase 12 does NOT proceed if all of the
+following hold:
+
+1. **No pilot customer requires full-scan analytics on view output.** If every
+   known use case reads views by primary key or narrow predicate (the hot path
+   the LSM is good at), the cold tier adds cost without value.
+2. **External-catalog-push via §13.6.5 satisfies tool discoverability.** If
+   pilot customers can point DuckDB/Spark/Trino at a sink-written Iceberg path
+   and the freshness lag of periodic sink flushes is acceptable, the
+   gateway-served two-tier merge is unnecessary.
+3. **No measurable user demand for `AS OF` full-collection scans.** If
+   historical queries are limited to point lookups or narrow key ranges, the
+   LSM reader at a past checkpoint is sufficient; Parquet cold snapshots
+   provide no speedup.
+
+If any one condition is false, Phase 12 proceeds. The decision is recorded in
+the audit log with the evidence considered.
 
 ---
 
