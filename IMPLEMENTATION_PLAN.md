@@ -41,10 +41,11 @@ The phase numbers here map to ROADMAP.md roadmap versions as follows:
 | 5 | v0.31–v0.32 | Frontier protocol and progress tracking |
 | 6 | v0.33–v0.36 | Fault tolerance, exactly-once, chaos |
 | 7 | v0.37–v0.39 | Elasticity: split, merge, drain, clone |
-| 8 | v0.43–v0.45 | Connectors and sinks (Tier 1 + Tier 2 contract) |
-| 9 | v0.40–v0.42 | Postgres query gateway, introspection, freshness, subscribe |
+| 8 | v0.40–v0.42 | Postgres query gateway, introspection, freshness, subscribe |
+| 9 | v0.43–v0.45 | Connectors and sinks (Tier 1 + Tier 2 contract) |
 | 10 | v0.46–v0.49 | Auth, observability, upgrades, security |
 | 11 | v0.50–v0.51 | Long soak and production beta handoff |
+| 12 | v0.52–v0.54 | Cold-tier sink, Iceberg REST catalog, snapshot GC |
 
 Durations are indicative effort, not calendar time, and assume a small
 dedicated team. The ROADMAP.md version table is the single source of truth
@@ -828,7 +829,7 @@ production-ready.
 
 ---
 
-## Phase 8 — Connectors & Sinks
+## Phase 9 — Connectors & Sinks
 
 **Goal**: Connect to the real world.
 
@@ -888,7 +889,7 @@ production-ready.
 
 ---
 
-## Phase 9 — Query Gateway & Postgres Compatibility
+## Phase 8 — Query Gateway & Postgres Compatibility
 
 **Goal**: Serve materialized views to applications over the Postgres wire
 protocol. Make RockStream self-contained (no external broker required).
@@ -994,7 +995,7 @@ a gateway rewrite.
     base-table shard, receiving the shard's next `source_epoch`.
   - `ROLLBACK` discards the buffer without shard writes.
 
-**Exit criteria for v0.42 (Phase 9 complete)**
+**Exit criteria for v0.42 (Phase 8 complete)**
 
 - `psql` runs `INSERT INTO t VALUES (...); COMMIT` and view reflects it within
   `freshness_target_ms`.
@@ -1006,7 +1007,7 @@ a gateway rewrite.
 
 ---
 
-**Additional Phase 9 deliverables (cross-cutting)**
+**Additional Phase 8 deliverables (cross-cutting)**
 
 - **Authentication / authorization**: OIDC / bearer-token auth at the gateway;
   per-view RBAC with `viewer` / `pipeline_owner` / `admin` roles stored in the
@@ -1114,6 +1115,134 @@ a gateway rewrite.
 - v1.0.0 tagged; binaries + container images published.
 - First external production customer running with paid support contract (or
   internal stakeholder accepting handoff).
+
+---
+
+## Phase 12 — Cold-Tier Sink & Iceberg REST Catalog
+
+**Goal**: Make RockStream's pre-computed views consumable by any tool in the
+data lake ecosystem (DuckDB, Snowflake, Trino, Spark, dbt) without those tools
+needing to talk to RockStream's gateway. Implement the two-tier storage model
+designed in DESIGN.md §12.7 and the cold-tier sink/catalog designed in §13.6–§13.7.
+
+**Prerequisite decision gate**: by Production Beta (v0.51), the team evaluates
+whether cold-tier storage is worth implementing or whether pushing Iceberg
+snapshots to external catalogs via sinks (§13.6.5 path only) is sufficient.
+If cold tier is confirmed, Phase 12 proceeds.
+
+---
+
+### v0.52 — Cold-Tier Parquet/Iceberg Sink
+
+- **Iceberg cold-tier sink writer** (DESIGN.md §13.6):
+  - `CREATE SINK ... TO ICEBERG '<path>' WITH (...)` DDL processing.
+  - `should_flush()` gated by `snapshot_interval_epochs` / `snapshot_interval_ms`.
+  - Pending-buffer staging in shard SlateDB (`connector/{id}/pending_buffer`).
+  - Parquet data file writer: one file per shard partition, column stats
+    (min/max/null count), configurable `parquet_row_group_bytes`.
+  - Iceberg manifest file writer: per-data-file entries with Parquet stats.
+  - Manifest list (snapshot) file writer.
+  - Atomic `metadata.json` pointer commit (optimistic CAS on version-hint).
+  - Connector offset update: `last_snapshot_epoch`.
+  - Crash-recovery: idempotent replay from pending_buffer produces identical
+    Parquet files (keyed by `{shard_id}-{epoch}`).
+- **`ViewReader` `TwoTier` implementation** (DESIGN.md §12.7.3):
+  - Gateway resolves `TwoTier { snapshot_manifest, hot_tail_from_epoch }`.
+  - Cold read: DataFusion Parquet scan over the snapshot's data files.
+  - Hot tail read: `DbReader` scan for epochs > `snapshot_epoch`.
+  - Merge: union with deduplication by `row_id`.
+  - Planner threshold: `cold_tier_scan_threshold` (default 10M rows).
+- **Delta Lake variant** stub: `CREATE SINK ... TO DELTA` with
+  `_delta_log/` JSON transaction entries. Feature-flagged behind
+  `--experimental-delta-sink`.
+- **Cold snapshot GC** (DESIGN.md §13.6.6):
+  - `cold_snapshot_retention_count` per-sink (default: 32 snapshots).
+  - `cold_snapshot_retention_duration` per-sink (default: 7 days).
+  - GC runs after each successful snapshot commit: delete Parquet data
+    files and manifest files not referenced by any retained snapshot.
+  - Iceberg metadata rollback: `metadata.json` always points at the
+    latest snapshot; old manifests that reference only expired data files
+    are removed.
+  - GC is idempotent: re-running after a crash does not delete live data.
+  - Metrics: `cold_snapshot_count`, `cold_snapshot_bytes`,
+    `cold_gc_last_run_epoch`, `cold_gc_bytes_reclaimed`.
+
+**Exit criteria for v0.52**
+
+- DuckDB `iceberg_scan('s3://...')` reads a valid Iceberg v2 table written
+  by RockStream.
+- Full-scan query over a 100M-row cold-tier view completes 10x faster than
+  the same query against hot LSM.
+- Crash mid-flush (kill during step 2) produces no orphan data files after
+  recovery flush.
+- Cold snapshot GC keeps ≤ `cold_snapshot_retention_count` snapshots;
+  expired Parquet files are deleted within one GC cycle.
+- `EXPLAIN INCREMENTAL` shows `TwoTier` read strategy when cold tier is
+  active.
+
+---
+
+### v0.53 — Catalog Registration & Iceberg REST Catalog Server
+
+- **Catalog registration backends** (DESIGN.md §13.6.5):
+  - `catalog = 'filesystem'` — no-op (already functional from v0.52).
+  - `catalog = 'glue'` — AWS Glue Data Catalog API integration.
+  - `catalog = 'rest'` — Iceberg REST Catalog spec client for Polaris,
+    Unity Catalog, Gravitino, Nessie.
+  - `catalog = 'hive'` — Hive Metastore Thrift client.
+  - `catalog = 'ducklake'` — DuckLake metadata database sync.
+  - Step 6 of snapshot lifecycle: idempotent catalog API call.
+  - `CATALOG_WARN` state on failure; retried next flush; IVM never blocked.
+  - Credential management via named secrets (`catalog/secrets/`).
+- **Native Iceberg REST Catalog server** (DESIGN.md §13.7):
+  - Gateway HTTP server on port 8181 serves `/iceberg/v1/`.
+  - `GET /v1/config`, `GET /v1/namespaces`, `GET /v1/namespaces/{ns}/tables`,
+    `GET /v1/namespaces/{ns}/tables/{tbl}`,
+    `GET /v1/namespaces/{ns}/tables/{tbl}/snapshots`.
+  - Backed by control-plane `DbReader` + cold snapshot manifests.
+  - Auth: same bearer/mTLS as SQL gateway.
+  - `rockstream-catalog` module inside `rockstream-gateway`.
+
+**Exit criteria for v0.53**
+
+- Spark configured with `catalog.type=rest, catalog.uri=http://rockstream:8181/iceberg/v1`
+  discovers and reads a RockStream view by name.
+- DuckDB with `iceberg_rest` secret discovers tables without explicit S3 path.
+- Glue catalog shows table within 30s of snapshot commit.
+- `CATALOG_WARN` state surfaces cleanly when external catalog is unreachable;
+  subsequent flush + successful API call resolves the state.
+- Auth: unauthenticated catalog request is rejected.
+
+---
+
+### v0.54 — Cold-Tier Correctness Soak & Cost Accounting
+
+- **Delta Lake full support**: remove `--experimental-delta-sink` flag;
+  Delta `_delta_log/` format with add/remove actions; readable by DuckDB
+  `delta_scan`.
+- **Cold + hot merge correctness soak**: 7-day randomized workload
+  (inserts, updates, deletes) comparing `TwoTier` merged read vs.
+  accumulated hot-only state. Any divergence is a P0 bug.
+- **Cost accounting**: cold-tier storage bytes reported in
+  `EXPLAIN INCREMENTAL ESTIMATE`, counted against pipeline
+  `state_budget_gb` quota, visible in `rockstream.views` system table.
+- **Snapshot interval auto-tuning**: the auto-tuner adjusts
+  `snapshot_interval_epochs` based on observed write rate and target
+  cold snapshot file size (avoid small files, avoid excessively large
+  buffering in shard pending_buffer).
+- **Documentation**: cold-tier operator guide, DuckDB/Snowflake/Trino
+  integration examples, catalog configuration reference.
+
+**Exit criteria for v0.54 (Phase 12 complete)**
+
+- 7-day soak shows zero merge divergence.
+- Delta `_delta_log/` readable by DuckDB `delta_scan`.
+- `EXPLAIN INCREMENTAL ESTIMATE` reports cold-tier bytes within 20% of
+  actual.
+- Cold-snapshot bytes count against `state_budget_gb`; exceeding quota
+  pauses the sink with `RS-4010 cold_tier.quota_exceeded`.
+- Snapshot interval auto-tuning produces ≥ 128 MB Parquet files under a
+  10k rows/s continuous workload.
 
 ---
 

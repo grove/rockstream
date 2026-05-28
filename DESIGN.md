@@ -2339,6 +2339,48 @@ content is deterministic from the epoch's Z-set output).
 any Parquet file is written. A crash-recovery replay re-drives `should_flush`
 from the same committed state and produces identical Parquet files.
 
+#### 13.6.2.1 Cold Snapshot Garbage Collection
+
+Cold snapshots accumulate over time. Without GC, object-store costs grow
+unboundedly. Each cold-tier sink has a retention policy:
+
+```sql
+CREATE SINK orders_mv_iceberg FOR VIEW orders_mv
+  TO ICEBERG '...'
+  WITH (
+    ...
+    cold_snapshot_retention_count    = 32,    -- keep at most N snapshots
+    cold_snapshot_retention_duration = '7d'   -- keep snapshots for at most 7 days
+  );
+```
+
+**GC rules** (whichever bound is reached first):
+
+1. After each successful snapshot commit, the sink evaluates retention.
+2. Snapshots older than `cold_snapshot_retention_duration` OR beyond the
+   `cold_snapshot_retention_count` most recent snapshots are expired.
+3. For each expired snapshot:
+   - Remove its manifest list file.
+   - Remove manifest files not referenced by any retained snapshot.
+   - Remove Parquet data files not referenced by any retained manifest.
+4. Update `metadata.json` to drop expired snapshot entries.
+5. Metrics emitted: `cold_gc_bytes_reclaimed`, `cold_gc_last_run_epoch`.
+
+**Safety guarantees**:
+
+- GC is idempotent: re-running after a crash cannot delete live data.
+- A data file referenced by *any* retained snapshot is never deleted, even
+  if another expired snapshot also references it (Iceberg's sharing semantics).
+- GC never runs concurrently with a snapshot commit on the same sink.
+- External readers currently scanning an expired snapshot may get 404s on
+  deleted data files — this is an accepted tradeoff documented in the
+  operator guide. To avoid it, set `cold_snapshot_retention_count` high
+  enough for external readers' query latency.
+
+**Defaults**: 32 snapshots / 7 days. At the default snapshot interval
+(every 128 epochs or 5 minutes), 32 snapshots covers roughly 2.5 hours.
+Operators adjust based on external reader SLAs.
+
 #### 13.6.3 External Tool Consumption
 
 Once a snapshot is committed, external tools can query it with **no RockStream

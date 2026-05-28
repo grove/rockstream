@@ -74,7 +74,8 @@ These names are for orientation. They are not calendar commitments.
 | Distributed Alpha | v0.36 | Multi-shard execution, frontier protocol, recovery, and exactly-once basics work. |
 | Integration Beta | v0.45 | Postgres access, direct writes, and major external connectors work end to end. |
 | Production Beta | v0.51 | Observability, auth, upgrades, security review, and long soaks are ready for a pilot. |
-| 1.0 | after v0.51 | Tagged only after a real production handoff succeeds without design exceptions. |
+| Data Lake GA | v0.54 | Cold-tier Iceberg/Delta sinks, Iceberg REST catalog, external tool consumption proven. |
+| 1.0 | after v0.54 | Tagged only after a real production handoff succeeds without design exceptions. |
 
 ---
 
@@ -169,11 +170,19 @@ without that proof, the version is not done.
 | v0.50 | Long production soak | 30-day 64-shard soak, 1,000-shard control/exchange stress, Nexmark/TPC-H continuous, chaos automation, continuous simulation soak on `main`, release-blocking defect burn-down. | 99.99% availability target met or miss is understood and fixed; no correctness divergence; large-cluster stress stays within exchange and frontier budgets; all historical failing simulator seeds replay in CI. |
 | v0.51 | Production beta handoff | Helm/Terraform packaging, deployment playbooks, SQL reference, connector guide, operator guide, reference architecture. | First pilot workload runs with support agreement, documented runbook, rollback plan, and known limitations. |
 
+### Cold Tier & Data Lake Integration
+
+| Version | Focus | Scope | Proof |
+|---|---|---|---|
+| v0.52 | Cold-tier Parquet/Iceberg sink | Iceberg v2 cold-tier sink writer (DESIGN.md §13.6): `CREATE SINK ... TO ICEBERG` with `snapshot_interval_epochs`/`snapshot_interval_ms`, Parquet data files with column stats, manifest files and manifest lists, atomic `metadata.json` commit, `should_flush`-gated buffering with pending rows staged in shard SlateDB, exactly-once via idempotent file keys. `ViewReader` `TwoTier` variant functional: gateway can merge cold snapshot + hot LSM tail. Cold snapshot GC (§13.6.6). | Cold-tier sink writes valid Iceberg v2 table readable by DuckDB `iceberg_scan`; full-scan query over a 100M-row view uses cold tier and completes 10x faster than hot-only LSM scan; snapshot GC keeps ≤ `cold_snapshot_retention_count` snapshots per view; crash mid-flush produces no orphan data files. |
+| v0.53 | Catalog registration and Iceberg REST catalog server | Catalog registration backends (§13.6.5): `filesystem` (self-contained, already functional), `glue`, `rest`, `hive`, `ducklake`. Native Iceberg REST catalog server (§13.7) on gateway HTTP port 8181: `/iceberg/v1/` serves namespaces, tables, snapshots backed by control-plane metadata. Auth token/mTLS passed through. | Spark/Trino/DuckDB discover views by name via `catalog.uri=http://rockstream:8181/iceberg/v1`; Glue catalog shows table within 30s of snapshot commit; `CATALOG_WARN` state surfaces cleanly when external catalog is unreachable; catalog API failures never block IVM. |
+| v0.54 | Cold-tier soak and Delta Lake support | Delta Lake cold-tier sink variant (`CREATE SINK ... TO DELTA`), cold-tier + hot tail merge correctness soak (randomized inserts/updates/deletes, compare cold+hot read vs. hot-only accumulated state), snapshot interval tuning, cost-accounting (cold-tier storage bytes in `EXPLAIN INCREMENTAL ESTIMATE` and quota system). | 7-day cold-tier soak with continuous writes shows no merge divergence; Delta `_delta_log/` is readable by DuckDB `delta_scan`; `EXPLAIN INCREMENTAL ESTIMATE` reports cold-tier storage cost within 20% of actual; cold-snapshot bytes count against pipeline `state_budget_gb`. |
+
 ---
 
 ## 1.0 Gate
 
-RockStream should not tag 1.0 simply because v0.51 is complete. The 1.0 gate is
+RockStream should not tag 1.0 simply because v0.54 is complete. The 1.0 gate is
 evidence-based:
 
 - At least one real production or production-like workload has run long enough
@@ -209,6 +218,7 @@ These are explicit places to pause, learn, and possibly reshape the roadmap.
 | Distributed architecture | v0.36 | Does the shard/exchange/frontier/checkpoint model actually hold under simulation and chaos? |
 | Product wedge | v0.45 | Is the `psql` + live views + connectors experience compelling enough for pilot users? |
 | Production readiness | v0.51 | Is the system operable by someone who did not build it? |
+| Data lake integration | v0.54 | Does the cold-tier + catalog story deliver real value, or is feeding external tools sufficient without the cold tier? |
 
 At each gate, the default action is not to accelerate. The default action is to
 remove uncertainty.
