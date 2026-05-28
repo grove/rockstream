@@ -107,6 +107,17 @@ for sequencing; this table exists only to orient readers between documents.
 - `make e2e` brings up a local cluster (MinIO + 1 worker + 1 control) and tears
   it down.
 - The oracle harness can drive a no-op pipeline and confirm equivalence.
+- **SlateDB determinism gate**: a dedicated test drives a write-heavy `ShardDb`
+  workload (mixed `put`, `merge`, `WriteBatch` commit, `DbReader` snapshot read,
+  WAL tail) twice under `SimRuntime` at the same seed. The resulting SlateDB
+  key–value state and WAL sequence must be bit-identical between the two runs.
+  If any internal SlateDB background task (compaction, manifest flush, WAL
+  rotation) uses wall-clock time or an uncontrolled RNG, the test will diverge
+  and the failure must be resolved — either by finding a `SimRuntime`-compatible
+  configuration of SlateDB, or by documenting the non-deterministic surfaces and
+  constraining them out of the hot simulation paths — before Phase 1 begins.
+  This test is the proof that the FoundationDB simulation property holds *through*
+  SlateDB, not merely around it.
 
 ---
 
