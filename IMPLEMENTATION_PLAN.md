@@ -49,6 +49,7 @@ The phase numbers here map to ROADMAP.md roadmap versions as follows:
 | 10 | v0.46–v0.50 | Auth, observability, auto-tuner, secondary indexes, upgrades, security |
 | 11 | v0.51–v0.52 | Long soak and production beta handoff |
 | 12 | v0.53–v0.55 | Cold-tier sink, Iceberg REST catalog, snapshot GC |
+| 13 | post-v0.55 | Coordinator Group: scoped multi-shard SERIALIZABLE (1.0 track) |
 
 Durations are indicative effort, not calendar time, and assume a small
 dedicated team. The ROADMAP.md version table is the single source of truth
@@ -1619,6 +1620,57 @@ the audit log with the evidence considered.
 
 ---
 
+## Phase 13 — Coordinator Group (Post-v0.55 / 1.0 Track)
+
+**Goal**: Implement the Coordinator Group model (DESIGN.md §13.10) — a small
+opt-in cohort of 3–5 processes that holds a lease-quorum over a designated
+base-table shard subset, providing full cross-shard `SERIALIZABLE` for
+transactions touching only those shards. Arrangement and view shards remain
+entirely uncoordinated.
+
+**Prerequisite decision gate**: after v0.55 optimistic-transaction soak.
+Phase 13 does NOT start unless the v0.55 soak confirms: (a) the exact-key
+optimistic subset is well-understood (abort rates explainable, no partial
+visibility), and (b) at least one pilot customer has a concrete use case that
+requires write-skew prevention across 2+ base-table shards that cannot be
+served by `SERIALIZABLE LOCAL` or `OptimisticExactKey`.
+
+**Deliverables**
+
+- `CREATE COORDINATOR GROUP … FOR TABLES (…) WITH (quorum_size, lease_ttl_ms)`
+  DDL, persisted in the control-plane catalog.
+- Coordinator-group leader election reusing the frontier aggregator's lease
+  mechanism (§3.4) with a dedicated `coordinator_group/{group_id}/leader` key.
+- Two-phase-commit round over group members: prepare (per-shard conflict table
+  check), commit (inject validated write batch stamped with coordinator epoch),
+  abort (return `RS-2008` with conflicting shard/key).
+- `CoordinatorGroupSerializable` transaction shape in the gateway classifier
+  (§13.5.1).
+- `EXPLAIN TRANSACTION` output includes coordinator group name, participant
+  shards, and a warning when cross-group write-skew is possible.
+- In-process coordinator in `embedded` and `single_worker` deployment modes.
+- Error codes `RS-2012`, `RS-2013`, `RS-2017`, `RS-2018`.
+- Observability: `coordinator_group_commit_total{group}`,
+  `coordinator_group_conflict_total{group,table}`,
+  `coordinator_group_leader_elections_total{group}`,
+  `coordinator_group_quorum_write_latency_seconds`.
+- Simulation tests: coordinator leader crash mid-prepare, quorum member
+  failure during commit, concurrent conflicting transactions, coordinator
+  group boundary enforcement (cross-group rejection).
+
+**Exit criteria**
+
+- `CoordinatorGroupSerializable` transactions are fully serializable: no
+  write-skew or phantom-read divergence observed in 7-day soak.
+- Coordinator path adds < 5 ms p99 latency vs. `SERIALIZABLE LOCAL` on a
+  2-shard coordinated group.
+- Arrangement/view shard throughput is unmeasurably affected (< 1% regression
+  on Nexmark/TPC-H benchmarks) when a coordinator group is declared.
+- All simulation interleavings for coordinator crash/quorum failure converge
+  to correct terminal state.
+
+---
+
 ## Cross-Cutting Concerns
 
 These run in parallel with every phase.
@@ -1683,6 +1735,8 @@ These run in parallel with every phase.
 | **Row-version metadata bloats hot write path** | Start at row-level granularity; measure write amplification; consider column-group versions only if false-conflict rate exceeds threshold. |
 | **Compaction folds pending transaction operands** | Pending operands use distinct visibility state; compaction refuses to fold until committed frontier/envelope is stable; Phase 12 soak verifies. |
 | **Optimistic transactions become a hidden transaction manager** | Keep accepted subset exact-key only pre-1.0; document every unsupported shape in `EXPLAIN`; v0.55 decision gate determines promotion vs. deferral. |
+| **Coordinator group scope creep** | Coordinator group covers only declared base-table shards; any attempt to add arrangement/view shards is rejected at DDL time; `EXPLAIN TRANSACTION` always prints the group name and warns on cross-group write-skew. |
+| **Coordinator leader becomes a single point of failure** | 3–5 member quorum; lease TTL bounds unavailability window; `RS-2017` surfaces to the client with retry guidance; simulation covers leader crash mid-prepare. |
 
 ### Team Structure (Suggested)
 
