@@ -19,6 +19,9 @@ system with progressively more capability.
 >   (PlanIR, DBSP-native differentiation pass, operator runtime,
 >   arrangements, and pg_trickle-derived correctness oracles). Phases 1–3 below operationalize IVM.md's
 >   `IVM-1` through `IVM-13` milestones.
+> - [ideas/crdts.md](ideas/crdts.md) — CRDT / merge-law strategy that informs
+>   the algebraic aggregate, exchange combiner, gateway pushdown, and connector
+>   metadata work below.
 
 ---
 
@@ -41,8 +44,8 @@ The phase numbers here map to ROADMAP.md roadmap versions as follows:
 | 5 | v0.31–v0.32 | Frontier protocol and progress tracking |
 | 6 | v0.33–v0.36 | Fault tolerance, exactly-once, chaos |
 | 7 | v0.37–v0.39 | Elasticity: split, merge, drain, clone |
-| 8 | v0.40–v0.42 | Postgres query gateway, introspection, freshness, subscribe |
-| 9 | v0.43–v0.45 | Connectors and sinks (Tier 1 + Tier 2 contract) |
+| 8 | v0.40–v0.43 | Postgres query gateway, introspection, freshness, subscribe, direct-write CRDT surface |
+| 9 | v0.44–v0.45 | Connectors and sinks (Tier 1 + Tier 2 contract); OR-Set; CRDT schema metadata |
 | 10 | v0.46–v0.49 | Auth, observability, upgrades, security |
 | 11 | v0.50–v0.51 | Long soak and production beta handoff |
 | 12 | v0.52–v0.54 | Cold-tier sink, Iceberg REST catalog, snapshot GC |
@@ -125,9 +128,45 @@ for sequencing; this table exists only to orient readers between documents.
 ## Phase 1 — Single-Shard IVM Core
 
 **Goal**: A single-process engine that incrementally maintains views built
-from filter, projection, algebraic aggregates, and non-invertible aggregates.
-This phase delivers the foundation of the IVM engine. SQL frontend is
-hard-coded plans only; the SQL parser comes in Phase 2.
+from filter, projection, algebraic aggregates, and non-invertible aggregates,
+on top of the database-wide **MergeLaw contract** that all later phases
+consume. SQL frontend is hard-coded plans only; the SQL parser comes in
+Phase 2.
+
+### Milestone IVM-0 — MergeLaw contract and law harness (v0.5, foundational)
+
+This milestone is foundational and lands alongside IVM-1. It establishes the
+shared algebraic contract documented in DESIGN.md §6.11 and
+[ideas/crdts.md](ideas/crdts.md). Every later milestone in every later phase
+consumes this contract; nothing in the IVM core, exchange, gateway, or
+connector layers may bypass it.
+
+- Introduce `MergeLaw`, `MergeLawId`, `MergeLawClass`, `LawProperties`,
+  `DuplicatePolicy`, `CompactionPolicy`, `FrontierPolicy`, and the
+  `LawBundle` (`LawEncoder` + `LawMergeFn` + `LawCompactionFilter` +
+  optional `LawGatewayCombiner` + `LawExplain`) traits in
+  `rockstream-types`. The catalog is a single process-startup registry
+  that panics on `MergeLawId` collision.
+- Reserve the built-in `MergeLawId` and tag-byte block in a `merge_laws.md`
+  table inside `rockstream-types`. IDs and tag bytes are forever; later
+  versions may reuse a tag for the same `MergeLawId` only.
+- Register **`WeightAdd/v1`** (the Z-set group law, ID 0x0001, tag 0x10) and
+  wire it into the Z-set algebra used by IVM-1.
+- Ship the shared **law property-test harness** (`rockstream-types::law_tests`):
+  associativity, commutativity-where-declared, idempotence-where-declared,
+  identity, inverse-where-declared, serialization round-trip, deterministic
+  encoding, version-compatibility for every `(version_old, version_new)` pair
+  the law declares safe, and fail-closed malformed-operand behavior returning
+  `RS-3009`. Every law registered in v0.5 and later must pass this harness.
+- Add one entry per registered law to the explicit fault-model registry in
+  `rockstream-sim` (DESIGN.md §17.4) naming the failure mode the law must
+  survive (reorder, duplicate-where-idempotent, crash-replay, fence).
+- Persist `(law_id, law_version)` in every arrangement header from day one.
+  A `ShardDb` mount that cannot resolve the registered bundle for a stored
+  header returns `RS-5002 unknown merge law` and refuses to attach.
+- Wire `merge_law_applied_total{law_id, law_name, law_version}` and
+  `merge_law_fallback_total{law_id, reason}` counters into
+  `rockstream-types` so later phases only have to increment them.
 
 ### Milestone IVM-1 — Filter / Project / Map skeleton (IVM.md §13 IVM-1)
 
@@ -166,11 +205,18 @@ hard-coded plans only; the SQL parser comes in Phase 2.
 ### Milestone IVM-2 — Algebraic aggregates (IVM.md §13 IVM-2, §7.6)
 
 - Add `Aggregate` PlanNode + `0xAG` arrangement (DESIGN.md §6.2).
-- Implement `AggregateMergeOp` (associative `(sum, count)` merge) and register
-  with SlateDB's `MergeOperator`.
+- Register **`SumCount/v1`** (ID 0x0002, tags 0x01/0x02) in the law catalog
+  established by IVM-0. The law is a non-idempotent commutative monoid
+  with `DuplicatePolicy::RequireExactlyOnce`, `CompactionPolicy::FrontierFold`,
+  and `FrontierPolicy::ExactOnly`. It must pass the shared property-test
+  harness from IVM-0.
+- Re-implement `AggregateMergeOp` as a thin shim over `LawBundle::merge_fn`;
+  the SlateDB-registered `MergeOperator` is now a low-level executor of the
+  catalog, never a definer of semantics.
 - Implement `diff_aggregate` for SUM / COUNT / AVG / COUNT(*):
   - Group input delta by group_key.
-  - `db.merge(key, (Δsum, Δcount))` into the `0xAG` arrangement.
+  - `db.merge(key, (Δsum, Δcount))` into the `0xAG` arrangement (writes
+    carry the IVM-0 arrangement-header law tag).
   - Read previous and current aggregate; emit `(old, -1) ⊎ (new, +1)` deltas
     via the cached last-emitted value in `op_index/0xAG`.
 - Property test: `SELECT k, SUM(v), COUNT(*), AVG(v) FROM t GROUP BY k`
@@ -181,13 +227,20 @@ hard-coded plans only; the SQL parser comes in Phase 2.
 
 - Add `0xMM` indexed-multiset arrangement (DESIGN.md §6.3) +
   `op_index/0xMM` cached extremum.
+- Register **`MaxRegister/v1`** (ID 0x0003, tag 0x20) and **`MinRegister/v1`**
+  (ID 0x0004, tag 0x21) in the law catalog. Both are idempotent join
+  semilattices. They are used as **cached-subcomponent laws** inside
+  MIN/MAX — the operator as a whole stays retraction-aware (DESIGN.md
+  §6.11). The arrangement-header law tag identifies the cache slot only.
 - Implement `diff_minmax`:
   - Insert: SlateDB merge on the multiset entry; if value is the new extremum,
-    update cache and emit delta.
+    update cache (via `MaxRegister/v1`-shaped merge) and emit delta.
   - Delete: if the deleted value was the extremum, prefix-scan the sorted
     multiset to find the new extremum.
 - Add MEDIAN / PERCENTILE as a follow-up using the same multiset + rank lookup.
-- Property test: groups churning across MIN/MAX transitions.
+- Property test: groups churning across MIN/MAX transitions; subcomponent
+  law equivalence test asserts that the cached `MaxRegister/v1` value matches
+  the multiset's true extremum after every batch.
 
 **Exit criteria for Phase 1**
 
@@ -245,6 +298,9 @@ join queries written as plain SQL.
   - Custom DataFusion `Extension` nodes for incremental operators
     (`IncAggregate`, `IncJoin`, `IncDistinct`, `IncWindow`).
   - Lowering pass: `LogicalPlan` → `PlanNode` (IVM.md §5).
+  - Merge-law propagation: every lowered aggregate, distinct/set operation,
+    monotone recursive term, and future UDAF carries a `MergeLaw` annotation or
+    an explicit `not_merge_safe_reason`.
   - Distribution pass: annotate each `PlanNode` with `partition_key`, insert
     `Exchange` nodes wherever partitioning differs. (Exchanges are no-ops in
     single-shard mode; preparation for Phase 4.)
@@ -306,16 +362,22 @@ join queries written as plain SQL.
 
 ### Milestone IVM-6 — Distinct / Union / Intersect / Except (IVM.md §13 IVM-6, §7.7–7.8)
 
-- `0xDS` weight-based arrangement (DESIGN.md §6.6) with
-  `DistinctWeightMerge` (`i64` addition).
+- `0xDS` weight-based arrangement (DESIGN.md §6.6) driven by the
+  **`WeightAdd/v1`** law registered in IVM-0. The `DistinctWeightMerge`
+  shim is a thin pass-through to `LawBundle::merge_fn`.
 - Output delta on zero-crossing transitions (0 → +n emits +1;
   +n → 0 emits −1).
 - Zero-crossing entries are explicitly deleted/tombstoned when immediate
   invisibility is required. A compaction filter may remove obsolete merge
-  operands only after a snapshot-safety audit.
+  operands only after a snapshot-safety audit; the filter is the law's
+  `LawCompactionFilter`.
 - Implement Intersect / Except with set + bag semantics; validate against
-  pg_trickle's `intersect.rs` / `except.rs`.
-- Property tests on set semantics with random sequences.
+  pg_trickle's `intersect.rs` / `except.rs`. The min-clamp step in
+  INTERSECT / EXCEPT is documented in the plan as
+  `not_merge_safe_reason=clamp_not_a_law` so the planner does not insert
+  a pre-shuffle combiner across the clamp boundary.
+- Property tests on set semantics with random sequences; one
+  combined-vs-uncombined equivalence test using the `WeightAdd/v1` law.
 
 **Exit criteria for Phase 2**
 
@@ -330,7 +392,10 @@ join queries written as plain SQL.
 **→ Operability deliverables (Phase 2)**
 
 - **`EXPLAIN INCREMENTAL`** prints the annotated operator tree from
-  DESIGN.md §14.8 against live statistics for any installed view.
+  DESIGN.md §14.8 against live statistics for any installed view, including
+  each operator's merge law, combiner eligibility, duplicate policy, compaction
+  policy, and `not_merge_safe_reason` when the planner must use explicit
+  arrangements.
 - **`EXPLAIN INCREMENTAL ESTIMATE`** runs the planner and cost model
   *without* deploying; reports predicted state size, per-operator
   `epoch_ms`, object-store request rate, and minimum achievable frontier
@@ -571,8 +636,13 @@ production-ready.
     worker per traffic class, with shard/exchange IDs in the frame header.
   - Same-worker loopback path using bounded in-process channels while keeping
     durable outbox/inbox metadata for replay.
-  - Pre-shuffle combiner for compiler-certified associative payloads, including
-    Z-set weight cancellation and partial SUM/COUNT/AVG aggregation.
+  - Pre-shuffle combiner driven **entirely** by planner-provided
+    `MergeLawId` annotations. The v0.4-style hand-coded SUM/COUNT/AVG
+    allowlist is deleted in this phase; the combiner is now generic over
+    `(target_shard, key, law_id)` and dispatches into the registered
+    `LawBundle::merge_fn`. CI runs an uncombined-equivalence property test
+    once per registered law (`WeightAdd/v1`, `SumCount/v1`, `MaxRegister/v1`,
+    `MinRegister/v1`, `HyperLogLog/v1`, `BloomUnion/v1`).
   - Hierarchical exchange domains controlled by `exchange_domain_size` for
     large worker counts.
   - Object-store fallback writer & reader.
@@ -660,6 +730,11 @@ production-ready.
   - Trigger window closing.
   - Detect recursion convergence.
   - Release shuffle inbox entries.
+- **Merge-law-aware progress metadata**: exact SQL reads still pin to the
+  published vector frontier, but operators with monotone/idempotent laws can
+  publish per-shard partial progress and `complete_through` metadata for
+  diagnostics, subscribe streams, future monotone read modes, and safe operand
+  compaction.
 - **Exchange GC**: senders observe `frontier/exchange_e/consumed` and reclaim
   outbox/inbox entries with bounded prefix scan + batched deletes; long-retained
   entries may be removed by frontier-aware compaction filters after audit.
@@ -869,6 +944,14 @@ production-ready.
   Parquet files — pending rows are staged as `connector/{id}/pending_buffer` in
   the shard SlateDB and participate in every epoch checkpoint for exactly-once
   recovery.
+- **Merge-law schema metadata (`LawSchemaMetadata`)**: connectors declare,
+  for each schema column, which built-in `MergeLawId` (if any) it advertises.
+  The gateway accepts only laws registered through the v0.5 IVM-0 catalog
+  that have already passed earlier phases (storage, planner, compaction,
+  duplicate policy, `EXPLAIN`); unknown or experimental laws are rejected
+  with `RS-5002`. User-defined laws via `CREATE MERGE LAW` remain gated
+  until Phase 11 v0.50. The connector SDK ships an example declaring a
+  `COUNTER` column end-to-end.
 - **Dead-letter sink routing**: per-record decode errors become `RS-1003`
   events and are routed to a configurable DLQ sink. Implemented as a
   connector-tier concern; the IVM core never sees malformed records.
@@ -889,6 +972,13 @@ production-ready.
   offset advances.
 - **Connector marketplace structure**: SDK + example crates; documented
   contract.
+- **`OR_SET` user-visible column type** (v0.44): registers `ORSet/v1`
+  (ID 0x0008, tag 0x41) with `CompactionPolicy::TombstoneGc`. DDL
+  `CREATE TABLE memberships (group TEXT, members OR_SET TEXT)`; DML
+  `UPDATE memberships SET members = members + 'alice' WHERE group = $1` and
+  `members - 'alice'`. Tombstone GC across shard split/merge (Phase 7) and
+  recovery (Phase 6) is verified in the chaos suite. The add-wins vs
+  remove-wins policy is a DDL flag, defaulting to `ADD_WINS`.
 
 **Exit criteria**
 
@@ -953,9 +1043,11 @@ a gateway rewrite.
 
 ### v0.41 — Gateway Introspection and Read Performance
 
-- **Cross-shard partial aggregation pushdown** (DESIGN.md §12.3.1): for queries
-  of the form `SELECT agg, key FROM mv GROUP BY key`, the gateway pushes partial
-  aggregation to shards and merges O(groups) rows rather than O(view rows).
+- **Merge-law-aware cross-shard partial aggregation pushdown** (DESIGN.md
+  §12.3.1): for queries of the form `SELECT agg, key FROM mv GROUP BY key`, the
+  gateway pushes partial aggregation to shards only when the aggregate's
+  `MergeLaw` permits regrouping. It merges O(groups) rows rather than O(view
+  rows), and `EXPLAIN` names the law used or reports why pushdown is unsafe.
 - **`rockstream` system schema** (DESIGN.md §12.6.1): virtual tables
   (`rockstream.epochs`, `rockstream.pipelines`, `rockstream.views`,
   `rockstream.shards`, `rockstream.connectors`, `rockstream.audit_log`,
@@ -996,21 +1088,67 @@ a gateway rewrite.
   - Configurable `checkpoint_retention_count` (default 128) and
     `checkpoint_retention_duration` (default min(view retention, 7d)) control
     how far back historical queries can reach.
+- **`AS OF MONOTONE PARTIAL`** opt-in read mode for views whose root operator
+  declares a monotone law (e.g. insert-only recursive reachability). Returns a
+  result tagged with `complete_through: Frontier`; documented as
+  *intentionally less than the cluster frontier* and never used by default.
+
+**Exit criteria for v0.42**
+
+- Read-your-writes demo passes; `wait_for=<token>` resolves within the SLO.
+- Subscribe stream survives gateway restart with no data loss.
+- `SELECT * FROM orders_mv AS OF EPOCH <past>` returns the correct historical
+  snapshot; queries beyond retention return `RS-2005`.
+- `AS OF MONOTONE PARTIAL` returns a result whose `complete_through` token
+  is provably ≤ the current cluster frontier and ≥ the previous response on
+  the same view (CI regression test).
+
+---
+
+### v0.43 — Direct-Write CRDT Surface (Phase 1 of user-visible CRDTs)
+
+This version delivers the first user-visible CRDT column types and DML
+writes. The internal `LawBundle` catalog (v0.5+), planner law propagation
+(v0.11+), exchange combining (v0.30), and gateway pushdown (v0.41) make this
+straightforward: each new column type is a registered law plus a DDL/DML
+binding.
+
 - **Internal (direct-write) source connector** (DESIGN.md §13.5):
   - `INSERT`/`UPDATE`/`DELETE` DML over the Postgres wire protocol appended to
     a per-connection write buffer.
   - `COMMIT` flushes as an atomic Z-set delta via `WriteBatch` to a dedicated
     base-table shard, receiving the shard's next `source_epoch`.
   - `ROLLBACK` discards the buffer without shard writes.
+- **User-visible CRDT column types** (DESIGN.md §6.11; [ideas/crdts.md §6](ideas/crdts.md)):
+  - `COUNTER` backed by `PNCounter/v1` (ID 0x0006, tag 0x30).
+  - `MAX_REGISTER`, `MIN_REGISTER` backed by `MaxRegister/v1` / `MinRegister/v1`
+    (already registered in v0.20).
+  - `LWW` backed by `LWWRegister/v1` (ID 0x0005, tag 0x22). The
+    timestamp-loss is documented explicitly in DDL output and `EXPLAIN`.
+  - `G_SET` backed by `GSet/v1` (ID 0x0007, tag 0x40).
+- **CRDT delta DML**: SQL forms `amount = amount + 1`,
+  `tags = tags || ARRAY['x']`, `winner = GREATEST(winner, $1)` lower into
+  `LawBundle::merge_fn`-friendly deltas via the planner. The planner refuses
+  to mix a CRDT column with an aggregating expression that does not match
+  its law (e.g. `SUM(g_set_col)` is rejected with a closed-enum SQL error).
+- **Idempotency-key enforcement**: writes to a non-idempotent law
+  (`COUNTER`, internal `SumCount/v1` direct writes) must carry either an
+  exactly-once source-epoch envelope or a caller-provided idempotency key.
+  Writes missing both are rejected with `RS-2007 write.idempotency_key_required`.
+  The idempotency-key table is per-shard, time-bounded (default 24 h), and
+  participates in the per-shard epoch commit.
 
-**Exit criteria for v0.42 (Phase 8 complete)**
+**Exit criteria for v0.43 (Phase 8 complete)**
 
 - `psql` runs `INSERT INTO t VALUES (...); COMMIT` and view reflects it within
   `freshness_target_ms`.
-- Read-your-writes demo passes.
-- Subscribe stream survives gateway restart with no data loss.
-- `SELECT * FROM orders_mv AS OF EPOCH <past>` returns the correct historical
-  snapshot; queries beyond retention return `RS-2005`.
+- `CREATE TABLE balances (account TEXT PRIMARY KEY, amount COUNTER)` succeeds
+  and `UPDATE balances SET amount = amount + 1 WHERE account = $1` round-trips
+  through psql.
+- 1M concurrent counter-increment soak test lands the exact total across
+  shard splits and worker restarts.
+- A non-idempotent write missing both an exactly-once envelope and an
+  idempotency key returns `RS-2007`.
 - `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` returns `RS-2003`.
 
 ---
@@ -1121,6 +1259,19 @@ a gateway rewrite.
 - Hosted-service deployment package (Helm chart, Terraform modules).
 - Public benchmarks vs. Feldera, RisingWave, Materialize on Nexmark / TPC-H.
 - Launch blog post + reference architecture diagrams.
+- **User-defined merge laws (`CREATE MERGE LAW`, v0.50)** behind a feature
+  flag. A user-supplied law is rejected unless it ships:
+  - a registered encoder/decoder pair;
+  - a passing run of the shared property-test harness from v0.5 IVM-0
+    (associativity, commutativity-where-declared, idempotence-where-declared,
+    identity, serialization round-trip, determinism, malformed-operand
+    failure returning `RS-3009`);
+  - explicit `DuplicatePolicy` and `CompactionPolicy` declarations;
+  - a registered `EXPLAIN` formatter;
+  - one fault-model entry in `rockstream-sim` covering the failure modes
+    the law claims to survive.
+  A sample user-defined law (min-clamped counter) is included with the
+  release and is exercised by the long-soak chaos suite.
 
 **Exit criteria**
 
@@ -1176,6 +1327,14 @@ the audit log with the evidence considered.
   - Connector offset update: `last_snapshot_epoch`.
   - Crash-recovery: idempotent replay from pending_buffer produces identical
     Parquet files (keyed by `{shard_id}-{epoch}`).
+- **Merge-law metadata in cold snapshots**: every CRDT column writes its
+  **finalized** value (folded counter, register winner, materialized set
+  membership) — never raw operands — and the Iceberg/Delta schema records
+  `(merge_law_id, merge_law_version)` in column metadata so external readers
+  (DuckDB, Spark, Trino) see a normal Parquet column while law-aware
+  RockStream readers can identify the provenance. Cold-tier reads through
+  `ViewReader::TwoTier` re-apply the hot-tail operands via the same
+  `LawBundle::merge_fn` used in IVM.
 - **`ViewReader` `TwoTier` implementation** (DESIGN.md §12.7.3):
   - Gateway resolves `TwoTier { snapshot_manifest, hot_tail_from_epoch }`.
   - Cold read: DataFusion Parquet scan over the snapshot's data files.
@@ -1310,7 +1469,10 @@ These run in parallel with every phase.
 | Per-operator commits overwhelm object storage | Shard-level group commit; commit-cost benchmark in Phase 3.5; adaptive epoch sizing with `min_epoch_ms` / `min_epoch_bytes` floors. |
 | SlateDB has no range-delete API | Design cleanup as scan-and-delete, compaction-filter retention, or checkpoint/clone/projection; make range-delete absence an integration test. |
 | Compaction filters break snapshot safety | Treat filters as retention only; explicit deletes for correctness; safety proofs and stale-reader tests before enabling filters. |
-| MergeOperator used for non-associative state | Restrict merge operators to associative accumulators; implement MIN/MAX/Top-K/window/recursive retractions with explicit arrangements. |
+| MergeOperator used for non-associative state | Restrict merge operators to registered `MergeLaw` entries (v0.5 IVM-0 catalog) with the shared property-test harness; implement MIN/MAX/Top-K/window/recursive retractions with explicit arrangements that may only use registered laws as cached subcomponents (DESIGN.md §6.11). |
+| Commutative monoids are mistaken for replay-safe CRDTs | `MergeLaw.properties.duplicate_policy` is mandatory at registration; non-idempotent laws (`SumCount/v1`, `WeightAdd/v1`, `PNCounter/v1`) require exactly-once source epochs or idempotency keys (gateway returns `RS-2007` if both are missing); every law contributes a duplicate-replay seed to the continuous simulation soak. |
+| User-defined CRDT functions break correctness or compaction | `CREATE MERGE LAW` is gated until v0.50 behind a feature flag and the shared property-test harness; the built-in catalog (v0.5–v0.45) must prove storage, planner, exchange, gateway, connector, compaction, and `EXPLAIN` first. |
+| Arrangement state outlives the law-version code | Every arrangement header stores `(law_id, law_version)`; old versions remain registered; mounts against unknown laws return `RS-5002`; incompatible law-version upgrades take the v0.39 blue/green plan-replacement path; v0.54 cold-tier soak proves law-version replay correctness. |
 | Frontier protocol implementation bugs | Heavy property testing; reference implementation in pure logic for comparison. |
 | Object-store cost dominates | Aggressive local SST cache; coalesce small writes; tier cold state; WAL listing cache. |
 | WAL listing becomes a hot-path cost | Per-shard WAL listing cache, tail via `WalReader::get(latest_id+1)`; Phase 3.5 listing-cost test. |
