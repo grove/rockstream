@@ -161,7 +161,6 @@ RockStream is inspired by production systems and implementation research:
 | **pg_trickle** | Shows how to turn SQL views into practical per-operator delta rules, with many hard correctness cases worked through in PostgreSQL |
 | **[SlateDB](https://slatedb.io/)** | Provides the cloud-native object-storage-backed LSM that RockStream uses as its durable shard and arrangement store |
 | **[RisingWave](https://risingwave.com/)** | A streaming database that maintains materialized views in real time |
-| **[Snowflake Dynamic Tables](https://docs.snowflake.com/en/user-guide/dynamic-tables-intro)** | Automatically refreshed tables inside the Snowflake cloud data warehouse |
 
 RockStream brings these ideas to an open, cloud-native storage foundation.
 

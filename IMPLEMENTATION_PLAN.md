@@ -1133,7 +1133,7 @@ a gateway rewrite.
 ## Phase 12 — Cold-Tier Sink & Iceberg REST Catalog
 
 **Goal**: Make RockStream's pre-computed views consumable by any tool in the
-data lake ecosystem (DuckDB, Snowflake, Trino, Spark, dbt) without those tools
+data lake ecosystem (DuckDB, Trino, Spark, dbt) without those tools
 needing to talk to RockStream's gateway. Implement the two-tier storage model
 designed in DESIGN.md §12.7 and the cold-tier sink/catalog designed in §13.6–§13.7.
 
@@ -1260,7 +1260,7 @@ the audit log with the evidence considered.
   `snapshot_interval_epochs` based on observed write rate and target
   cold snapshot file size (avoid small files, avoid excessively large
   buffering in shard pending_buffer).
-- **Documentation**: cold-tier operator guide, DuckDB/Snowflake/Trino
+- **Documentation**: cold-tier operator guide, DuckDB/Trino
   integration examples, catalog configuration reference.
 
 **Exit criteria for v0.54 (Phase 12 complete)**
