@@ -1883,6 +1883,8 @@ name = "rockstream"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rockstream-control",
+ "rockstream-runtime",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1900,6 +1902,7 @@ name = "rockstream-connectors"
 version = "0.1.0"
 dependencies = [
  "rockstream-types",
+ "tracing",
 ]
 
 [[package]]
@@ -1907,6 +1910,10 @@ name = "rockstream-control"
 version = "0.1.0"
 dependencies = [
  "rockstream-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -1928,8 +1935,9 @@ dependencies = [
 name = "rockstream-ops"
 version = "0.1.0"
 dependencies = [
- "rockstream-plan",
+ "rockstream-connectors",
  "rockstream-types",
+ "tracing",
 ]
 
 [[package]]
@@ -1950,7 +1958,14 @@ dependencies = [
 name = "rockstream-runtime"
 version = "0.1.0"
 dependencies = [
+ "rockstream-connectors",
+ "rockstream-control",
+ "rockstream-ops",
  "rockstream-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -2421,6 +2436,19 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "windows",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.2",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

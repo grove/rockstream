@@ -8,3 +8,4 @@ description = "Source and sink connector implementations for RockStream"
 
 [dependencies]
 rockstream-types = { workspace = true }
+tracing = { workspace = true }
