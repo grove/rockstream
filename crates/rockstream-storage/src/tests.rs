@@ -428,7 +428,7 @@ async fn determinism_two_runs_identical_state() {
         // Deterministic sequence of operations
         for i in 0u64..50 {
             let key = ShardKeyEncoder::encode(ShardPrefix::OpState, i % 5, &i.to_be_bytes());
-            let value = format!("value_{}", i);
+            let value = format!("value_{i}");
             db.put(&key, value.as_bytes()).await.unwrap();
         }
 
