@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.11. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.12. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -93,6 +93,17 @@ object storage.
 > a worker drain protocol (§10.7) enabling graceful scale-in; and cluster
 > autoscaling signals with worker capacity model (§10.8) bridging the control
 > plane to infrastructure autoscalers.
+>
+> **v3.12 fills distributed-systems gaps** identified by systematic review of
+> prior art: network partition self-fencing so a partitioned-but-alive worker
+> cannot race the new owner (§11.6); object store brownout handling with local
+> buffering and backpressure rather than data loss (§11.7); thundering-herd
+> mitigation via staggered startup jitter and lease-grant rate limiting
+> (§11.8); cooperative scheduling yield points so expensive operator epochs
+> cannot starve heartbeats (§9.3); wire-protocol version skew contract for
+> rolling upgrades (§5.5); tombstone accumulation bounds and proactive
+> compaction (§5.4); cross-shard partial aggregation pushdown (§12.3.1); and
+> the `debug arrangement` IVM debugger (§14.7.1).
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -608,6 +619,16 @@ things to discover at runtime:
 - **`DbReader` is the cross-worker read path.** Joins and lookups that read
   state owned by another shard use `DbReader` pinned to a published
   checkpoint, never an undefined "live" read.
+- **Tombstone accumulation is bounded.** Z-set retractions produce LSM
+  tombstones. For high-churn views (frequent inserts + deletes on the same
+  key), tombstones accumulate faster than background compaction can clear
+  them, degrading read latency. Each shard reports a `tombstone_density`
+  metric (tombstone count / total key count). When `tombstone_density >
+  tombstone_compaction_threshold` (default 0.25), the worker schedules a
+  targeted compaction on that key range. Compaction filters clear Z-set
+  entries whose weight is zero AND whose epoch is older than the committed
+  checkpoint frontier — this is safe because no reader can observe a
+  zero-weight row at a past epoch.
 
 ### 5.5 Storage Format Versioning and Rolling Upgrades
 
@@ -627,6 +648,24 @@ Rolling upgrade procedure: (1) deploy new binary to one worker; (2) verify it
 acquires its shards and processes epochs; (3) roll forward. The control plane
 rejects shard-lease acquisition from a binary whose supported version range does
 not overlap the shards' stored version, preventing silent data corruption.
+
+**Wire protocol version skew.** During a rolling upgrade there is a window
+where shard A runs binary version N+1 and shard B runs version N. They may
+exchange shuffle frames and gRPC messages over the same pipeline. Each gRPC
+service announces a `protocol_version` header; the receiving side rejects
+requests with a higher protocol version than it supports (returns `RS-5002
+protocol.version_not_supported`). The upgrade contract is therefore:
+
+- The N+1 binary must be able to *send* messages that N can parse (backward
+  compatible wire format for one version).
+- If a new message field is required, it must be added in a preparatory N
+  release before the field is used in N+1.
+- The control plane will not assign a pipeline across workers of incompatible
+  versions; it waits until enough N+1 workers are available to host all
+  affected operator instances.
+
+This is the same N−1/N compatibility contract Kafka uses for inter-broker
+protocol negotiation.
 
 ### 5.6 Storage Profiles and Autotuner Defaults
 
@@ -1096,6 +1135,28 @@ resolved by the frontier protocol: downstream operators that depend on both
 shards simply do not advance their input frontier past `e` until both shards
 publish it. There is no cross-shard 2PC.
 
+### 9.3 Cooperative Scheduling and Yield Points
+
+Workers run operator tasks as tokio async tasks on a shared thread pool. A
+large join recomputation, a recursive operator doing many iterations, or a
+backfill epoch with millions of rows can hold the tokio executor for long
+enough to starve heartbeat sends, shuffle credit grants, and frontier reports
+— causing spurious heartbeat timeouts that look like worker failures.
+
+To prevent this, every operator loop is bounded by a **records-per-quantum**
+limit (default 64k rows per poll). When an operator has more work remaining
+after consuming its quantum, it emits a partial `EpochOutput`, yields via
+`tokio::task::yield_now()`, and is re-scheduled by the executor. The
+heartbeat sender and frontier reporter run as separate tokio tasks with
+higher priority in the scheduler, so they are always serviced between quanta.
+
+The quantum size is tunable per pipeline (`max_rows_per_quantum`, default
+65536). Lowering it increases scheduling responsiveness at the cost of more
+task context switches. Raising it is appropriate for CPU-bound pure aggregation
+workloads where yield overhead dominates. The auto-tuner adjusts quantum size
+by observing `scheduler_yield_ratio` (fraction of epochs that hit the quantum
+limit); if above 0.8, it halves the quantum.
+
 ---
 
 ## 10. Elasticity: Adding, Removing, and Rebalancing Shards
@@ -1349,6 +1410,94 @@ degraded state (§14.10) and pages the operator. Phase 6 of the implementation
 plan must demonstrate the budgets hold under simulated worker death, network
 partition, and object-store throttling.
 
+### 11.6 Network Partition and Worker Self-Fencing
+
+The failure detector (§11.5) handles the case where a worker *dies*. A harder
+case is a worker that is *alive* but partitioned from the control plane:
+
+- The worker can still write to its SlateDB shards (object store reachable).
+- The control plane cannot hear its heartbeats and eventually marks it dead.
+- The control plane assigns the shards to a new worker.
+- Now two workers may attempt to write the same shard.
+
+SlateDB's manifest fence epoch prevents a committed double-write, but the
+write races are wasteful and the partitioned worker would keep burning CPU.
+
+**Self-fencing rule.** A worker that fails to deliver a heartbeat to the
+control plane for `self_fence_after` seconds (default `2 × dead_after` =
+30 s) proactively terminates itself. It does not drain or checkpoint; it
+shuts down immediately so the new owner can acquire the lease without a fence
+race. The value must satisfy:
+
+```
+self_fence_after > dead_after   (so the control plane marks it dead first)
+self_fence_after < 2 × shard_recovery_budget  (so recovery still fits SLO)
+```
+
+The partitioned worker also stops processing new epochs the moment it detects
+it cannot contact the control plane, so its shard states do not advance. When
+it can reconnect, it re-registers as a new worker rather than resuming as the
+old identity.
+
+**Object-store-only partition.** If a worker can reach the control plane but
+not the object store, it cannot commit epoch WALs. It reports
+`BLOCKED(RS-3003 storage.object_store_unreachable)` and stalls. The control
+plane does not mark it dead (heartbeats still arrive); it waits for recovery.
+If the object store outage exceeds `object_store_stall_timeout` (default 5 min),
+the operator is alerted via the degraded state channel.
+
+### 11.7 Object Store Brownout
+
+The system assumes object storage is available the vast majority of the time,
+but a complete or partial outage must not cause data loss or duplicate output.
+
+**During an object store brownout:**
+- Workers stall at the epoch commit step (WAL flush blocks).
+- Workers continue accepting connector credits up to `local_buffer_max_epochs`
+  (default 10 epochs) in the tokio task input queue before applying
+  backpressure to the source connector.
+- After `local_buffer_max_epochs`, the source connector is credit-starved;
+  Kafka consumption pauses; HTTP push sources return `429 Too Many Requests`.
+- Frontiers stop advancing; pipeline transitions to `STRESSED` then
+  `BLOCKED(RS-3003)`.
+- The control plane surfaces `cluster_storage_stalled = true` in metrics
+  and the degraded-state channel.
+
+**Recovery once the object store returns:**
+- Workers resume WAL flushes; buffered epochs commit in order.
+- Frontiers advance normally; sources resume at the committed offset.
+- No data loss (writes were buffered, not dropped).
+- No duplicates (epoch keys are idempotent; re-flushing the same WriteBatch
+  is a no-op if the WAL segment already exists).
+
+This is the same "local buffer → backpressure → pause source" pattern used
+by Flink's checkpoint alignment mechanism.
+
+### 11.8 Thundering Herd on Cluster Restart
+
+After a control plane failover or cluster-wide restart, all workers
+simultaneously attempt to:
+1. Open their SlateDB instances (each calls `get_latest_manifest()` on object
+   storage — one PUT/GET per shard).
+2. Replay their WAL tail.
+3. Send heartbeats + frontier reports to the control plane.
+
+With hundreds of workers and thousands of shards, the simultaneous spike in
+object-store requests can trigger S3/GCS throttling (HTTP 429/503), which
+delays manifest reads, which delays heartbeats, which triggers false failure
+detection — a cascade.
+
+**Staggered recovery.** Workers are assigned a startup jitter window based
+on `worker_id mod jitter_buckets` (default 20 buckets × 1 s = 20 s spread).
+A worker in bucket `k` waits `k × (jitter_window_ms / jitter_buckets)` ms
+before beginning shard acquisition. Buckets are randomized per boot to prevent
+synchronized re-collisions on repeated cluster restarts.
+
+The control plane also implements a **lease grant rate limit**: it will
+not issue more than `max_lease_grants_per_second` (default 50) shard leases
+per second cluster-wide, ensuring shard openings are spread over time even
+if all workers start simultaneously.
+
 ---
 
 ## 12. Query Serving
@@ -1384,6 +1533,30 @@ shard's `WalReader` filtered to `view_output/` for the requested view-id prefix.
 Subscription connections are authenticated via the same token/certificate checked
 by the gateway (§12.5); the gateway proxies the subscription rather than exposing
 raw shard access to clients.
+
+### 12.3.1 Cross-Shard Read Pushdown
+
+For aggregation queries over a distributed view (e.g., `SELECT COUNT(*), region
+FROM orders_mv GROUP BY region`), naively routing all rows to the gateway
+before aggregating wastes network bandwidth proportional to view cardinality.
+The gateway instead pushes the partial aggregation to each shard:
+
+1. The gateway decomposes the query into a **partial plan** (per-shard
+   `GROUP BY + partial SUM/COUNT`) and a **merge plan** (gateway-side
+   final aggregation).
+2. Each shard executes the partial plan against its `view_output/` snapshot
+   and returns a compact partial-aggregate batch (one row per group key).
+3. The gateway merges the partial batches and returns the final result.
+
+This reduces network bytes from O(view rows) to O(distinct group keys × shards)
+— for a 1B-row view with 100 regions across 100 shards, the gateway receives
+10,000 rows instead of 1B.
+
+The partial plan is a subset of DataFusion's logical plan; no new operator
+types are needed. The shard exposes a `partial_query(plan_bytes)` gRPC
+method that accepts a Substrait fragment and returns an Arrow batch.
+Pushdown is used only for safe, side-effect-free aggregation fragments;
+joins and updates always use the full scan path.
 
 ### 12.4 Freshness Tokens and Read-Your-Writes
 
@@ -1787,9 +1960,34 @@ rockstream pipeline {list, show, deploy, replace, pause, resume, drop}
 rockstream view     {list, show, query, subscribe}
 rockstream explain  <view> [--estimate]
 rockstream cluster  {status, workers, quotas}
+rockstream cluster  workers {list, drain, status}
 rockstream support  bundle [--pipeline=<name>]   # see §14.12
 rockstream audit    {tail, query}                # see §14.11
+rockstream debug    arrangement <view> <op_id> <key>  # see §14.7.1
 ```
+
+#### 14.7.1 IVM Arrangement Debugger
+
+When a view produces a *wrong answer* (not just a slow one), the operator needs
+to inspect the intermediate Z-set state rather than just the pipeline metrics.
+The `debug arrangement` command reads a specific key from a live arrangement
+using `DbReader` pinned to the latest committed frontier:
+
+```
+$ rockstream debug arrangement orders_mv agg_op_3f2a "product_id=42"
+op_id:       agg_op_3f2a  (SUM(quantity) GROUP BY product_id)
+shard:       shard-07 (s3://bucket/shards/07/)
+epoch:       1492 (committed at 2026-05-28T10:14:23Z)
+key:         product_id=42
+state:       { sum_quantity: 1840, row_count: 23 }
+weight:      +1
+last_delta:  epoch 1489  (+120 quantity, +3 rows)
+```
+
+This reads directly from the arrangement state encoding (§6.2) via `DbReader`;
+it does not block the live pipeline. The command also supports `--epoch=N`
+to inspect historical state at a past committed epoch (within the checkpoint
+retention window).
 
 No separate `rockstream-control`, `rockstream-worker`, `rockstream-gateway`
 binaries; no separate config files for each role. A node decides which roles

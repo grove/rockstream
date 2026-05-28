@@ -673,6 +673,20 @@ production-ready.
 - **Chaos test suite**:
   - Random process kills, network partitions, disk-full, object-store throttle.
   - Verify output equivalence against a non-faulty reference.
+- **Worker self-fencing** (DESIGN.md §11.6): workers that cannot reach the
+  control plane for `self_fence_after` seconds terminate themselves. Simulated
+  in `SimRuntime` by injecting a control-plane partition; the partitioned
+  worker must fence before the new owner acquires its leases.
+- **Object store brownout handling** (DESIGN.md §11.7): workers buffer up to
+  `local_buffer_max_epochs` epochs when the object store is unreachable, then
+  apply backpressure to sources. Recovery is transparent when the store
+  returns. Test: inject a 60-second object-store blackout; verify no data
+  loss, no duplicates, and frontier resumes within the SLO after recovery.
+- **Thundering herd mitigation** (DESIGN.md §11.8): staggered worker startup
+  using `worker_id mod jitter_buckets` delay; control plane rate-limits lease
+  grants at `max_lease_grants_per_second`. Test: restart all 32 workers
+  simultaneously; verify no false failure detections and object-store request
+  spike stays within 2× normal.
 - **Simulation-test coverage** (under `SimRuntime` with `BUGGIFY` enabled,
   DESIGN.md §17.3):
   - Epoch commit interleavings across N shards — every partial-failure
@@ -684,6 +698,9 @@ production-ready.
     surfaces `RECOVERING` if it cannot complete.
   - 2PC sink crash points — pre-commit / between / commit all recover
     idempotently.
+  - Network partition self-fencing — partitioned worker terminates before
+    the new owner commits to a previously-leased shard.
+  - Object store brownout — 50-epoch blackout produces zero loss/duplicates.
 - **Recovery-time SLO instrumentation**: emit `failure_detection_seconds`,
   `shard_recovery_seconds`, `pipeline_freshness_recovery_seconds` histograms
   (DESIGN.md §11.5). Pipelines that miss the 60 s freshness-recovery budget
@@ -906,6 +923,7 @@ protocol. Make RockStream self-contained (no external broker required).
   - `cluster workers {list, drain, status}`
   - `shard list/migrate`
   - `checkpoint list/restore`
+  - `debug arrangement <view> <op_id> <key>` (DESIGN.md §14.7.1)
 - **Web console** (optional, post-MVP): pipeline graph viewer, frontier lag
   charts, live throughput.
 - **Chaos testing automation**: Jepsen-style test harness.
