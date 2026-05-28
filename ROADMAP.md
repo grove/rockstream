@@ -154,8 +154,8 @@ without that proof, the version is not done.
 | v0.40 | Postgres read gateway | pgwire startup/query/extended-query, row descriptions with Postgres OIDs, catalog stubs, snapshot reads, cross-shard partial aggregation pushdown (DESIGN.md §12.3.1), `rockstream` system schema virtual tables (DESIGN.md §12.6.1), per-worker arrangement segment cache (DESIGN.md §5.4). | `psql` and SQLAlchemy can read views; `SELECT COUNT(*), region FROM mv GROUP BY region` pushes partial agg to shards; gateway receives O(groups) rows, not O(view rows); `SELECT * FROM rockstream.epochs` returns committed epoch history; segment cache hit ratio > 80% for hot-join workloads in benchmarks. |
 | v0.41 | Freshness, subscribe, isolation, historical queries | `READ COMMITTED`, `REPEATABLE READ`, freshness tokens, `wait_for=<token>`, subscribe API, gateway restart behavior, `AS OF EPOCH <n>` / `AS OF TIMESTAMP <t>` historical queries (DESIGN.md §12.4.1), `checkpoint_retention_count` / `checkpoint_retention_duration` configuration. | Read-your-writes demo passes; subscribe stream survives gateway restart without gaps or duplicates; `SELECT * FROM orders_mv AS OF EPOCH <past>` returns the correct historical snapshot; queries beyond retention return `RS-2005`. |
 | v0.42 | Internal direct-write connector | DML over pgwire, transaction buffer, COMMIT to base-table shard, ROLLBACK discard, generated source epochs. | `psql` can insert/update/delete rows and see a maintained view refresh within `freshness_target_ms`. |
-| v0.43 | External source/sink set | Kafka source/sink, Postgres CDC source, S3/table-format source and sink, HTTP push/webhook; every source implements the full §13.3 contract (opaque `OffsetToken`, `watermark: Option<EventTimeWatermark>`, `credits_available()`, `partition_filter: Option<PartitionFilter>`) and routes per-record decode errors to a DLQ sink as `RS-1003`; Iceberg/Delta sink implements `should_flush` and stages pending rows in the epoch checkpoint. | Postgres CDC → RockStream IVM → Kafka sustains 100k rows/s for 24 hours exactly once; Kafka source closes a 1-minute tumbling window correctly under deliberate clock skew; Iceberg sink with a 10ms epoch produces ≤ 2 files/minute (≥ 256 MB each) rather than thousands of tiny files; under sustained downstream saturation, Kafka consumption rate tracks downstream credits with bounded inbox memory. |
-| v0.44 | Connector lifecycle and SDK | Connector pause/resume/delete, external gRPC connector protocol, SDK, examples, isolation options. | Third-party example connector passes the same contract tests as built-ins. |
+| v0.43 | External source/sink set (Tier 1 contract) | Kafka source/sink, Postgres CDC source, S3/table-format source and sink, HTTP push/webhook; every source implements the §13.3 Tier 1 contract (opaque `OffsetToken`, `watermark: Option<EventTimeWatermark>`, `credits_available()`) and routes per-record decode errors to a DLQ sink as `RS-1003`; every sink implements `prepare`/`commit`/`abort` with a default `should_flush` that flushes every epoch. | Postgres CDC → RockStream IVM → Kafka sustains 100k rows/s for 24 hours exactly once; Kafka source closes a 1-minute tumbling window correctly under deliberate clock skew; under sustained downstream saturation, Kafka consumption rate tracks downstream credits with bounded inbox memory. |
+| v0.44 | Connector lifecycle, SDK, and Tier 2 contract | Connector pause/resume/delete, external gRPC connector protocol, SDK, examples, isolation options; Tier 2 contract additions: `partition_filter: Option<PartitionFilter>` on source `start_snapshot`/`poll_delta` (opt-in; connectors that do not support it return `None` and fall back to operator-layer filtering), and `should_flush(bytes_buffered, epochs_buffered)` override for file-format sinks (Iceberg/Delta/Parquet) that need to buffer across epochs to avoid small files. | Third-party example connector passes Tier 1 contract tests; Iceberg sink implementing Tier 2 `should_flush` with a 10ms epoch produces ≤ 2 files/minute (≥ 256 MB each); a Tier 1 connector (e.g. Kafka) passes contract tests with the default flush-every-epoch `should_flush`; `partition_filter_support() -> bool` returns false on connectors that do not implement pushdown and operator-layer filtering is verified to produce identical output. |
 
 ### Production Beta
 
@@ -211,6 +211,15 @@ These are explicit places to pause, learn, and possibly reshape the roadmap.
 
 At each gate, the default action is not to accelerate. The default action is to
 remove uncertainty.
+
+**Design freeze after v0.10.** Once the IVM Kernel Confidence gate is passed,
+new sections may not be added to DESIGN.md or IVM.md unless they are required
+to unblock a specific coded milestone. The documents become implementation
+references, not the primary work product. Gaps discovered during coding are
+tracked as GitHub issues and resolved with targeted corrections to the relevant
+section — not as numbered design-revision passes. The test: after v0.10, every
+DESIGN.md commit should be small and targeted ("correct §7.5: exchange
+loopback threshold"), not broad ("v3.X adds Y, Z").
 
 ---
 

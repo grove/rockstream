@@ -24,23 +24,31 @@ system with progressively more capability.
 
 ## Phase Overview
 
-| Phase | Title | Outcome | Indicative Duration |
-|---|---|---|---|
-| 0 | Repository & Tooling | Buildable, tested, CI-green skeleton | 1–2 weeks |
-| 1 | Single-Shard IVM Core (IVM-1 … IVM-3) | Single-process engine: filter/project/map + algebraic aggregates + MIN/MAX | 5–7 weeks |
-| 2 | SQL Frontend & Joins (IVM-4 … IVM-6) | DataFusion → PlanIR → circuit; inner/outer/semi/anti joins; set ops | 6–8 weeks |
-| 3 | Advanced Operators (IVM-7 … IVM-12) | Windows, time windows, recursion, bootstrap, view-on-view, lateral | 8–10 weeks |
-| 3.5 | IVM Correctness Soak (IVM-13) | TPC-H 22/22, Nexmark, fuzz, parity vs. pg_trickle & DataFusion batch | 3 weeks |
-| 4 | Multi-Shard & Exchange | Distributed execution, shuffle subsystem | 6–8 weeks |
-| 5 | Frontier Protocol | Distributed progress tracking | 4 weeks |
-| 6 | Fault Tolerance | Cluster checkpoints, recovery, exactly-once | 6 weeks |
-| 7 | Elasticity | Online add/remove shards, rebalancing | 4 weeks |
-| 8 | Connectors & Sinks | Kafka, Postgres CDC, S3, HTTP | 4 weeks |
-| 9 | Query Gateway | SQL-over-views, subscriptions | 3 weeks |
-| 10 | Observability & Hardening | Metrics, tracing, chaos testing, docs | 4 weeks |
-| 11 | Production Launch | Beta → GA | 4 weeks |
+This document owns the detailed deliverables, exit criteria, and operability
+callouts for each phase. For version sequencing, public milestones, decision
+gates, and the build philosophy, see [ROADMAP.md](ROADMAP.md).
 
-Durations are indicative effort, not calendar time, and assume a small dedicated team.
+The phase numbers here map to ROADMAP.md roadmap versions as follows:
+
+| Phase | ROADMAP versions | Focus |
+|---|---|---|
+| 0 | v0.1–v0.4 | Repository, simulation, storage, no-op pipeline |
+| 1 | v0.5–v0.10 | Single-shard IVM core (IVM-1 … IVM-3) |
+| 2 | v0.11–v0.18 | SQL frontend, joins, set ops (IVM-4 … IVM-6) |
+| 3 | v0.19–v0.26 | Advanced operators: windows, recursion, view-on-view (IVM-7 … IVM-12) |
+| 3.5 | v0.27 | IVM correctness soak (IVM-13) |
+| 4 | v0.28–v0.30 | Multi-shard execution and exchange subsystem |
+| 5 | v0.31–v0.32 | Frontier protocol and progress tracking |
+| 6 | v0.33–v0.36 | Fault tolerance, exactly-once, chaos |
+| 7 | v0.37–v0.39 | Elasticity: split, merge, drain, clone |
+| 8 | v0.42–v0.44 | Connectors and sinks (Tier 1 + Tier 2 contract) |
+| 9 | v0.40–v0.41 | Postgres query gateway, freshness, subscribe |
+| 10 | v0.45–v0.48 | Auth, observability, upgrades, security |
+| 11 | v0.49–v0.50 | Long soak and production beta handoff |
+
+Durations are indicative effort, not calendar time, and assume a small
+dedicated team. The ROADMAP.md version table is the single source of truth
+for sequencing; this table exists only to orient readers between documents.
 
 ---
 

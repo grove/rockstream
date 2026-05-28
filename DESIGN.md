@@ -1882,6 +1882,20 @@ Connector types are pluggable, but the contract is fixed. Built-in connectors
 implement it as Rust traits; external connectors use the same protocol over
 gRPC so they can run in a separate connector tier.
 
+The contract is split into two tiers:
+
+| Tier | Required for | Features |
+|---|---|---|
+| **Tier 1** | All connectors | Opaque `OffsetToken`, event-time watermark channel, backpressure feedback, DLQ routing, `prepare`/`commit`/`abort` on sinks |
+| **Tier 2** | File-format sources/sinks only (opt-in) | Partition-filter pushdown, `should_flush` buffering override |
+
+A connector that does not implement Tier 2 features advertises this via
+`partition_filter_support() -> bool` (returns `false`) and by not overriding
+`should_flush` (the default implementation returns `true`, flushing every
+epoch). The planner skips pushdown for connectors that report no support;
+operator-layer filtering produces identical results. Tier 1 connectors pass
+the full contract test suite without implementing any Tier 2 surface.
+
 **Opaque offset type.** Source positions are carried as an `OffsetToken`
 (serialisable opaque bytes), not as a scalar. Kafka encodes a
 `{ partition_id → offset }` map; Postgres CDC encodes an LSN; S3 / Iceberg /
@@ -1911,16 +1925,16 @@ this before consuming and stop polling when the pool runs dry. This bounds
 the in-flight memory footprint at the connector boundary regardless of
 source burst rate.
 
-**Partition-filter pushdown.** When a source reads a partitioned table format
-(Iceberg, Delta Lake, Hudi, Parquet-manifest), the planner's predicate-pushdown
-pass may already know which partition columns to restrict. Rather than scanning
-all partitions and discarding non-matching rows in the operator layer, the
-planner passes a `PartitionFilter` — a conjunction of simple column predicates
-— directly to `start_snapshot` and `poll_delta`. Connectors that support
-pushdown skip non-matching partition directories entirely; connectors that do
-not simply ignore the filter and fall back to operator-layer filtering. The
-filter type is defined in the connector contract and does not depend on
-DataFusion internals:
+**[Tier 2] Partition-filter pushdown.** When a source reads a partitioned table
+format (Iceberg, Delta Lake, Hudi, Parquet-manifest), the planner's
+predicate-pushdown pass may already know which partition columns to restrict.
+Rather than scanning all partitions and discarding non-matching rows in the
+operator layer, the planner passes a `PartitionFilter` — a conjunction of
+simple column predicates — directly to `start_snapshot` and `poll_delta`.
+Connectors that support pushdown skip non-matching partition directories
+entirely; connectors that do not simply ignore the filter (or return `None`)
+and fall back to operator-layer filtering. The filter type is defined in the
+connector contract and does not depend on DataFusion internals:
 
 ```
 /// Partition-column predicates pushed from the planner to skip directories
@@ -1938,35 +1952,40 @@ type PartitionFilter = Vec<PartitionPredicate>;
 string, date, timestamp); it is serialisable over gRPC and does not carry a
 DataFusion type-system dependency.
 
-**Sink file aggregation.** The epoch-commit protocol checkpoints state every
-epoch for exactly-once recovery, but physical file writes to Iceberg/Delta/Hudi
-must be large (128 MB–1 GB) to avoid the small-files problem. The sink contract
-therefore separates *checkpoint granularity* from *physical write granularity*
-via a `should_flush` signal. When `should_flush` returns false, pending rows are
-staged as `connector/{id}/pending_buffer` in the shard SlateDB and participate
-in the epoch checkpoint, so they survive a crash between epochs. Physical file
-writes happen only when the connector decides the buffer is large enough. The
+**[Tier 2] Sink file aggregation.** The epoch-commit protocol checkpoints state
+every epoch for exactly-once recovery, but physical file writes to
+Iceberg/Delta/Hudi must be large (128 MB–1 GB) to avoid the small-files
+problem. File-format sinks may override `should_flush` to separate
+*checkpoint granularity* from *physical write granularity*. When
+`should_flush` returns false, pending rows are staged as
+`connector/{id}/pending_buffer` in the shard SlateDB and participate in the
+epoch checkpoint, so they survive a crash between epochs. Physical file writes
+happen only when the connector decides the buffer is large enough. The
 epoch-commit protocol guarantees exactly-once regardless of the flush policy.
+The default implementation of `should_flush` returns `true` (flush every
+epoch), which is always correct and is the right behavior for non-file-format
+sinks (Kafka, Postgres).
 
-Source connectors must provide:
+Source connectors must provide (Tier 1 required; Tier 2 optional):
 
 ```
 discover_schema()                         -> SchemaVersion
 start_snapshot(frontier,
-               partition_filter: Option<PartitionFilter>)
+               partition_filter: Option<PartitionFilter>)  // Tier 2; pass None if unsupported
   -> SnapshotStream
 poll_delta(after: OffsetToken,
            max_bytes: usize,
            credits_available: usize,
-           partition_filter: Option<PartitionFilter>)
+           partition_filter: Option<PartitionFilter>)      // Tier 2; pass None if unsupported
   -> { batches: Vec<RecordBatchDelta>,
        new_offset: OffsetToken,
        watermark: Option<EventTimeWatermark> }
 commit_offset(epoch, offset: OffsetToken) -> IdempotentResult
 pause(reason) / resume()
+partition_filter_support() -> bool        // Tier 2; default: false
 ```
 
-Sink connectors must provide:
+Sink connectors must provide (Tier 1 required; Tier 2 optional):
 
 ```
 prepare(epoch, rows)                       -> pending_handle
@@ -1974,7 +1993,7 @@ commit(epoch, pending_handle,
        checkpoint_id)                      -> IdempotentResult
 abort(epoch, pending_handle)               -> IdempotentResult
 should_flush(bytes_buffered: u64,
-             epochs_buffered: u32)         -> bool
+             epochs_buffered: u32)         -> bool  // Tier 2; default: true (flush every epoch)
 ```
 
 Every emitted row includes the stable `row_id` rules from §6.4 and the schema
