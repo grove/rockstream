@@ -220,6 +220,14 @@ object storage.
 > group is a post-v0.55 / 1.0-track feature gated on the v0.55 optimistic-
 > transaction soak.
 >
+> **v3.24 adds inline views** (§4.3): `CREATE VIEW` (without `MATERIALIZED`)
+> stores a query definition in the catalog and expands it as a macro at query
+> or materialized-view compilation time. No operator state, no arrangement
+> shards, no `view_output/` storage — just a named SQL alias. This is the
+> Postgres-standard `CREATE VIEW` semantics and covers ad-hoc query composition,
+> building blocks for materialized views, and schema abstraction. Ships v0.40.
+> Error codes `RS-1010`–`RS-1011` added. §5.7 and §12.1 updated.
+>
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
 >   itself (PlanIR, the differentiation pass, the per-operator rules, the
@@ -678,6 +686,103 @@ plans in parallel until the new plan reaches the old frontier, then flip query
 routing atomically in the catalog. This is the default mechanism for `ALTER
 VIEW`, join-key changes, and breaking source-schema updates.
 
+### 4.3 Inline Views (Query-Time Macro Expansion)
+
+RockStream supports two kinds of views:
+
+| Kind | DDL | Semantics | Storage |
+|---|---|---|---|
+| **Materialized view** | `CREATE MATERIALIZED VIEW v AS …` | Continuously maintained by the IVM engine. Result set is pre-computed in `view_output/`. | Arrangement shards |
+| **Inline view** | `CREATE VIEW v AS …` | Stored as a query definition in the catalog. Expanded (inlined) into the referencing query or materialized view at plan-compilation time. | Catalog only (no arrangement, no shard) |
+
+**Key distinction:** `CREATE VIEW` never allocates operator state, arrangement
+shards, or `view_output/` storage. The definition lives in `catalog/views/` in
+the control-plane SlateDB. At query time or materialized-view compilation, the
+planner substitutes the inline view's AST into the referencing query, exactly
+like a SQL macro.
+
+**Syntax.**
+
+```sql
+-- Inline view: just a named query alias, no materialization
+CREATE VIEW recent_orders AS
+  SELECT * FROM orders WHERE created_at > NOW() - INTERVAL '1 day';
+
+-- Materialized view: continuously maintained by IVM
+CREATE MATERIALIZED VIEW order_totals AS
+  SELECT account_id, SUM(amount) AS total FROM orders GROUP BY account_id;
+```
+
+**Use cases.**
+
+1. **Ad-hoc query composition.** Define reusable query fragments without paying
+   the cost of maintaining them incrementally:
+   ```sql
+   CREATE VIEW active_accounts AS
+     SELECT * FROM accounts WHERE status = 'active';
+
+   -- Ad-hoc: expanded inline at query time
+   SELECT * FROM active_accounts WHERE balance > 1000;
+   ```
+
+2. **Building blocks for materialized views.** Inline views can compose into
+   materialized view definitions. The planner inlines them before the
+   incrementalization pass (§4 step [4]):
+   ```sql
+   CREATE VIEW high_value_orders AS
+     SELECT * FROM orders WHERE amount > 10000;
+
+   -- Materialized: IVM maintains this, with high_value_orders inlined
+   CREATE MATERIALIZED VIEW hv_summary AS
+     SELECT account_id, COUNT(*) FROM high_value_orders GROUP BY account_id;
+   ```
+   The compiled pipeline for `hv_summary` sees the filter from
+   `high_value_orders` as part of its plan — no intermediate arrangement.
+
+3. **Schema abstraction.** Present a stable interface over evolving base tables
+   or materialized views:
+   ```sql
+   CREATE VIEW customer_profile AS
+     SELECT id, name, email FROM users;
+   ```
+
+**Planner interaction.** Inline view expansion happens at step [2] of the SQL
+compilation pipeline (logical plan construction). When the binder encounters a
+reference to an inline view, it substitutes the view's stored `LogicalPlan`
+subtree. This is identical to how DataFusion handles its `CREATE VIEW` today.
+After expansion, the downstream steps (optimization, incrementalization,
+distribution) are unaware that an inline view was involved.
+
+**Interaction with materialized views.** When an inline view is referenced
+inside a `CREATE MATERIALIZED VIEW`, the inline view's definition is frozen at
+the materialized view's compilation time. If the inline view is later
+`CREATE OR REPLACE`'d, existing materialized views that reference it are NOT
+automatically recompiled. The operator must explicitly `ALTER MATERIALIZED VIEW
+… RECOMPILE` or use the plan-replacement path (§4.2).
+
+**DDL operations.**
+
+| Operation | Behavior |
+|---|---|
+| `CREATE VIEW v AS …` | Stores definition in `catalog/views/{v}`. No pipeline, no arrangement. |
+| `CREATE OR REPLACE VIEW v AS …` | Overwrites the stored definition. Does not affect live materialized views. |
+| `DROP VIEW v` | Removes the definition. Fails with `RS-1010` if any materialized view references `v`. |
+| `ALTER VIEW v RENAME TO w` | Renames in catalog. References in materialized views are by ID, not name. |
+
+**Backwards compatibility.** The `CREATE VIEW` form (without `MATERIALIZED`) is
+the Postgres-standard DDL. Applications migrating from Postgres get inline views
+by default — matching their existing expectations. Only `CREATE MATERIALIZED
+VIEW` opts into RockStream's IVM engine.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| `RS-1010` | `view.inline_referenced_by_materialized` | Cannot drop inline view; one or more materialized views reference it. |
+| `RS-1011` | `view.inline_cycle_detected` | Inline view definition creates a circular reference. |
+
+**Ships**: v0.40.
+
 ---
 
 ## 5. Per-Shard SlateDB Storage Layout
@@ -902,8 +1007,9 @@ Materialized view outputs grow without bound unless retention is specified.
 By default:
 
 - **`MATERIALIZED VIEW`**: retained forever (the view *is* the answer).
+- **`VIEW` (inline)**: has no storage; nothing to retain or GC (§4.3).
 - **`VIEW` declared incremental for streaming consumers only**: retained for
-  30 days, configurable via `CREATE VIEW WITH (retention = '7d')`.
+  30 days, configurable via `CREATE MATERIALIZED VIEW WITH (retention = '7d')`.
 
 Retention is enforced by a SlateDB TTL plus a compaction filter that
 drops view-output rows whose commit timestamp is older than the retention
@@ -1957,7 +2063,7 @@ if all workers start simultaneously.
 |---|---|---|
 | **Materialized view lookup** | `DbReader` on the shard holding the view-output partition | µs–ms |
 | **Materialized view range scan** | `scan()` on the relevant shard(s); merge results on the gateway | ms |
-| **Ad-hoc SQL over views** | DataFusion query executes against a `Snapshot` of materialized views (no incremental engine involvement) | ms–s |
+| **Ad-hoc SQL over views** | DataFusion query executes against a `Snapshot` of materialized views (no incremental engine involvement). Inline views (§4.3) are expanded before planning. | ms–s |
 | **Historical view query** | Resolve epoch or timestamp to a checkpoint manifest; open `DbReader` at that snapshot across all relevant shards | ms–s (warm cache), s (cold) |
 
 ### 12.2 Query Gateway

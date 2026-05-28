@@ -1033,12 +1033,32 @@ a gateway rewrite.
   - `REPEATABLE READ`: `BEGIN` captures a vector frontier; all statements in
     the transaction see that snapshot; `COMMIT`/`ROLLBACK` releases it.
   - `SERIALIZABLE`: rejected with `RS-2003 isolation.serializable_not_supported`.
+- **Inline views** (DESIGN.md §4.3):
+  - `CREATE VIEW v AS …` stores the query definition in
+    `catalog/views/{v}` without allocating operator state, arrangement shards,
+    or `view_output/` storage.
+  - `CREATE OR REPLACE VIEW v AS …` overwrites the stored definition.
+  - `DROP VIEW v` removes the definition; fails with `RS-1010` if any
+    materialized view references `v`.
+  - Inline view expansion at logical-plan construction time: the binder
+    substitutes the stored `LogicalPlan` subtree when an inline view is
+    referenced in a query or `CREATE MATERIALIZED VIEW`.
+  - Cycle detection: `RS-1011` if an inline view references itself directly
+    or transitively.
+  - `pg_catalog.pg_views` and `information_schema.views` list both inline and
+    materialized views, distinguished by a `is_materialized` column.
 
 **Exit criteria for v0.40**
 
 - `psql` connects, runs `SELECT * FROM my_view LIMIT 10`, returns < 10 ms.
 - SQLAlchemy ORM reflects view schema without errors.
 - `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` returns `RS-2003`.
+- `CREATE VIEW v AS SELECT …; SELECT * FROM v` returns correct results via
+  inline expansion (no arrangement created).
+- `CREATE MATERIALIZED VIEW mv AS SELECT * FROM v` successfully inlines `v`
+  and starts IVM maintenance.
+- `DROP VIEW v` with a dependent materialized view returns `RS-1010`.
+- Circular inline view definition returns `RS-1011`.
 
 ---
 
