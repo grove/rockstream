@@ -131,6 +131,15 @@ object storage.
 > deliverable, but the `ViewReader` gateway abstraction is made cold-tier-aware
 > in Phase 9 so the cold tier can be added later without a gateway rewrite.
 >
+> **v3.16 fills in the external consumption story**: the cold tier writes valid
+> Iceberg v2 tables (§12.7.2) to object storage so downstream tools (DuckDB,
+> Snowflake, Trino, Spark) can query view snapshots directly — no RockStream
+> in the read path. §13.6 adds the Iceberg/Delta cold-tier sink connector as a
+> first-class built-in, with `CREATE SINK` syntax, the checkpoint-to-manifest
+> lifecycle, and the external consumption contract. This firmly establishes
+> RockStream's role as a freshness layer that feeds the data lake rather than
+> competing with columnar analytics tools on ad-hoc scans.
+>
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
 >   itself (PlanIR, the differentiation pass, the per-operator rules, the
@@ -157,6 +166,7 @@ object storage.
 12. [Query Serving](#12-query-serving)
     - [12.7 Two-Tier View Storage](#127-two-tier-view-storage-design-decision)
 13. [Connectors & External I/O](#13-connectors--external-io)
+    - [13.6 Iceberg/Delta Cold-Tier Sink](#136-icebergdelta-cold-tier-sink)
 14. [Operations: Deploy, Monitor, Diagnose](#14-operations-deploy-monitor-diagnose)
 15. [Comparison to Prior Art](#15-comparison-to-prior-art)
 16. [Optimality Assessment (v3.7)](#16-optimality-assessment-v37)
@@ -1910,10 +1920,52 @@ different output format: Parquet files written to object storage instead of (or
 alongside) SlateDB checkpoints. The gateway's DataFusion execution already reads
 Parquet natively. No new distributed protocols are needed.
 
-Cold snapshots are written to `views/{view_id}/snapshots/{epoch}/` under the
-pipeline's object-store prefix. Each snapshot can be a valid Iceberg table
-snapshot (or Delta Lake commit), enabling downstream tools (Snowflake, DuckDB,
-Trino) to query the view's data directly — without RockStream in the read path.
+Cold snapshots are written as a valid **Iceberg v2 table** (default) or Delta
+Lake commit to `views/{view_id}/iceberg_table/` under the pipeline's
+object-store prefix. The Iceberg table layout follows the standard spec:
+
+```
+views/{view_id}/iceberg_table/
+  metadata/
+    v1.metadata.json          # table schema, partition spec, sort order
+    snap-{epoch}.avro         # snapshot manifest list (one per cold snapshot)
+  data/
+    {partition_key=value}/
+      {shard_id}-{epoch}.parquet   # data files, one per shard partition
+```
+
+Each committed cold snapshot is a valid Iceberg snapshot with its own
+`snapshot-id` and `sequence-number`. The manifest list points to manifest
+files; manifest files point to Parquet data files with column-level statistics
+(min/max, null count) for predicate pushdown.
+
+This makes every cold snapshot a **first-class Iceberg table** that external
+tools can consume directly — with no RockStream gateway in the read path:
+
+```sql
+-- DuckDB reads the latest cold snapshot directly from object storage
+INSTALL iceberg; LOAD iceberg;
+SELECT * FROM iceberg_scan('s3://bucket/views/orders_mv/iceberg_table');
+
+-- Or register it once and query by name
+CREATE VIEW orders_mv AS
+  SELECT * FROM iceberg_scan('s3://bucket/views/orders_mv/iceberg_table');
+SELECT region, SUM(total) FROM orders_mv GROUP BY region;
+
+-- Snowflake external Iceberg table
+CREATE EXTERNAL TABLE orders_mv
+  USING TEMPLATE (SELECT ARRAY_CONSTRUCT(*) FROM TABLE(INFER_SCHEMA(
+    LOCATION => '@my_stage/views/orders_mv/iceberg_table/',
+    FILE_FORMAT => 'my_parquet_fmt')))
+  LOCATION = '@my_stage/views/orders_mv/iceberg_table/';
+```
+
+For the hot LSM tail (epochs after the last cold snapshot), external tools
+either tolerate bounded staleness equal to the snapshot interval, or query
+RockStream's gateway for the tail and merge client-side. The snapshot interval
+is a per-view knob (`cold_snapshot_interval`, default: every 128 epochs or
+5 minutes, whichever comes first). See §13.6 for the sink connector that
+writes these snapshots.
 
 #### 12.7.3 Cold-Tier-Aware Gateway Interface
 
@@ -2172,6 +2224,111 @@ Client (psql / JDBC)  ──INSERT──►  Gateway  ──delta──►  Base
 needs no external broker or database. Deploy RockStream, issue SQL `INSERT`
 statements, query IVM views — no Kafka, no Postgres, no infrastructure beyond
 object storage.
+
+---
+
+### 13.6 Iceberg/Delta Cold-Tier Sink
+
+The cold-tier sink is a **built-in Tier 2 sink connector** that writes
+committed view-output snapshots as Iceberg v2 (or Delta Lake) tables to object
+storage. It is the production mechanism for the cold tier described in §12.7.
+
+#### 13.6.1 Declaring a Cold-Tier Sink
+
+```sql
+-- Attach an Iceberg cold-tier sink to an existing view
+CREATE SINK orders_mv_iceberg
+  FOR VIEW orders_mv
+  TO ICEBERG 's3://bucket/views/orders_mv/iceberg_table'
+  WITH (
+    snapshot_interval_epochs = 128,   -- write a new snapshot every N epochs
+    snapshot_interval_ms     = 300000, -- or every 5 min, whichever is first
+    parquet_row_group_bytes  = 134217728, -- 128 MB row groups
+    format_version           = 2,        -- Iceberg v2 (default)
+    partition_by             = ARRAY['region', 'date_trunc(''day'', created_at)']
+  );
+```
+
+The sink can also be declared as a `DELTA` table:
+
+```sql
+CREATE SINK orders_mv_delta
+  FOR VIEW orders_mv
+  TO DELTA 's3://bucket/views/orders_mv/delta_table'
+  WITH (snapshot_interval_epochs = 64);
+```
+
+Sinks are registered in the control-plane connector catalog and are visible
+via `rockstream.connectors`.
+
+#### 13.6.2 Snapshot Lifecycle
+
+The cold-tier sink integrates with the epoch-commit protocol (§9) and the
+`should_flush` Tier 2 signal:
+
+```
+Epoch N committed
+  │
+  ├─ should_flush() → false          ← buffer rows into pending_buffer (in shard)
+  │  (N < snapshot_interval threshold)
+  │
+  └─ should_flush() → true           ← threshold reached; flush
+       │
+       ├─ 1. Write Parquet data files to object storage (one per shard partition)
+       ├─ 2. Write Iceberg manifest files referencing data files + column stats
+       ├─ 3. Write manifest list (snapshot) file
+       ├─ 4. Atomically commit new metadata.json pointer (Iceberg atomic swap)
+       └─ 5. Update connector offset in control plane: last_snapshot_epoch = N
+```
+
+Steps 1–3 are idempotent (files are keyed by `{shard_id}-{epoch}`). Step 4
+uses the Iceberg spec's optimistic concurrency commit (compare-and-swap on the
+version hint file). If the process crashes after step 3 but before step 4, the
+next epoch's flush re-runs steps 1–4; existing data files are reused (their
+content is deterministic from the epoch's Z-set output).
+
+**Exactly-once guarantee**: pending rows are staged in the shard SlateDB as
+`connector/{id}/pending_buffer` and participate in the epoch checkpoint before
+any Parquet file is written. A crash-recovery replay re-drives `should_flush`
+from the same committed state and produces identical Parquet files.
+
+#### 13.6.3 External Tool Consumption
+
+Once a snapshot is committed, external tools can query it with **no RockStream
+gateway involvement**:
+
+| Tool | Access pattern |
+|---|---|
+| **DuckDB** | `iceberg_scan('s3://...')` or `delta_scan('s3://...')` — full predicate/column pushdown via Parquet statistics |
+| **Snowflake** | External Iceberg table on the same S3 prefix — auto-refreshes on new snapshots |
+| **Apache Spark / Trino** | Iceberg catalog pointing at the metadata path; reads via the standard Iceberg REST or Hive catalog |
+| **Apache Flink** | Iceberg source connector; can also subscribe to the Iceberg changelog for incremental reads |
+| **dbt** | Reads Iceberg/Delta tables as sources; runs `dbt run` against the cold snapshots |
+
+The staleness of an external read equals the snapshot interval
+(`cold_snapshot_interval`) plus Parquet write latency (typically seconds for
+reasonable partition sizes). For workloads where sub-second freshness is not
+required, external tools get full analytical performance with no latency
+budget spent on RockStream's gateway.
+
+#### 13.6.4 Positioning: RockStream as a Freshness Layer
+
+This makes the architectural split explicit:
+
+```
+                      ┌─────────────────────────────────────┐
+  Source data         │         RockStream                  │
+  (Kafka, Postgres,   │  IVM engine: incremental SQL views  │
+   direct DML)  ────► │  SlateDB hot LSM (10–250 ms fresh)  │ ──► psql / app point lookups
+                      │  Checkpoint → Iceberg cold snapshots│ ──► DuckDB / Snowflake / Trino
+                      └─────────────────────────────────────┘       (full analytical scans)
+```
+
+RockStream's primary value is **view freshness** — incremental updates at
+10–250 ms latency that no columnar engine can match. The Iceberg cold tier
+then makes that fresh data **accessible** to any tool in the data ecosystem
+without requiring those tools to integrate with RockStream's gateway. There
+is no tension between the two: they serve different queries.
 
 ---
 
