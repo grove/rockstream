@@ -39,8 +39,8 @@ pub fn after_boundary<T: Hash>(data: &T, token: &AssertionToken) {
     assert_eq!(
         actual_hash, token.hash,
         "Paired assertion failed at boundary '{}': data corruption detected \
-         (expected hash {:016x}, got {:016x})",
-        token.label, token.hash, actual_hash
+         (expected hash {:016x}, got {actual_hash:016x})",
+        token.label, token.hash
     );
 }
 
@@ -57,8 +57,7 @@ pub fn paired_assert<T: Hash + PartialEq>(
     let recovered_hash = hasher.finish();
     assert_eq!(
         recovered_hash, token.hash,
-        "Paired assertion failed at boundary '{}': data mismatch",
-        label
+        "Paired assertion failed at boundary '{label}': data mismatch",
     );
     true
 }

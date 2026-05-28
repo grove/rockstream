@@ -480,8 +480,8 @@ async fn determinism_two_runs_identical_state() {
     );
 
     for (i, ((k1, v1), (k2, v2))) in state1.iter().zip(state2.iter()).enumerate() {
-        assert_eq!(k1, k2, "Key mismatch at position {}", i);
-        assert_eq!(v1, v2, "Value mismatch at position {} for key {:?}", i, k1);
+        assert_eq!(k1, k2, "Key mismatch at position {i}");
+        assert_eq!(v1, v2, "Value mismatch at position {i} for key {k1:?}");
     }
 }
 
