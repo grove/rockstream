@@ -8,3 +8,12 @@ description = "Storage abstraction layer wrapping SlateDB for RockStream"
 
 [dependencies]
 rockstream-types = { workspace = true }
+bytes = { workspace = true }
+slatedb = { workspace = true }
+object_store = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

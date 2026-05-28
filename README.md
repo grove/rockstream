@@ -151,6 +151,20 @@ The practical result: when you put RockStream into production, the kinds of
 distributed-systems surprises that usually fill a runbook have already been
 discovered — and fixed — on a developer's laptop.
 
+### Feeds the Data Lake
+
+RockStream can act as a **freshness layer that feeds columnar analytics tools**.
+At any cadence you specify, it writes view snapshots to object storage as
+[**Iceberg v2**](https://iceberg.apache.org/) or **Delta Lake** tables. From
+there, DuckDB, Trino, Spark, and similar tools can query view snapshots
+directly — no RockStream in the read path.
+
+RockStream can also *be* the catalog. The gateway exposes a native
+**Iceberg REST Catalog** endpoint (`/iceberg/v1/`) so any Iceberg-native tool
+can discover views by name with no extra infrastructure. Catalog registration
+backends include filesystem (self-contained), AWS Glue, any Iceberg REST
+catalog (Polaris, Unity Catalog, Gravitino), Hive Metastore, and DuckLake.
+
 ## Inspiration
 
 RockStream is inspired by production systems and implementation research:
@@ -158,7 +172,7 @@ RockStream is inspired by production systems and implementation research:
 | System | What it does |
 |---|---|
 | **[Feldera](https://feldera.com/)** | Uses mathematical theory (DBSP) to guarantee that incremental results are always identical to what a full re-computation would produce |
-| **pg_trickle** | Shows how to turn SQL views into practical per-operator delta rules, with many hard correctness cases worked through in PostgreSQL |
+| **[pg_trickle](https://github.com/trickle-labs/pg-trickle)** | Shows how to turn SQL views into practical per-operator delta rules, with many hard correctness cases worked through in PostgreSQL |
 | **[SlateDB](https://slatedb.io/)** | Provides the cloud-native object-storage-backed LSM that RockStream uses as its durable shard and arrangement store |
 | **[RisingWave](https://risingwave.com/)** | A streaming database that maintains materialized views in real time |
 
@@ -178,7 +192,7 @@ RockStream brings these ideas to an open, cloud-native storage foundation.
 
 ## Status
 
-This project is in the **design phase** (current revision: **v3.12**). Four
+This project is in the **design phase** (current revision: **v3.20**). Four
 documents describe the system in progressively more detail:
 
 | Document | Audience | What it covers |
@@ -187,7 +201,62 @@ documents describe the system in progressively more detail:
 | [IVM.md](IVM.md) | IVM specialists | How the incremental-view-maintenance engine itself works — DBSP-native operators, the differentiation pass, the circuit runtime, arrangements on SlateDB, and pg_trickle as a correctness oracle |
 | [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) | Implementers | Phase-by-phase build plan from empty repo to GA, including corrected IVM milestones and validation gates |
 | [ROADMAP.md](ROADMAP.md) | Builders / planners | Version-by-version delivery roadmap, with each roadmap version sized at about 10 person-weeks and tied to concrete proof |
+## Roadmap
 
+RockStream is built in phases, each delivering a working, testable increment.
+Each roadmap version is sized at roughly **10 person-weeks** of implementation effort.
+
+### Public Milestones
+
+| Milestone | Version | What it means |
+|---|---:|---|
+| Developer Alpha | v0.10 | Local single-shard engine maintains simple views and survives crash/replay |
+| SQL Alpha | v0.18 | Core SQL views, joins, set ops, and `EXPLAIN` work on one shard |
+| Single-Shard Beta | v0.27 | Advanced IVM feature-complete for serious single-node testing |
+| Distributed Alpha | v0.36 | Multi-shard execution, frontier protocol, recovery, and exactly-once basics work |
+| Integration Beta | v0.45 | Postgres gateway, direct writes, and major external connectors work end to end |
+| Production Beta | v0.51 | Observability, auth, upgrades, security review, and long soaks ready for a pilot |
+| Data Lake GA | v0.54 | Cold-tier Iceberg/Delta sinks, native Iceberg REST catalog, external tool consumption proven |
+| 1.0 | post-v0.54 | Tagged only after a real production workload succeeds without design exceptions |
+
+### Phase Summary
+
+| Phase | Focus |
+|---|---|
+| 0 | Repository, deterministic simulator (`SimRuntime` + `buggify!()`), SlateDB storage contract, no-op pipeline |
+| 1 | Single-shard IVM core: filter, project, map, algebraic aggregates (SUM/COUNT/AVG), MIN/MAX |
+| 2 | DataFusion SQL frontend, inner and outer joins, set operations, `EXPLAIN INCREMENTAL` |
+| 3 | Advanced operators: window functions, time windows with event-time frontiers, recursion, view-on-view DAG |
+| 3.5 | IVM correctness soak: TPC-H 22/22, Nexmark subset, query fuzzer |
+| 4 | Multi-shard execution, gRPC shuffle, durable shuffle fallback |
+| 5 | Frontier protocol, frontier aggregator, shuffle GC |
+| 6 | Fault tolerance, exactly-once end-to-end, cluster checkpoints, chaos testing, continuous simulation soak |
+| 7 | Elasticity: online split/merge, worker drain, proactive scaling, hot-key virtual buckets |
+| 8 | Postgres wire protocol gateway, freshness tokens, subscribe API, `AS OF EPOCH` historical queries |
+| 9 | External connectors: Kafka, Postgres CDC, S3, Iceberg/Delta source; internal direct-write connector |
+| 10 | Auth (OIDC/mTLS/RBAC), secrets management, observability (Prometheus/OTEL), rolling upgrades |
+| 11 | 30-day 64-shard production soak and production beta handoff |
+| 12 | Cold-tier Iceberg v2 and Delta Lake sinks, native Iceberg REST catalog, Data Lake GA |
+
+## Crate Architecture
+
+The project is a Cargo workspace of purpose-built crates:
+
+| Crate | Purpose |
+|---|---|
+| `rockstream-types` | Shared types: timestamps, frontiers, Z-set rows, schemas |
+| `rockstream-storage` | SlateDB wrappers, key encoders, merge operator registry, checkpoint helpers |
+| `rockstream-plan` | `PlanNode` IR and physical `OpNode` graph |
+| `rockstream-diff` | `DiffCtx` differentiation pass — turns SQL plans into incremental delta plans |
+| `rockstream-ops` | `Operator` trait and per-operator implementations |
+| `rockstream-sql` | SQL frontend built on DataFusion |
+| `rockstream-runtime` | Worker process, circuit executor, async scheduler, exchange subsystem |
+| `rockstream-control` | Control-plane service (topology, shard leasing, placement) |
+| `rockstream-gateway` | Postgres wire protocol gateway and Iceberg REST catalog endpoint |
+| `rockstream-connectors` | Connector implementations: Kafka, Postgres CDC, S3, Iceberg, Delta Lake |
+| `rockstream-oracle` | Batch reference engine and property-test harness (DBSP soundness tests) |
+| `rockstream-sim` | Deterministic simulation harness: `SimRuntime`, `buggify!()`, fault model |
+| `rockstream-cli` | Operator CLI (`rockstream start`, `explain`, `audit`, `support bundle`) |
 ## How Do I Know It’s Working?
 
 The system exposes one primary health indicator per pipeline: **SLO compliance** —
