@@ -140,6 +140,17 @@ object storage.
 > RockStream's role as a freshness layer that feeds the data lake rather than
 > competing with columnar analytics tools on ad-hoc scans.
 >
+> **v3.17 adds catalog registration to the cold-tier sink** (§13.6.5): writing
+> Parquet files is not enough for tools that look up tables by name rather than
+> path. The `CREATE SINK` syntax gains a `catalog` option that governs whether
+> RockStream also calls an external catalog API after each snapshot commit:
+> `filesystem` (default — self-contained Iceberg metadata, no external service),
+> `glue` (AWS Glue Data Catalog), `rest` (any Iceberg REST catalog: Polaris,
+> Unity Catalog, Gravitino), `hive` (Hive Metastore via Thrift), and `ducklake`
+> (DuckLake catalog backed by a DuckDB/MotherDuck database). The catalog call is
+> step 6 of the snapshot lifecycle, idempotent, and failure-isolated — a catalog
+> API error degrades the sink to `CATALOG_WARN` state without blocking IVM.
+>
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
 >   itself (PlanIR, the differentiation pass, the per-operator rules, the
@@ -2241,11 +2252,18 @@ CREATE SINK orders_mv_iceberg
   FOR VIEW orders_mv
   TO ICEBERG 's3://bucket/views/orders_mv/iceberg_table'
   WITH (
-    snapshot_interval_epochs = 128,   -- write a new snapshot every N epochs
-    snapshot_interval_ms     = 300000, -- or every 5 min, whichever is first
+    snapshot_interval_epochs = 128,      -- write a new snapshot every N epochs
+    snapshot_interval_ms     = 300000,   -- or every 5 min, whichever is first
     parquet_row_group_bytes  = 134217728, -- 128 MB row groups
-    format_version           = 2,        -- Iceberg v2 (default)
-    partition_by             = ARRAY['region', 'date_trunc(''day'', created_at)']
+    format_version           = 2,         -- Iceberg v2 (default)
+    partition_by             = ARRAY['region', 'date_trunc(''day'', created_at)'],
+
+    -- Catalog registration (optional; default = 'filesystem')
+    catalog                  = 'rest',
+    catalog_endpoint         = 'https://polaris.example.com/api/catalog',
+    catalog_warehouse        = 'analytics',
+    catalog_namespace        = 'reporting',
+    catalog_table            = 'orders_mv'
   );
 ```
 
@@ -2255,7 +2273,12 @@ The sink can also be declared as a `DELTA` table:
 CREATE SINK orders_mv_delta
   FOR VIEW orders_mv
   TO DELTA 's3://bucket/views/orders_mv/delta_table'
-  WITH (snapshot_interval_epochs = 64);
+  WITH (
+    snapshot_interval_epochs = 64,
+    catalog                  = 'glue',
+    catalog_database         = 'analytics',
+    catalog_table            = 'orders_mv'
+  );
 ```
 
 Sinks are registered in the control-plane connector catalog and are visible
@@ -2278,7 +2301,9 @@ Epoch N committed
        ├─ 2. Write Iceberg manifest files referencing data files + column stats
        ├─ 3. Write manifest list (snapshot) file
        ├─ 4. Atomically commit new metadata.json pointer (Iceberg atomic swap)
-       └─ 5. Update connector offset in control plane: last_snapshot_epoch = N
+       ├─ 5. Update connector offset in control plane: last_snapshot_epoch = N
+       └─ 6. If catalog ≠ 'filesystem': call catalog API to register/update table
+              (idempotent; failure → CATALOG_WARN, does not block IVM)
 ```
 
 Steps 1–3 are idempotent (files are keyed by `{shard_id}-{epoch}`). Step 4
@@ -2329,6 +2354,48 @@ RockStream's primary value is **view freshness** — incremental updates at
 then makes that fresh data **accessible** to any tool in the data ecosystem
 without requiring those tools to integrate with RockStream's gateway. There
 is no tension between the two: they serve different queries.
+
+#### 13.6.5 Catalog Registration
+
+Writing Parquet files to a known S3 path is enough for tools that accept a
+path (`iceberg_scan('s3://...')`). Tools that look up tables **by name** from
+a central registry need a catalog API call after each snapshot commit.
+
+The `catalog` option in `CREATE SINK` selects the registration backend:
+
+| `catalog` value | Mechanism | Tools that benefit |
+|---|---|---|
+| `filesystem` (default) | Self-contained `metadata.json` in the object store prefix. No external service. | DuckDB `iceberg_scan`, Snowflake external table by path |
+| `glue` | AWS Glue Data Catalog API — creates/updates the table in the specified Glue database. Credentials from the node's IAM role or `catalog_credentials` secret. | Athena, Redshift Spectrum, Glue ETL, any tool using Glue as Hive Metastore |
+| `rest` | Iceberg REST Catalog spec (`POST /namespaces/{ns}/tables` / `POST /namespaces/{ns}/tables/{table}/snapshots`). Compatible with Polaris, Apache Gravitino, Unity Catalog, Nessie, and any spec-compliant REST catalog. | Spark, Flink, Trino, DuckDB with `iceberg` extension catalog config |
+| `hive` | Hive Metastore Thrift API — `AlterTable` on each snapshot commit. | Spark (legacy), Hive, Presto |
+| `ducklake` | DuckLake catalog API — registers or updates the Iceberg table entry in the DuckLake metadata database (DuckDB / MotherDuck). Each snapshot commit appends a new entry to the DuckLake snapshot log. | DuckDB with DuckLake extension, MotherDuck |
+
+**Failure isolation.** The catalog API call (step 6) happens *after* the
+Iceberg metadata commit (step 4) is durable. A catalog API failure does not
+block IVM or the next epoch. The sink transitions to `CATALOG_WARN` state,
+visible via `rockstream.connectors`, and retries the catalog call on the next
+successful snapshot flush. The data is always readable by path even if the
+catalog registration is temporarily behind.
+
+**Credential management.** Catalog credentials (`catalog_credentials`) are
+stored as a named secret in the control-plane catalog (`catalog/secrets/`),
+never in plain text in the `CREATE SINK` statement. Credentials are encrypted
+at rest using the cluster's key material (§14.x) and injected into the sink
+process at runtime.
+
+**DuckLake detail.** DuckLake differs from other catalogs in that it stores
+both table metadata *and* Iceberg snapshot history in a DuckDB database (local
+file or MotherDuck cloud). RockStream's DuckLake backend calls the DuckLake
+catalog API to append a new snapshot entry after each flush. The Parquet data
+files remain on S3; the DuckLake database holds only metadata. This means:
+
+```sql
+-- After RockStream registers the table in DuckLake:
+LOAD ducklake;
+ATTACH 'md:analytics' AS dl;      -- or a local .duckdb file
+SELECT * FROM dl.reporting.orders_mv;   -- table discovered by name, not path
+```
 
 ---
 
