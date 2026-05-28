@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::path::Path;
 use tracing_subscriber::EnvFilter;
 
 /// RockStream: Massively-parallel incremental view maintenance on SlateDB.
@@ -38,7 +39,45 @@ fn main() {
     match cli.command {
         Some(Command::Start { storage, role }) => {
             tracing::info!(storage = %storage, role = %role, "starting rockstream");
-            println!("RockStream starting with storage={storage}, role={role}");
+
+            let storage_path = Path::new(&storage);
+            std::fs::create_dir_all(storage_path).expect("failed to create storage directory");
+
+            // Audit: server started
+            let audit_path = storage_path.join("audit.jsonl");
+            let audit_log = rockstream_control::audit::FileAuditLog::open(&audit_path)
+                .expect("failed to open audit log");
+            let event = rockstream_control::audit::AuditEvent::now(
+                "system",
+                "server.started",
+                "rockstream",
+            )
+            .with_detail(format!("storage={storage}, role={role}"));
+            audit_log
+                .append(&event)
+                .expect("failed to write audit event");
+
+            // Run no-op pipeline
+            let result = rockstream_runtime::pipeline::run_noop_pipeline(storage_path);
+            tracing::info!(epochs = result.epochs_completed, "pipeline completed");
+
+            // Create support bundle
+            let bundle_path =
+                rockstream_runtime::support_bundle::create_support_bundle(storage_path)
+                    .expect("failed to create support bundle");
+            tracing::info!(path = %bundle_path.display(), "support bundle written");
+
+            // Audit: server stopped
+            let event = rockstream_control::audit::AuditEvent::now(
+                "system",
+                "server.stopped",
+                "rockstream",
+            );
+            audit_log
+                .append(&event)
+                .expect("failed to write audit event");
+
+            println!("RockStream completed: {result:?}");
         }
         Some(Command::Version) => {
             println!("rockstream {}", env!("CARGO_PKG_VERSION"));

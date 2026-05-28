@@ -3,6 +3,9 @@
 //! Contains the per-worker runtime: operator scheduling, epoch coordination,
 //! and shuffle/exchange paths.
 
+pub mod pipeline;
+pub mod support_bundle;
+
 #[cfg(test)]
 mod tests {
     #[test]

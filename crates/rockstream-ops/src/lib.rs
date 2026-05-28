@@ -3,6 +3,9 @@
 //! Each IVM operator (filter, project, aggregate, join, etc.) implements
 //! the `Operator` trait defined here.
 
+pub mod noop;
+pub mod operator;
+
 #[cfg(test)]
 mod tests {
     #[test]

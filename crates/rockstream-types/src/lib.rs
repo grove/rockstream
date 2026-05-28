@@ -3,6 +3,8 @@
 //! This crate defines core types used across the RockStream system:
 //! timestamps, frontiers, Z-set rows, and schema definitions.
 
+pub mod error_code;
+
 /// Placeholder module for timestamp types.
 pub mod timestamp {
     /// A logical epoch number.
