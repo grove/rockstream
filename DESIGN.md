@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.12. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.14. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -112,6 +112,14 @@ object storage.
 > amplification (§7.5); exact hierarchical frontier summaries for very large
 > clusters (§8.6); and concrete hot-key virtual buckets for skewed joins and
 > aggregates (§10.5).
+>
+> **v3.14 adds temporal queries, system introspection, and read-path caching**:
+> historical view queries via `AS OF EPOCH <n>` / `AS OF TIMESTAMP <t>`
+> bounded by the view's retention window (§12.4.1); the `rockstream` system
+> schema exposing epoch history, pipeline state, schema evolution, and the
+> audit log as queryable SQL tables (§12.6.1); and a per-worker arrangement
+> segment cache that exploits SST immutability between checkpoints to reduce
+> cross-shard read latency for joins and gateway queries (§5.4).
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -647,6 +655,26 @@ things to discover at runtime:
 - **`DbReader` is the cross-worker read path.** Joins and lookups that read
   state owned by another shard use `DbReader` pinned to a published
   checkpoint, never an undefined "live" read.
+- **Arrangement segment cache.** `DbReader` lookups for join operators and
+  cross-shard view queries pay object-store latency on every segment miss.
+  Because arrangement SST segments are immutable between the checkpoint at
+  which they were created and the compaction that rewrites them, they are safe
+  to cache with zero coordination. Each worker maintains a per-process LRU
+  **arrangement segment cache** keyed by `(shard_id, segment_id)`:
+  - Bounded by `segment_cache_bytes` (default: 512 MB per worker, tunable per
+    pipeline via the auto-tuner or manual override).
+  - Populated on `DbReader` segment fetches; evicted LRU.
+  - Invalidated on compaction: when a shard's manifest advances and a segment
+    is no longer referenced, the cache entry is dropped. Manifest-poll already
+    runs at `manifest_poll_interval`; invalidation piggybacks on that signal.
+  - Shared across all `DbReader` handles on the same worker, regardless of
+    which shard or pipeline they serve.
+  - Reported as `segment_cache_hit_ratio` and `segment_cache_bytes_used` in
+    the metrics reference (§14.15).
+  For hot join arrangements whose working set fits in cache, this reduces
+  cross-shard read latency from object-store round-trip (10–100 ms) to
+  in-process memory access (µs). The cache is especially effective for
+  skewed joins where a small set of keys dominates lookups.
 - **Tombstone accumulation is bounded.** Z-set retractions produce LSM
   tombstones. For high-churn views (frequent inserts + deletes on the same
   key), tombstones accumulate faster than background compaction can clear
@@ -1602,13 +1630,14 @@ if all workers start simultaneously.
 
 ## 12. Query Serving
 
-### 12.1 Three Query Modes
+### 12.1 Four Query Modes
 
 | Mode | Mechanism | Latency |
 |---|---|---|
 | **Materialized view lookup** | `DbReader` on the shard holding the view-output partition | µs–ms |
 | **Materialized view range scan** | `scan()` on the relevant shard(s); merge results on the gateway | ms |
 | **Ad-hoc SQL over views** | DataFusion query executes against a `Snapshot` of materialized views (no incremental engine involvement) | ms–s |
+| **Historical view query** | Resolve epoch or timestamp to a checkpoint manifest; open `DbReader` at that snapshot across all relevant shards | ms–s (warm cache), s (cold) |
 
 ### 12.2 Query Gateway
 
@@ -1675,6 +1704,46 @@ timeout expires. The query result then explicitly says whether the token was
 satisfied. This gives application developers a simple contract without
 exposing antichains in the default path.
 
+### 12.4.1 Historical Queries (`AS OF`)
+
+Any query against a materialized view can be qualified with a temporal clause
+to read a past state of the view:
+
+```sql
+SELECT * FROM orders_mv AS OF EPOCH 4201;
+SELECT * FROM orders_mv AS OF TIMESTAMP '2026-01-15T09:00:00Z';
+```
+
+**Resolution.** The gateway resolves the requested point to the nearest
+committed cluster checkpoint:
+
+- `AS OF EPOCH <n>`: look up `control: checkpoints/` for the checkpoint whose
+  committed epoch frontier dominates epoch `n` on all relevant shards.
+- `AS OF TIMESTAMP <t>`: look up the checkpoint whose commit wall-clock time
+  is the greatest value ≤ `t`.
+
+If no matching checkpoint exists (too old, or before the pipeline was created),
+the gateway returns `RS-2005 history.epoch_before_retention`.
+
+**Execution.** The gateway opens `DbReader` handles at the resolved checkpoint
+manifest rather than at the current frontier. Multi-shard scans pin all handles
+to the same historical checkpoint vector, preserving causal consistency at the
+past point. The query then proceeds identically to a live range scan or ad-hoc
+SQL query.
+
+**Retention boundary.** Historical queries are bounded by the view's retention
+policy (§5.7). Data beyond the retention window is removed by compaction
+filters and is unavailable regardless of whether the checkpoint manifest still
+exists. Checkpoint manifests themselves are garbage-collected by the cluster
+checkpoint GC (§11.3) according to a configurable
+`checkpoint_retention_count` (default: 128 checkpoints) and
+`checkpoint_retention_duration` (default: equal to the view's retention or 7
+days, whichever is shorter).
+
+**Interaction with freshness tokens.** `AS OF` and `wait_for=<token>` are
+mutually exclusive on the same query. `AS OF` reads a past snapshot;
+`wait_for` waits for the frontier to advance to a future point.
+
 ### 12.5 Authentication and Authorization
 
 All external interfaces (SQL port, gRPC subscribe, REST/HTTP) enforce the same
@@ -1734,6 +1803,50 @@ streaming workloads.
 TABLE`, `ALTER TABLE`) is handled via `CREATE PIPELINE` / `CREATE VIEW`
 semantics. Write DML goes through the internal source connector (§13.5).
 Extensions, `COPY`, `LISTEN`/`NOTIFY`, and advisory locks are out of scope.
+
+### 12.6.1 The `rockstream` System Schema
+
+In addition to `pg_catalog` and `information_schema`, the gateway exposes a
+`rockstream` schema containing virtual tables materialized from the
+control-plane catalog and checkpoint index. These tables are read-only and
+require no additional storage — they project existing control-plane state
+through the standard SQL interface.
+
+| Table | Source | Purpose |
+|---|---|---|
+| `rockstream.epochs` | `control: checkpoints/` + `shard_meta/0x06` | Per-pipeline committed epoch history: epoch number, commit timestamp, frontier hash, shard count, row delta count. |
+| `rockstream.pipelines` | `control: catalog/pipeline` | Pipeline metadata, current state, SLO target, degraded reason if any. |
+| `rockstream.views` | `control: catalog/view` | View definitions, retention policy, arrangement count, state bytes. |
+| `rockstream.shards` | `control: topology/` | Shard placement, worker assignment, frontier position, state size. |
+| `rockstream.connectors` | `control: connector/` | Connector status, latest committed offset, lag. |
+| `rockstream.audit_log` | `control: audit/` | Recent audit events (bounded by a configurable window, default 7 days). |
+| `rockstream.schema_history` | `control: schema/` | Per-view schema version history: version, applied timestamp, actor, change summary. |
+
+Example queries:
+
+```sql
+-- Recent epoch history for a pipeline
+SELECT epoch_num, committed_at, row_delta_count, shard_count
+FROM   rockstream.epochs
+WHERE  pipeline_id = 'orders'
+ORDER  BY epoch_num DESC LIMIT 20;
+
+-- Schema evolution audit trail
+SELECT version, applied_at, actor, change_summary
+FROM   rockstream.schema_history
+WHERE  view_id = 'orders_mv'
+ORDER  BY version DESC;
+
+-- Current pipeline health at a glance
+SELECT pipeline_id, state, slo_compliance, degraded_reason
+FROM   rockstream.pipelines;
+```
+
+These tables are available in all runtime profiles. In `embedded` mode they
+query in-process state; in `distributed` mode they query the control-plane
+`DbReader`. Access is subject to the same RBAC rules as user views (§12.5):
+`viewer` can see metadata for views they have access to; `admin` can see all
+entries including the full audit log.
 
 **Positioning**: with the Postgres wire layer plus the internal source connector
 (§13.5), RockStream operates as a *streaming SQL platform with Postgres-compatible
@@ -2230,6 +2343,8 @@ RS-1001  connector.authentication_failed
 RS-1002  connector.schema_drift
 RS-2001  view.unsupported_sql_construct
 RS-2002  view.state_budget_exceeded
+RS-2003  isolation.serializable_not_supported
+RS-2005  history.epoch_before_retention
 RS-3001  shard.fence_lost
 RS-3002  shard.recovery_replay_failed
 RS-4001  control.quota_violation
@@ -2258,6 +2373,9 @@ Every shard, operator instance, and pipeline reports:
 - `checkpoint_age_seconds`, `checkpoint_duration_seconds`, `checkpoint_lag_ms` — recovery planning and checkpoint health.
 - `object_store_rps` — PUT+GET+LIST+DELETE per second per shard.
 - `autotune_decisions_total` — counter labeled by `(loop, direction)`.
+- `segment_cache_hit_ratio` — per-worker hit rate for the arrangement segment cache.
+- `segment_cache_bytes_used` — current memory consumption of the segment cache.
+- `historical_query_count` — counter of `AS OF` queries served, labeled by pipeline.
 
 Exported via Prometheus / OpenTelemetry. A starter Grafana dashboard ships
 in `deploy/dashboards/rockstream-overview.json` and contains exactly one

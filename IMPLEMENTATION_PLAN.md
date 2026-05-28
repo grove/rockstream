@@ -910,6 +910,26 @@ protocol. Make RockStream self-contained (no external broker required).
 - **Freshness tokens**: query responses return the vector frontier used;
   clients can pass `wait_for=<token>` for read-your-writes semantics with a
   timeout and explicit satisfied/not-satisfied response.
+- **Historical queries** (DESIGN.md §12.4.1):
+  - `AS OF EPOCH <n>` resolves to the nearest committed cluster checkpoint
+    whose frontier dominates epoch `n` on all relevant shards.
+  - `AS OF TIMESTAMP <t>` resolves to the checkpoint whose commit wall-clock
+    time is the greatest value ≤ `t`.
+  - Bounded by view retention (§5.7); queries beyond retention return
+    `RS-2005 history.epoch_before_retention`.
+  - Configurable `checkpoint_retention_count` (default 128) and
+    `checkpoint_retention_duration` (default min(view retention, 7d)) control
+    how far back historical queries can reach.
+- **`rockstream` system schema** (DESIGN.md §12.6.1): virtual tables
+  (`rockstream.epochs`, `rockstream.pipelines`, `rockstream.views`,
+  `rockstream.shards`, `rockstream.connectors`, `rockstream.audit_log`,
+  `rockstream.schema_history`) projecting control-plane state through the
+  standard SQL interface. No additional storage required.
+- **Arrangement segment cache** (DESIGN.md §5.4): per-worker LRU cache
+  keyed by `(shard_id, segment_id)`, bounded by `segment_cache_bytes`
+  (default 512 MB). Populated on `DbReader` segment fetches for join lookups
+  and gateway reads; invalidated on compaction via manifest-poll. Reported
+  as `segment_cache_hit_ratio` and `segment_cache_bytes_used` metrics.
 - **Authentication / authorization**: OIDC / bearer-token auth at the gateway;
   per-view RBAC with `viewer` / `pipeline_owner` / `admin` roles stored in the
   control-plane catalog (DESIGN.md §12.5). `rockstream login` CLI flow for
@@ -929,6 +949,12 @@ protocol. Make RockStream self-contained (no external broker required).
 - SQLAlchemy ORM reflects view schema without errors.
 - Subscribe stream survives gateway restart with no data loss.
 - `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` returns `RS-2003`.
+- `SELECT * FROM orders_mv AS OF EPOCH <past>` returns the correct historical
+  snapshot; queries beyond retention return `RS-2005`.
+- `SELECT * FROM rockstream.epochs WHERE pipeline_id = 'orders'` returns
+  committed epoch history without additional storage writes.
+- Segment cache hit ratio > 80% for a hot-join benchmark with a working set
+  that fits within `segment_cache_bytes`.
 
 ---
 

@@ -845,6 +845,9 @@ arrangements because their retractions require reading sibling entries.
 - Range scan: same pattern.
 - Cross-shard lookup is forbidden in the hot path; if needed, the operator
   must be preceded by an Exchange so the data is co-located.
+- Query gateways and `DbReader`-based join lookups from other workers benefit
+  from the per-worker arrangement segment cache (DESIGN.md §5.4) which
+  exploits segment immutability between checkpoints.
 
 ### 9.5 Segments, Retention, and Cleanup
 
