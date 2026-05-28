@@ -54,6 +54,9 @@ complete:
 - Any new public surface is documented in the relevant doc or CLI help.
 - Any new distributed coordination path has at least one seeded `SimRuntime`
   test before it is considered done.
+- Any new queue, buffer, or scan window has a named upper bound, a metric
+  reporting current fill level, and a backpressure or error path when the
+  bound is reached. Unbounded in-memory accumulation is never acceptable.
 - Main remains runnable through the single `rockstream` binary.
 
 Long soaks are gates, not loopholes. If a version needs a 24-hour or 30-day run,
@@ -143,7 +146,7 @@ without that proof, the version is not done.
 | v0.33 | Distributed recursion and skew stress | Exchange inside recursive scopes, inner frontier convergence, skewed inputs, per-shard recompute fallback. | Sharded 10M-edge reachability benchmark converges; stalled inner frontier surfaces a named error. |
 | v0.34 | Cluster checkpoints | Barrier injection, bounded alignment buffers, per-shard checkpoint creation, atomic cluster checkpoint commit, old checkpoint GC. | Checkpoint under slow input and credit exhaustion never grows unbounded and either succeeds or reports `RECOVERING`. |
 | v0.35 | Recovery driver and SLO metrics | Recovery from cluster checkpoint, shard reassignment, failure detection, recovery histograms, `RECOVERING_SLOW`, worker self-fencing on control-plane partition (DESIGN.md §11.6), staggered restart / lease-grant rate limit to prevent thundering herd (DESIGN.md §11.8). | At target shard size: failure detection <=5s, shard reassignment <=30s, pipeline freshness recovery <=60s in chaos runs; 32-worker simultaneous restart triggers no false failure detections. |
-| v0.36 | Exactly-once and chaos alpha | 2PC sink protocol, Kafka/S3/Postgres sink stubs, simulation suite for epoch/frontier/checkpoint/2PC interleavings, liveness checks tied to recovery SLOs, object store brownout handling (DESIGN.md §11.7), wire protocol version skew contract (DESIGN.md §5.5). | >=100k simulation seeds pass; every recoverable injected fault either commits a new epoch within the 5s/30s/60s budgets or surfaces a named degraded state; a 24-hour 32-shard chaos run has zero data loss and zero duplicates; 60-second object-store blackout test recovers cleanly. |
+| v0.36 | Exactly-once and chaos alpha | 2PC sink protocol, Kafka/S3/Postgres sink stubs, simulation suite for epoch/frontier/checkpoint/2PC interleavings, liveness checks tied to recovery SLOs, object store brownout handling (DESIGN.md §11.7), wire protocol version skew contract (DESIGN.md §5.5). **Continuous simulation soak infrastructure**: scheduled CI job that runs new seeded `SimRuntime` executions against `main` around the clock from this version onward; failing seeds are minimized, stored as regression seeds, and block release. | >=100k simulation seeds pass; every recoverable injected fault either commits a new epoch within the 5s/30s/60s budgets or surfaces a named degraded state; a 24-hour 32-shard chaos run has zero data loss and zero duplicates; 60-second object-store blackout test recovers cleanly; **continuous soak CI job is running and has produced its first regression-seed corpus**. |
 
 ### Elasticity, Gateway, and Connectors
 
@@ -167,7 +170,7 @@ without that proof, the version is not done.
 | v0.47 | Observability and admin surface | Prometheus metrics, OTEL traces, JSON logs, admin CLI, support bundle completeness, dashboard template, `rockstream debug arrangement` IVM debugger (DESIGN.md §14.7.1), tombstone density metric and proactive compaction trigger (DESIGN.md §5.4). | Operator can diagnose a slow pipeline from SLO compliance -> degraded reason -> explain -> support bundle; can inspect a specific arrangement key without stopping the pipeline. |
 | v0.48 | Auto-tuner hardening | Adaptive parallelism, epoch sizing, source throttle, hysteresis, stability tests, override docs. | Random workload property tests converge without oscillation; every tuning action is audit logged. |
 | v0.49 | Upgrades, migration, and security review | Storage format gate, rolling upgrade test, migration skeleton, disaster recovery drill, independent security review. | N -> N+1 rolling upgrade loses no epoch; incompatible format fails safely with `RS-5001`; security review issues are triaged. |
-| v0.50 | Long production soak | 30-day 64-shard soak, 1,000-shard control/exchange stress, Nexmark/TPC-H continuous, chaos automation, continuous simulation soak on `main`, release-blocking defect burn-down. | 99.99% availability target met or miss is understood and fixed; no correctness divergence; large-cluster stress stays within exchange and frontier budgets; all historical failing simulator seeds replay in CI. |
+| v0.50 | Long production soak | 30-day 64-shard soak, 1,000-shard control/exchange stress, Nexmark/TPC-H continuous, chaos automation, continuous simulation soak scaled to millions of seeds (infrastructure started at v0.36), release-blocking defect burn-down. | 99.99% availability target met or miss is understood and fixed; no correctness divergence; large-cluster stress stays within exchange and frontier budgets; all historical failing simulator seeds replay in CI. |
 | v0.51 | Production beta handoff | Helm/Terraform packaging, deployment playbooks, SQL reference, connector guide, operator guide, reference architecture. | First pilot workload runs with support agreement, documented runbook, rollback plan, and known limitations. |
 
 ### Cold Tier & Data Lake Integration

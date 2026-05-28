@@ -765,6 +765,14 @@ production-ready.
 - **Simulation seeds**: ≥ 100k seeded `SimRuntime` runs across the
   coordination suite pass cleanly; any failing seed is checked in as a
   regression test.
+- **Continuous simulation soak infrastructure starts here**: a scheduled CI
+  job runs new seeded `SimRuntime` executions against `main` around the
+  clock from v0.36 onward. Failing seeds are minimized using the standard
+  seed-bisection tool, stored as regression seeds in the repository, and
+  block release until either fixed or explicitly accepted with a documented
+  limitation. The soak starts small (hundreds of seeds/night) and scales
+  to millions of seeds/night by v0.50. The CI job is the evidence that the
+  FoundationDB simulation discipline is active, not aspirational.
 - Routine worker restart surfaces `RECOVERING` with `recovery_progress` and
   suppresses false SLO alerts until `recovery_deadline`; missed deadlines alert.
 
