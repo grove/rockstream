@@ -121,6 +121,28 @@ to replace Postgres for high-concurrency transactional workloads; it sits in the
 tier as streaming-SQL systems like Materialize and RisingWave, with the convenience
 of being reachable through standard Postgres tooling.
 
+SQL also supports standard `CREATE VIEW` — a **inline view** stored as a reusable
+query fragment in the catalog and expanded at compile time. Inline views carry no
+IVM overhead, no arrangement shards, and no `view_output/` storage. They are the
+right tool for ad-hoc query composition and as building blocks inside a `CREATE
+MATERIALIZED VIEW`.
+
+### Algebraic Aggregates and CRDTs
+
+RockStream treats aggregation as an algebraic contract. Every operator node in a
+query plan carries either a registered **merge law** — a named, versioned algebraic
+rule (SUM, COUNT, AVG, or a user-defined CRDT) verified for associativity and
+commutativity — or an explicit machine-readable reason why it cannot.
+
+When a merge law is in effect, RockStream can apply partial aggregates directly in
+storage without a read-modify-write cycle, push combining steps to the producer
+side of a network shuffle, and prune compaction safely. Starting at v0.43, you can
+define your own **CRDT column types** — counters, sets, last-write-wins registers —
+that merge correctly across concurrent writes by construction.
+
+`EXPLAIN INCREMENTAL` always shows the law name, or the exact reason it is absent,
+for every node in your plan.
+
 ### Self-Healing
 
 RockStream keeps itself in good shape without operator intervention:
@@ -189,10 +211,12 @@ RockStream brings these ideas to an open, cloud-native storage foundation.
 | **Frontier** | A marker that says "no future change before this point is expected"; this is the distributed version of a watermark |
 | **Checkpoint** | A saved snapshot of progress so the system can recover after a crash |
 | **CDC** | Change Data Capture — streaming the changes out to other systems |
+| **Inline view** | A reusable query fragment stored in the catalog; expands at compile time — no IVM overhead, no operator state, no arrangement storage |
+| **Merge law** | A named algebraic rule (e.g. SUM, a CRDT) that the system can apply safely without a read-modify-write cycle; every operator carries one, or an explicit reason it does not |
 
 ## Status
 
-This project is in the **design phase** (current revision: **v3.20**). Four
+This project is in the **design phase** (current revision: **v3.24**). Four
 documents describe the system in progressively more detail:
 
 | Document | Audience | What it covers |
@@ -224,7 +248,7 @@ Each roadmap version is sized at roughly **10 person-weeks** of implementation e
 | Phase | Focus |
 |---|---|
 | 0 | Repository, deterministic simulator (`SimRuntime` + `buggify!()`), SlateDB storage contract, no-op pipeline |
-| 1 | Single-shard IVM core: filter, project, map, algebraic aggregates (SUM/COUNT/AVG), MIN/MAX |
+| 1 | Single-shard IVM core: filter, project, map, algebraic aggregates (SUM/COUNT/AVG), MIN/MAX; foundational `MergeLaw` / `LawBundle` contract |
 | 2 | DataFusion SQL frontend, inner and outer joins, set operations, `EXPLAIN INCREMENTAL` |
 | 3 | Advanced operators: window functions, time windows with event-time frontiers, recursion, view-on-view DAG |
 | 3.5 | IVM correctness soak: TPC-H 22/22, Nexmark subset, query fuzzer |
@@ -232,7 +256,7 @@ Each roadmap version is sized at roughly **10 person-weeks** of implementation e
 | 5 | Frontier protocol, frontier aggregator, shuffle GC |
 | 6 | Fault tolerance, exactly-once end-to-end, cluster checkpoints, chaos testing, continuous simulation soak |
 | 7 | Elasticity: online split/merge, worker drain, proactive scaling, hot-key virtual buckets |
-| 8 | Postgres wire protocol gateway, freshness tokens, subscribe API, `AS OF EPOCH` historical queries |
+| 8 | Postgres wire protocol gateway, inline views, freshness tokens, subscribe API, `AS OF EPOCH` historical queries, HTAP session controls (max-staleness, shard column statistics) |
 | 9 | External connectors: Kafka, Postgres CDC, S3, Iceberg/Delta source; internal direct-write connector |
 | 10 | Auth (OIDC/mTLS/RBAC), secrets management, observability (Prometheus/OTEL), rolling upgrades |
 | 11 | 30-day 64-shard production soak and production beta handoff |
