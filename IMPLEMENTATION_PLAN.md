@@ -134,6 +134,10 @@ hard-coded plans only; the SQL parser comes in Phase 2.
   as tokio tasks driven by data arrival and frontier updates, with credit-based
   backpressure. No `OwnershipConflict`-style rejection of multi-consumer
   streams.
+- **Embedded runtime profile**: `rockstream start --role=all --storage=./data`
+  wires control, worker, frontier, and gateway services in-process. The
+  single-shard hot path must not issue gRPC calls or create shuffle objects;
+  `EXPLAIN INCREMENTAL` reports any elided exchange boundaries.
 - Source connector that feeds a `Vec<RecordBatch>` as delta batches with
   `_weight: i64` column convention.
 - Property test: `SELECT a, b * 2 AS c FROM t WHERE c > 10` against random
@@ -174,6 +178,9 @@ hard-coded plans only; the SQL parser comes in Phase 2.
   output bit-identical to an uninterrupted run.
 - Group-commit benchmark: shard-level batching must reduce durability events
   by at least 5x compared with one commit per operator at the same epoch rate.
+- Embedded freshness benchmark records p50/p95 commit-to-query visibility for
+  1, 10, and 1000 rows/epoch; the run must show zero gRPC shuffle calls and
+  zero durable shuffle objects.
 - Oracle property test runs green for ≥ 100k randomized scenarios per
   operator combination.
 
@@ -538,8 +545,16 @@ production-ready.
     (two writers can't commit to the same shard).
 - **Exchange subsystem** (`rockstream-runtime::exchange`):
   - gRPC service for direct shuffle (`proto/shuffle.proto`).
+  - Exchange path classifier from DESIGN.md §7.5: `elided`, `loopback`,
+    `direct`, and `durable`.
   - Worker-to-worker connection pooling/multiplexing: one stream per peer
     worker per traffic class, with shard/exchange IDs in the frame header.
+  - Same-worker loopback path using bounded in-process channels while keeping
+    durable outbox/inbox metadata for replay.
+  - Pre-shuffle combiner for compiler-certified associative payloads, including
+    Z-set weight cancellation and partial SUM/COUNT/AVG aggregation.
+  - Hierarchical exchange domains controlled by `exchange_domain_size` for
+    large worker counts.
   - Object-store fallback writer & reader.
   - Coalesced durable shuffle objects: one object may contain many shard-to-
     shard frames plus an index footer. Receivers never LIST the shuffle prefix
@@ -553,6 +568,9 @@ production-ready.
   re-balance minimality.
 - **Distribution-aware execution**:
   - Operator instances are addressable by `(op_id, instance_idx)`.
+  - Placement is locality-aware: compatible adjacent operators should be
+    co-located when the cost model predicts serialization/network cost exceeds
+    the benefit of wider parallelism.
   - The scheduler on each worker runs only the `OperatorTask`s (IVM.md §8.2)
     whose `instance_idx` is assigned to its shards.
   - Exchange operators serialize Arrow batches keyed by destination shard
@@ -576,12 +594,17 @@ production-ready.
 - 16-shard cluster (single host, 16 processes) runs TPC-H with near-linear
   throughput vs. single shard for partitionable queries, with documented skew
   and shuffle limits.
+- Same-worker loopback path produces bit-identical output to direct gRPC and
+  shows zero worker-to-worker network calls for co-located exchanges.
+- Pre-shuffle combiner benchmark documents bytes avoided for partitioned
+  aggregate workloads and proves no row-preserving operator is combined unless
+  explicitly certified.
 - Killing one worker process causes its shards to be re-leased to another
   worker; processing continues without data loss (verified by output equality
   vs. uninterrupted run).
 - Connection count is bounded by worker count, not shard count; a 1,000-shard
-  exchange stress test must stay within configured connection and durable
-  shuffle-object budgets.
+  exchange stress test with hierarchical domains must stay within configured
+  connection and durable shuffle-object budgets.
 
 **→ Operability deliverables (Phase 4)**
 
@@ -607,9 +630,10 @@ production-ready.
   product-order timestamps. Property tests for meet/join/advance.
 - **Per-shard frontier reporter**: bundled in every epoch commit
   (`shard_meta/0x06 0xFR`).
-- **Control-plane frontier aggregator**: subscribes to all shards' `WalReader`
-  feeds, computes per-operator cluster frontier, publishes to
-  `frontier/op_id` in the control DB.
+- **Control-plane frontier aggregator**: consumes worker-level frontier
+  summaries from DESIGN.md §8.6, computes per-operator cluster frontier,
+  publishes to `frontier/op_id` in the control DB, and can rebuild summaries
+  from per-shard `shard_meta/0x06 0xFR` after worker loss.
 - **Operator frontier consumers**: each operator reads its input frontier from
   the control plane (cached, push-updated via gRPC subscription), and uses it
   to:
@@ -627,6 +651,8 @@ production-ready.
 - Recursive query converges deterministically; frontier advances past
   iteration timestamps after convergence.
 - Shuffle storage usage is bounded under sustained throughput.
+- Frontier aggregation stress test covers thousands of shards × hundreds of
+  operators without the control plane subscribing to each shard feed directly.
 
 **→ Operability deliverables (Phase 5)**
 
@@ -944,7 +970,7 @@ protocol. Make RockStream self-contained (no external broker required).
   deterministic seeds against `main` around the clock. Failures are minimized,
   stored as regression seeds, and block release until either fixed or explicitly
   accepted with a documented limitation.
-- **Frontier aggregator deployment** (DESIGN.md §3.1): document and ship
+- **Frontier aggregator deployment** (DESIGN.md §3.2): document and ship
   the `rockstream start --role=frontier` deployment topology for Tier 3.
   Frontier-role processes are stateless and horizontally scalable; the
   Raft control group remains 3–5 nodes regardless of cluster shard count.

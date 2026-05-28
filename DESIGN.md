@@ -105,6 +105,14 @@ object storage.
 > compaction (§5.4); cross-shard partial aggregation pushdown (§12.3.1); and
 > the `debug arrangement` IVM debugger (§14.7.1).
 >
+> **v3.13 adds performance elasticity across the workload range**: an
+> embedded/local runtime profile that elides distributed boundaries for tiny
+> workloads (§3.1); exchange elision, same-worker loopback, pre-shuffle
+> combiners, and hierarchical exchange for lower latency and lower network
+> amplification (§7.5); exact hierarchical frontier summaries for very large
+> clusters (§8.6); and concrete hot-key virtual buckets for skewed joins and
+> aggregates (§10.5).
+>
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
 >   itself (PlanIR, the differentiation pass, the per-operator rules, the
@@ -158,6 +166,7 @@ object storage.
 | P14 | **Async scheduling.** | Operators are long-lived async tasks. There is no synchronous global scheduler tick and no per-stream ownership checker. Backpressure flows via credits; progress flows via frontiers. |
 | P15 | **Bounded staleness for cross-shard reads.** | Query gateways pin to a published cluster frontier (a vector of per-shard checkpoints) rather than to wall-clock "fresh"; the staleness budget is documented and observable. |
 | P16 | **Operability is a first-class system property.** | The system is SLO-driven (operators state intent; the control plane chooses mechanism), self-tuning by default, deployable as a single binary, observable by construction, and unable to surprise its operator: every degradation has a named reason, every control action is auditable, and every pipeline runs inside enforced quotas. One number (frontier lag against the SLO) answers "is it healthy?"; everything else is a drill-down. |
+| P17 | **Scale down before scaling out.** | A one-shard local pipeline must avoid distributed overhead; a thousand-shard pipeline must avoid all-to-all amplification. Placement, exchange, and frontier aggregation optimize for locality first, then parallelism. |
 
 ### 1.1 Non-Goals (Explicit)
 
@@ -312,6 +321,25 @@ synchronous barrier.
    Object storage holds *all* durable state. Workers and the control plane have
    no local persistent state (modulo a small write-through cache).
 
+### 3.1 Runtime Profiles: Tiny to Massive
+
+Storage profile (§5.6) controls durability/cost assumptions; **runtime
+profile** controls how much distributed machinery is actually in the hot path.
+The same binary supports three runtime profiles:
+
+| Runtime profile | Typical shape | Hot-path behavior |
+|---|---|---|
+| `embedded` | One process, one shard, local filesystem | Control plane, frontier aggregator, worker, and gateway are in-process services. Exchange nodes whose input/output partitioning is unchanged are elided, and gateway reads use local `DbReader` handles. |
+| `single_worker` | One process or host, many shards | Shards still provide parallelism, but worker-to-worker gRPC is replaced by same-process channels or same-worker loopback. Durable outbox/inbox metadata remains in SlateDB for replay. |
+| `distributed` | Many workers, object storage | Full placement, direct shuffle, durable fallback, hierarchical frontier aggregation, and autoscaling are enabled. |
+
+`rockstream start --role=all --storage=./data` defaults to `embedded`. A
+pipeline can move from `embedded` to `single_worker` to `distributed` by
+changing placement and shard maps; the logical plan and persisted state format
+do not change. The control plane records the active runtime profile per
+pipeline, and `EXPLAIN INCREMENTAL` shows which exchanges were elided, looped
+back, or sent over the network.
+
 ### Why Shards (and not "one SlateDB")
 
 SlateDB is single-writer per database. To exceed one writer's throughput we run
@@ -349,7 +377,7 @@ before being admitted into `topology/worker/`.
 
 ---
 
-### 3.1 Frontier Aggregator as a Separable Process
+### 3.2 Frontier Aggregator as a Separable Process
 
 In Tier 3, the control-plane Raft group owns the *authoritative* shard map,
 schema catalog, and pipeline lifecycle decisions. It does **not** need to be on
@@ -959,6 +987,36 @@ Arrow gives us:
 - IPC format that doubles as the wire and on-disk format.
 - Native interop with DataFusion expression evaluation.
 
+### 7.5 Exchange Fast Paths and Combiners
+
+The best shuffle is the one the compiler can prove is unnecessary. During
+physical planning, every exchange is classified as one of four paths:
+
+| Path | Used when | Effect |
+|---|---|---|
+| **Elided** | Upstream and downstream partitioning are identical and the operator instances are co-located on the same shard. | No serialization, no outbox, no inbox; the shard-level coordinator passes `EpochOutput` fragments directly to the downstream task before the next commit. |
+| **Loopback** | Source and target shards are owned by the same worker. | Uses an in-process bounded channel instead of gRPC; durable outbox/inbox keys are still written so replay is identical to the distributed path. |
+| **Direct** | Different live workers, batch below the durable threshold. | Existing gRPC fast path. |
+| **Durable** | Receiver unavailable, batch too large, or recovery path. | Existing coalesced object-store payload. |
+
+For associative operators, the exchange can insert a **pre-shuffle combiner**
+on the sender side. The combiner groups deltas by `(target_shard, key)` within
+an epoch, cancels equal-and-opposite Z-set weights, and emits one compact batch
+per target shard. This is legal only for algebraically safe fragments:
+`SUM`, `COUNT`, `AVG` partials, duplicate-weight cancellation, and other
+compiler-certified associative/commutative payloads. Joins, Top-K, windows,
+and non-invertible aggregates use the normal row-preserving path unless the
+operator has an explicit partial-state encoding.
+
+For very large clusters, direct exchange switches to a **hierarchical exchange**
+when worker fan-out crosses the configured `exchange_domain_size` (default
+64 workers). Workers are grouped into exchange domains. Sender-side combiners
+first reduce traffic inside the local domain, domain routers forward coalesced
+Arrow batches across domains, and the destination domain fans into target
+workers. The hierarchy is a transport optimization only: every frame still
+carries `(exchange_id, src_shard, target_shard, epoch, seq)`, and replay uses
+the same outbox/inbox idempotency keys.
+
 ---
 
 ## 8. Frontier Protocol & Progress Tracking
@@ -1066,6 +1124,26 @@ does not currently expose range deletion, cleanup is implemented as bounded
 prefix scan + batched deletes, with a frontier-aware compaction-filter fallback
 for very old retained data. This is exact in semantics; it is not implemented
 by a single range-delete API call.
+
+### 8.6 Hierarchical Frontier Summaries
+
+At small scale, frontier aggregation is in-process and nearly free. At very
+large scale, the frontier role must not subscribe to `shards × operators`
+updates one by one. The meet operation is associative, so RockStream aggregates
+frontiers hierarchically without changing semantics:
+
+1. Each shard persists its exact frontier in `shard_meta/0x06 0xFR` as before.
+2. Each worker computes a worker-local meet for the shards it owns and sends
+    one compact `WorkerFrontierSummary` per `(pipeline, operator, output_port)`
+    per `frontier_agg_interval`.
+3. Frontier-role processes compute the cluster meet from worker summaries.
+4. In clusters with multiple frontier roles, one elected publisher writes the
+  committed frontier to control SlateDB; followers serve cached reads.
+
+This keeps control-plane traffic proportional to active workers and active
+operators per interval rather than raw shard count. The persisted per-shard
+frontiers remain the recovery source of truth, so losing a worker summary only
+delays publication by one aggregation interval.
 
 ---
 
@@ -1224,9 +1302,31 @@ compiler picks parallelism per operator based on:
 - Available cluster capacity.
 - Historical execution statistics (collected via the observability stack).
 
+Placement is locality-aware. If two adjacent operators have compatible
+partitioning, the placement solver tries to co-locate their instances on the
+same shard or worker so §7.5 can elide or loop back the exchange. It is allowed
+to prefer locality over maximum parallelism when the SLO model predicts that
+serialization and network cost dominate CPU.
+
 Adaptive re-planning: if an operator's metrics show skew, the control plane can
 re-shard that operator's state online while the rest of the pipeline keeps
-running.
+running. For hot keys, re-sharding the whole operator is not enough, because
+one logical key may still dominate one shard. RockStream therefore supports
+**hot-key virtual buckets**:
+
+1. Detect a key whose per-epoch CPU, bytes, or state writes exceed the
+   `hot_key_factor` threshold over the median shard.
+2. Split that logical key into `B` virtual buckets by salting with a stable
+   hash of row identity or source partition.
+3. Maintain partial state per `(logical_key, bucket)`.
+4. Add a final unsalted combiner that merges the `B` partials before emitting
+    view output.
+
+For algebraic aggregates this is exact partial aggregation. For equi-joins,
+the planner may split the large side and replicate the small/hot side across
+the buckets, or decline the split if replication would exceed the state quota.
+For operators without an exact partial-state encoding, the plan remains
+unsplit and reports `SKEW_BOUND` if the SLO cannot be met.
 
 ---
 
@@ -1897,7 +1997,7 @@ shared operator DAG so common subplans are maintained once and fanned out to
 multiple view sinks. `ALTER PIPELINE ... ADD VIEW` and `ALTER PIPELINE ...
 REPLACE VIEW` use the schema/plan replacement path from §4.2.
 
-The control plane auto-tunes the four mechanism knobs (§14.6) to satisfy the
+The control plane auto-tunes the mechanism knobs (§14.6) to satisfy the
 SLO inside the quota. Operators do not normally set those knobs; they set
 intent. If the SLO cannot be met inside the quota, the pipeline transitions
 to a named degraded state (§14.10) instead of silently missing the target.
@@ -1921,7 +2021,7 @@ by operator and shard.
 
 ### 14.5 Self-Tuning by Default
 
-Three control loops run continuously in the control plane. All three are on
+Five control loops run continuously in the control plane. All five are on
 by default and can be disabled per pipeline (`autotune.* = off`) for audited
 manual control.
 
@@ -1930,6 +2030,8 @@ manual control.
 | **Adaptive parallelism** | `operator.*.parallelism` | Operator `epoch_ms` p95 trends above SLO budget for > 30 s | `min_parallelism` ≤ N ≤ `max_parallelism` (per pipeline) |
 | **Adaptive epoch sizing** | `min_epoch_ms`, `max_epoch_ms` | Object-store write rate trends above quota, or SLO compliance < target | Floor: 10 ms; ceiling: 5 s |
 | **Adaptive source throttle** | Per-connector `max_poll_bytes_per_epoch` | `frontier_lag_ms` trends above `freshness_target_ms * 1.5` for > 20 s, indicating ingestion is outpacing processing | Minimum 1 row/epoch; maximum = connector's native batch ceiling |
+| **Adaptive locality** | Operator placement and exchange path (`elided`, `loopback`, `direct`, `durable`) | Exchange serialization/network time is a material fraction of `epoch_ms`, or a small pipeline can fit on fewer workers without missing SLO | Never moves state outside quota; no placement that increases predicted p95 lag above SLO |
+| **Adaptive skew splitting** | `operator.*.skew_buckets` for hot keys | Worst-shard load exceeds `hot_key_factor × median` for > 30 s | `1 ≤ B ≤ max_skew_buckets`; enabled only for operators with exact partial-state semantics |
 
 Every adjustment is recorded in the audit log (§14.11) with the metric
 reading that triggered it. Operators see *what the system decided and why*,
@@ -1937,7 +2039,7 @@ not opaque magic.
 
 ### 14.6 Manual Override Knobs
 
-For the cases auto-tuning cannot solve, the same four knobs from v3.2 remain
+For the cases auto-tuning cannot solve, the same primary knobs remain
 available as per-pipeline or per-operator overrides:
 
 | Knob | Auto default | When to override |
@@ -1946,6 +2048,7 @@ available as per-pipeline or per-operator overrides:
 | `max_epoch_ms` | = `freshness_target_ms / 2` | You want freshness tighter than what the SLO loop derives. |
 | `frontier_agg_interval` | 100 ms | Very large clusters (≥ 1000 shards) may relax to 500 ms. |
 | `operator.*.parallelism` | adaptive | `EXPLAIN INCREMENTAL` shows a specific operator stuck ⚠ and you want to pin it. |
+| `operator.*.skew_buckets` | adaptive | One logical key is hot and you want to pre-split it instead of waiting for detection. |
 
 Manual overrides are sticky and visible in `SHOW PIPELINE` output so the
 next operator does not have to guess why a value was set.
@@ -2264,9 +2367,10 @@ the system explain itself before and during failure.
 The following items are the explicit validation backlog and feed the
 implementation plan's Phase 3.5 and Phase 4 acceptance criteria:
 
-- **Hot-key skew** in joins and aggregates. Sub-key partitioning and adaptive
-  re-sharding (§10.5) must keep worst-shard load within a documented factor
-  of median.
+- **Hot-key skew** in joins and aggregates. Virtual-bucket hot-key splitting,
+  pre-shuffle combiners, locality-aware placement, and adaptive re-sharding
+  (§7.5, §10.5) must keep worst-shard load within a documented factor of
+  median.
 - **Object-store request budget** under sustained load (PUT/GET/LIST/DELETE
   per second per shard) including WAL, manifest, SST, shuffle, and
   checkpoints.

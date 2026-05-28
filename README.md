@@ -65,6 +65,11 @@ for a slice of the data. When traffic grows, the system adds parallelism to the 
 operators automatically. When it quiets down, it reduces it. Workers coordinate
 automatically — no manual reconfiguration required.
 
+For small workloads, RockStream can run as one local process and avoid distributed
+network hops entirely. For large workloads, it uses shard-level parallelism,
+pre-shuffle combining, hot-key splitting, and hierarchical coordination so a cluster
+can grow without every component talking to every other component.
+
 You tell RockStream *what* you want — "keep this view fresh within 1 second; do not
 exceed 200 GB of state" — and the system figures out *how*: how many shards each
 operator needs, how often to commit to object storage, when to scale up or back. The
