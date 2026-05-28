@@ -908,6 +908,11 @@ a gateway rewrite.
   - Define `ViewReadStrategy` enum (`HotOnly` | `TwoTier { snapshot_manifest, hot_tail_from_epoch }`) in `rockstream-gateway`.
   - Define the `ViewReader` trait with a `read_strategy()` method the planner calls before routing a query.
   - Implement `HotOnly` fully. `TwoTier` variant is present but returns `RS-4001 cold_tier.not_enabled` if selected.
+- **HTTP server routing reservation** (DESIGN.md §13.7.2): `--role=gateway`
+  starts an HTTP server on port `8181` alongside pgwire on `5432`. Register
+  the `/iceberg/v1/` route prefix now (returns `501 Not Implemented`). This
+  ensures the gateway HTTP surface is catalog-aware before the Iceberg REST
+  catalog implementation lands, avoiding a routing rewrite later.
 - **pgwire gateway** (stateless, horizontally scalable):
   - Postgres wire protocol (`pgwire` crate): startup, query, extended-query,
     copy-out, terminate message flows.

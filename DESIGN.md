@@ -151,6 +151,17 @@ object storage.
 > step 6 of the snapshot lifecycle, idempotent, and failure-isolated — a catalog
 > API error degrades the sink to `CATALOG_WARN` state without blocking IVM.
 >
+> **v3.18 adds RockStream as a native Iceberg REST Catalog server** (§13.7):
+> rather than calling an external catalog, RockStream can *be* the catalog.
+> The gateway exposes `/iceberg/v1/` (Iceberg REST Catalog spec) backed
+> directly by the existing control-plane catalog and cold snapshot manifests.
+> Any Iceberg-native tool (Spark, Flink, Trino, DuckDB catalog config) can
+> point at the RockStream gateway and discover views by name with no
+> additional infrastructure. The HTTP routing slot is reserved in Phase 9
+> (`--role=gateway` serves both pgwire and HTTP on separate ports) so the
+> endpoint can be implemented when the cold tier ships without a gateway
+> rewrite.
+>
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
 >   itself (PlanIR, the differentiation pass, the per-operator rules, the
@@ -178,6 +189,7 @@ object storage.
     - [12.7 Two-Tier View Storage](#127-two-tier-view-storage-design-decision)
 13. [Connectors & External I/O](#13-connectors--external-io)
     - [13.6 Iceberg/Delta Cold-Tier Sink](#136-icebergdelta-cold-tier-sink)
+    - [13.7 Native Iceberg REST Catalog](#137-native-iceberg-rest-catalog)
 14. [Operations: Deploy, Monitor, Diagnose](#14-operations-deploy-monitor-diagnose)
 15. [Comparison to Prior Art](#15-comparison-to-prior-art)
 16. [Optimality Assessment (v3.7)](#16-optimality-assessment-v37)
@@ -2396,6 +2408,125 @@ LOAD ducklake;
 ATTACH 'md:analytics' AS dl;      -- or a local .duckdb file
 SELECT * FROM dl.reporting.orders_mv;   -- table discovered by name, not path
 ```
+
+### 13.7 Native Iceberg REST Catalog
+
+RockStream can act as an **Iceberg REST Catalog server** — serving the
+standard [Iceberg REST Catalog spec](https://iceberg.apache.org/rest-spec/)
+directly from its control-plane metadata and cold snapshot manifests. This
+makes all views with cold-tier sinks discoverable by name to any
+Iceberg-native tool, with no external catalog service required.
+
+#### 13.7.1 Why It's a Thin Layer
+
+RockStream already holds everything the Iceberg REST spec needs:
+
+| Iceberg REST concept | Source in RockStream |
+|---|---|
+| Namespace | `catalog/namespace/` in control-plane SlateDB (§5.2) |
+| Table name + schema | `catalog/view/` — view definition, column types, partition spec |
+| Snapshot list | Cold snapshot manifests, one per flush epoch |
+| Table location (S3 prefix) | `catalog` field in the sink definition |
+| Partition spec | `partition_by` from `CREATE SINK` |
+| Sort order | Optional `sort_by` from `CREATE SINK` |
+
+The catalog endpoint is a stateless HTTP adapter over the control-plane
+`DbReader`. No new storage, no new coordination.
+
+#### 13.7.2 Endpoint and Auth
+
+The gateway serves the Iceberg REST catalog on a dedicated HTTP port
+(default `8181`), separate from the pgwire SQL port (`5432`):
+
+```
+--role=gateway   →  pgwire on :5432   (SQL queries)
+                    HTTP   on :8181   (Iceberg REST catalog + future REST API)
+```
+
+The `/iceberg/v1/` prefix is reserved in Phase 9 even before the catalog
+is implemented (returns `501 Not Implemented`). This ensures the gateway's
+HTTP routing is catalog-aware from the start.
+
+Authentication uses the same bearer-token / mTLS layer as the SQL gateway
+(§12.5). A principal with `viewer` on a view can read its catalog metadata;
+`admin` can see all namespaces.
+
+#### 13.7.3 API Coverage
+
+| Endpoint | Behaviour |
+|---|---|
+| `GET /v1/config` | Returns warehouse location and auth endpoint. |
+| `GET /v1/namespaces` | Lists RockStream namespaces the caller can see. |
+| `POST /v1/namespaces` | Creates a RockStream namespace (proxies `CREATE NAMESPACE`). |
+| `GET /v1/namespaces/{ns}/tables` | Lists views with a cold-tier sink in the namespace. |
+| `GET /v1/namespaces/{ns}/tables/{tbl}` | Returns schema, partition spec, and latest snapshot. |
+| `POST /v1/namespaces/{ns}/tables/{tbl}` | Commits a new snapshot (used by Spark/Flink writers; not the primary path). |
+| `GET /v1/namespaces/{ns}/tables/{tbl}/snapshots` | Full snapshot history within retention window. |
+
+Views without a cold-tier sink are not listed — they have no Iceberg
+snapshots. If a caller requests such a table, the catalog returns
+`404 NoSuchTableException`.
+
+#### 13.7.4 Client Configuration
+
+```python
+# PySpark
+spark = SparkSession.builder \
+    .config("spark.sql.catalog.rs",
+            "org.apache.iceberg.spark.SparkCatalog") \
+    .config("spark.sql.catalog.rs.type", "rest") \
+    .config("spark.sql.catalog.rs.uri",
+            "http://rockstream-gateway:8181/iceberg/v1") \
+    .config("spark.sql.catalog.rs.token", "<bearer-token>") \
+    .getOrCreate()
+
+df = spark.table("rs.reporting.orders_mv")
+```
+
+```sql
+-- Trino
+CREATE CATALOG rockstream USING iceberg
+WITH (
+  "iceberg.catalog.type"    = 'rest',
+  "iceberg.rest-catalog.uri" = 'http://rockstream-gateway:8181/iceberg/v1',
+  "iceberg.rest-catalog.security" = 'OAUTH2',
+  "iceberg.rest-catalog.oauth2.token" = '${ENV:RS_TOKEN}'
+);
+SELECT * FROM rockstream.reporting.orders_mv;
+```
+
+```sql
+-- DuckDB
+INSTALL iceberg; LOAD iceberg;
+CREATE SECRET rs (
+    TYPE iceberg_rest,
+    ENDPOINT 'http://rockstream-gateway:8181/iceberg/v1',
+    TOKEN '<bearer-token>'
+);
+SELECT * FROM iceberg_catalog('rs', 'reporting.orders_mv');
+```
+
+#### 13.7.5 Relationship to §13.6.5 Catalog Registration
+
+These two features solve different halves of the discovery problem:
+
+| | §13.6.5 Catalog Registration | §13.7 Native Iceberg REST Catalog |
+|---|---|---|
+| **Direction** | RockStream *pushes* metadata to an external catalog | External tools *pull* metadata from RockStream |
+| **Use when** | Your org already has a central catalog (Glue, Unity, DuckLake) | RockStream is the catalog; no external service needed |
+| **Infrastructure** | External catalog must exist and be reachable | Nothing extra — the gateway serves it |
+| **Best for** | Enterprise data platforms with existing catalog governance | Self-contained deployments, new projects, edge deployments |
+
+Both can be active simultaneously: a sink registers with Glue *and* RockStream
+serves the same table via its REST catalog. Tools choose which to consult.
+
+#### 13.7.6 Implementation Scope
+
+The `/iceberg/v1/` HTTP routing slot is reserved in Phase 9. Full
+implementation is a future deliverable, sequenced after the cold-tier sink
+(§13.6) ships, since the catalog endpoint serves cold snapshot metadata.
+The implementation is a single `rockstream-catalog` module inside
+`rockstream-gateway` — no new crate, no new binary.
 
 ---
 
