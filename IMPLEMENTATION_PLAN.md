@@ -1179,6 +1179,13 @@ binding.
   write + read back for auto-generated keys. Multi-row form (`INSERT ... SELECT
   ... RETURNING`) works. `UPDATE ... RETURNING` and `DELETE ... RETURNING` are
   not yet implemented.
+- **Session-scoped max-staleness** (DESIGN.md §12.8.3): `SET
+  rockstream.max_staleness = '<duration>'` configures an analytical session to
+  accept snapshots within the given age without blocking. Setting `max_staleness`
+  implicitly disables implicit `wait_for`. `RS-2018 session.staleness_exceeded`
+  emitted as a `NOTICE` when the published frontier is older than the bound.
+  `session_staleness_exceeded_total` and `session_frontier_age_ms` metrics
+  added. `SHOW rockstream.session_mode` returns `olap` or `oltp`.
 
 ---
 
@@ -1320,6 +1327,51 @@ backed by the existing IVM engine. See DESIGN.md §13.9 for the design.
 - Index state bytes appear in `EXPLAIN INCREMENTAL ESTIMATE` output.
 - Simulation: no data loss or duplicate rows after shard split during index
   backfill.
+
+---
+
+### v0.50 — Shard Column Statistics and OLAP Scatter Pruning
+
+This version adds per-shard column statistics that allow the gateway planner to
+prune scatter sets for OLAP queries with selective predicates. See DESIGN.md
+§8.7 and §12.3.1 for the design. Delivered as part of Phase 10.
+
+- **`ShardColumnStats` collection**: at each cluster checkpoint, each worker
+  computes and publishes per-column min/max bounds, a blocked Bloom filter
+  (capped at `shard_bloom_budget_bytes`, default 64 KB per column per shard),
+  and a `HyperLogLog/v1` cardinality sketch for each non-partition-key column
+  nominated for skipping. Stats stored in
+  `control: topology/shard_stats/{view_id}/{shard_id}`.
+- **Gateway planner integration**: before scattering a query, the planner reads
+  `shard_stats` from its cached control-plane `DbReader` and prunes any shard
+  whose column stats prove no matching rows exist (min/max range exclusion or
+  Bloom miss for equality predicates).
+- **`EXPLAIN` integration**: scatter pruning appears as
+  `shard_scan: K/N shards (pruned by column statistics on <cols>)`.
+- **Stats freshness guard**: if stats are older than `shard_stats_max_age`
+  (default: `5 × checkpoint_interval`), the gateway skips pruning and falls
+  back to full scatter with `RS-2017 shard_stats.too_stale` as a `NOTICE`.
+- **Secondary-index stat injection**: `CREATE INDEX` (v0.49) at build completion
+  automatically publishes precise min/max + Bloom for the indexed column into
+  `shard_stats`, making indexed columns immediately available for scatter
+  pruning with no additional configuration.
+- **Metrics**: `scatter_shards_total`, `scatter_shards_pruned_total`,
+  `shard_bloom_false_positive_total`.
+- **Error code**: `RS-2017 shard_stats.too_stale`.
+
+**Exit criteria for v0.50**
+
+- A query `SELECT * FROM orders WHERE status = 'PENDING'` on a 100-shard view
+  where only 8 shards contain `PENDING` rows uses ≤ 12 shards (allowing for
+  Bloom false positives); `EXPLAIN` reports the pruned count.
+- With stats older than `shard_stats_max_age`, the query falls back to full
+  scatter and emits `RS-2017` as a `NOTICE`.
+- After `CREATE INDEX ON orders (status)`, the next checkpoint publishes
+  updated stats for `status`; subsequent queries use the index-derived bounds.
+- `scatter_shards_pruned_total` metric increments correctly in load tests.
+- Simulation: property test verifies over 10k randomized workloads that the
+  Bloom filter never excludes a shard that would contribute matching rows
+  (false negatives are impossible by construction).
 
 ---
 

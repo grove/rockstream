@@ -196,6 +196,16 @@ object storage.
 > v0.43 extended to cover §12.8 features; secondary indexes land at v0.49
 > (new slot); v0.49–v0.54 shift to v0.50–v0.55.
 >
+> **v3.22 adds three HTAP and distributed-coordination improvements** grounded
+> in the existing frontier algebra: a `max_staleness` session parameter for
+> analytical sessions that bounds read latency without blocking (§12.8.3);
+> shard-level column statistics (min/max bounds, Bloom filters, HLL cardinality)
+> piggybacking on the `WorkerFrontierSummary` to enable OLAP scatter pruning in
+> the gateway planner (§8.7, §12.3.1); and a formal statement of the CALM
+> epoch-commit invariant (§8.4) — making the committed epoch verifiable by any
+> observer with object-store read access, with no gateway or coordinator
+> required, and exposing this guarantee to the Iceberg REST catalog (§13.7).
+>
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
 >   itself (PlanIR, the differentiation pass, the per-operator rules, the
@@ -1331,6 +1341,33 @@ typically 50–500 ms. A frontier that is up to one budget interval stale is
 still correct for garbage collection, window closing, and shuffle cleanup; it
 only affects how quickly those reclamations happen.
 
+**The CALM epoch-commit invariant.** The cluster-committed epoch is a monotone
+predicate: once epoch *N* is committed on all shards, no shard frontier ever
+retreats below *N*. This means the commit decision is verifiable by any observer
+with read-only access to object storage, without coordination:
+
+> An epoch *N* is globally committed if and only if every shard's
+> `shard_meta/0x06 0xFR` entry in its most recent object-store manifest
+> satisfies `frontier ≥ N`. This is a pure scan, requires no gateway
+> connection, and is consistent with the control plane's published frontier.
+
+Practical consequences:
+
+1. **External tools** (DuckDB via cold snapshots, Trino via the Iceberg REST
+   Catalog in §13.7) can verify that a cold snapshot at epoch *N* is safe to
+   query by checking that all contributing shards' manifests satisfy the
+   invariant — no API call to the RockStream gateway is needed.
+2. **Freshness tokens survive gateway downtime.** A `FreshnessToken` with
+   `source_epoch = N` can be self-verified against the object store. If the
+   gateway is temporarily unreachable, a client can confirm token satisfaction
+   independently.
+3. **The frontier aggregator is a derived view, not the source of truth.** The
+   per-shard `shard_meta/0x06 0xFR` entries are authoritative. The aggregator's
+   published value is always ≤ the true cluster-committed epoch and converges
+   within `frontier_agg_interval`. Staleness in the aggregator is always
+   pessimistic — it may delay garbage collection and window closing, but it
+   never causes correctness violations.
+
 ### 8.5 Garbage Collection of Shuffle Buffers
 
 When a receiver operator's input frontier on exchange `E` advances past epoch
@@ -1366,6 +1403,77 @@ This keeps control-plane traffic proportional to active workers and active
 operators per interval rather than raw shard count. The persisted per-shard
 frontiers remain the recovery source of truth, so losing a worker summary only
 delays publication by one aggregation interval.
+
+### 8.7 Shard Column Statistics for OLAP Scatter Pruning
+
+At each cluster checkpoint, each worker piggybacks a compact `ShardColumnStats`
+message alongside its `WorkerFrontierSummary`. Unlike the frontier summary
+(updated every `frontier_agg_interval`), column stats update only at checkpoint
+frequency — roughly every 30–128 epochs — and are stored in the control-plane
+catalog:
+
+```
+control: topology/shard_stats/{view_id}/{shard_id} → ShardColumnStats
+```
+
+**Structure.** For each non-partition-key column nominated for skipping:
+
+```rust
+pub struct ShardColumnStats {
+    pub shard_id:          ShardId,
+    pub view_id:           ViewId,
+    pub checkpoint_epoch:  u64,
+    pub col_stats:         Vec<ColumnStats>,
+}
+
+pub struct ColumnStats {
+    pub col_idx:            u16,
+    pub min_bytes:          Option<Bytes>,  // serialized min value; None if unknown
+    pub max_bytes:          Option<Bytes>,  // serialized max value
+    pub bloom_filter:       Option<Bytes>,  // blocked Bloom / XOR filter, budget-bounded
+    pub null_count:         u64,
+    pub distinct_count_hll: Bytes,          // HyperLogLog/v1 sketch (MergeLaw 0x0008)
+}
+```
+
+The Bloom filter is capped at `shard_bloom_budget_bytes` per shard per column
+(default 64 KB, tunable per pipeline). Each shard maintains its own independent
+filter; the gateway evaluates filters independently — shard filters are **not**
+merged into a cluster-wide filter.
+
+**Gateway planner integration** (extends §12.3.1). When planning a multi-shard
+scatter, the gateway reads `shard_stats` from its cached control-plane
+`DbReader`. For each candidate shard it evaluates each `WHERE` predicate against
+the column stats:
+
+- If `predicate_val < min_bytes` or `predicate_val > max_bytes` → prune.
+- If the Bloom test returns false for an equality predicate → prune.
+- Otherwise → include in scatter set.
+
+`EXPLAIN` reports: `shard_scan: 8/100 shards (pruned by column statistics on
+status, region)`. Pruning is an optimization only — a Bloom false positive causes
+a wasted round-trip; a false negative is impossible by Bloom filter construction.
+
+**Stats freshness guard.** If `shard_stats` for a view are older than
+`shard_stats_max_age` (default: `5 × checkpoint_interval`), the gateway skips
+scatter pruning for that view and falls back to full scatter. A warning notice
+`RS-2017 shard_stats.too_stale` is emitted (never blocks a query).
+
+**Secondary indexes provide high-quality stats.** When `CREATE INDEX` (§13.9)
+builds an index on a column, the resulting arrangement frontier and partition map
+supply precise min/max bounds and an exact Bloom filter for the indexed column at
+build completion. These are automatically published to `shard_stats` at each
+subsequent checkpoint.
+
+**Metrics:**
+
+| Metric | Description |
+|---|---|
+| `scatter_shards_total` | Shards considered for scatter before pruning. |
+| `scatter_shards_pruned_total` | Shards skipped by column statistics. |
+| `shard_bloom_false_positive_total` | Shards included by Bloom that returned no matching rows. |
+
+**Ships**: v0.50 (Phase 10), after secondary indexes land at v0.49.
 
 ---
 
@@ -1881,6 +1989,13 @@ method that accepts a Substrait fragment and returns an Arrow batch.
 Pushdown is used only for safe, side-effect-free aggregation fragments;
 joins and updates always use the full scan path.
 
+**Shard-statistics scatter pruning** (§8.7) is orthogonal to partial aggregation
+pushdown. Pushdown reduces *result size* (O(distinct groups) vs O(view rows));
+shard-stats pruning reduces *scatter width* (K matching shards vs N total shards
+for selective predicates). Both can apply to the same query: the planner prunes
+the scatter set first using column statistics, then pushes the partial aggregate
+to the remaining shards. `EXPLAIN` reports both effects separately.
+
 ### 12.4 Freshness Tokens and Read-Your-Writes
 
 Every source commit, sink commit, and query response can carry a **freshness
@@ -2333,6 +2448,59 @@ old state before the write, which adds read-modify-write latency. They are
 deferred post-1.0.
 
 **Ships**: v0.43 (extends the direct-write surface).
+
+#### 12.8.3 Session-Scoped Max-Staleness for Analytical Queries
+
+OLTP sessions use `session_wait_for` (§12.8.1) to ensure read-your-writes.
+Analytical sessions have the opposite need: they want low-latency reads
+against a recent-enough snapshot and do not need to block on a specific write
+propagating. `SET rockstream.max_staleness` provides this guarantee.
+
+**Session parameter:**
+
+```sql
+SET rockstream.max_staleness = '10s';   -- accept snapshots up to 10 s old
+SET rockstream.max_staleness = '0';     -- require the freshest published frontier
+SET rockstream.max_staleness = 'none';  -- no bound (default; equivalent to '0')
+```
+
+**Behaviour.** Before pinning the vector frontier for a `SELECT`, the gateway
+checks the wall-clock age of the most recently published cluster frontier. If
+`age ≤ max_staleness`, it pins immediately without waiting. If
+`age > max_staleness`, the session emits a `NOTICE` (`RS-2018
+session.staleness_exceeded`) and still uses the current frontier — it **never
+blocks**. The query result includes a `frontier_age_ms` field in the response
+metadata so clients can observe the actual staleness.
+
+**Interaction with `session_wait_for`.** These session knobs are mutually
+exclusive:
+
+| Setting | Behaviour |
+|---|---|
+| `session_wait_for = on` (default) | OLTP mode: implicit `wait_for` after every `COMMIT`; blocks up to `session_wait_for_timeout`. |
+| `max_staleness = '<duration>'` | OLAP mode: disables implicit `wait_for`; accepts any snapshot within the staleness bound. |
+| `session_wait_for = off` | Opt-out of `wait_for`; no staleness bound either. |
+
+Setting `max_staleness` implicitly sets `session_wait_for = off` for the
+session. Setting `session_wait_for = on` implicitly clears `max_staleness`.
+The active mode is visible via `SHOW rockstream.session_mode`.
+
+**No new distributed machinery.** `max_staleness` is purely gateway session
+bookkeeping. The frontier age is derived from the publication timestamp already
+attached to the cached cluster frontier.
+
+**New error code:** `RS-2018 session.staleness_exceeded` — emitted as a
+`NOTICE` (not an error) when the published frontier is older than
+`max_staleness` and the query proceeds with the stale frontier.
+
+**Metrics added:**
+
+| Metric | Description |
+|---|---|
+| `session_staleness_exceeded_total` | Count of queries where `max_staleness` was exceeded and the session fell through to the stale frontier. |
+| `session_frontier_age_ms` | Histogram: frontier age at `SELECT` time for sessions with `max_staleness` set. |
+
+**Ships**: v0.43 (extends the session ergonomics surface).
 
 ---
 
@@ -2842,6 +3010,15 @@ RockStream already holds everything the Iceberg REST spec needs:
 
 The catalog endpoint is a stateless HTTP adapter over the control-plane
 `DbReader`. No new storage, no new coordination.
+
+**Snapshot safety via the CALM invariant (§8.4).** Every snapshot served by
+the catalog corresponds to a cluster-committed epoch verified by the CALM
+epoch-commit invariant: the snapshot is safe to query if and only if all
+contributing shards' `shard_meta/0x06 0xFR` entries satisfy `frontier ≥ N`.
+The catalog endpoint only surfaces snapshots whose epoch satisfies this
+condition. External tools (DuckDB, Trino, Spark) can independently verify
+snapshot safety by reading per-shard manifests from object storage directly —
+no live RockStream gateway connection is required.
 
 #### 13.7.2 Endpoint and Auth
 
@@ -3447,6 +3624,8 @@ RS-2002  view.state_budget_exceeded
 RS-2003  isolation.serializable_not_supported
 RS-2005  history.epoch_before_retention
 RS-2007  write.idempotency_key_required
+RS-2017  shard_stats.too_stale
+RS-2018  session.staleness_exceeded
 RS-3001  shard.fence_lost
 RS-3002  shard.recovery_replay_failed
 RS-3009  merge.malformed_operand
