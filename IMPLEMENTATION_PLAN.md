@@ -74,7 +74,11 @@ Durations are indicative effort, not calendar time, and assume a small dedicated
     `network`; `TokioRuntime` (production) and `SimRuntime` (in-memory,
     seeded RNG) implementations; `buggify!()` macro (no-op in release, hot
     in simulation builds). Threaded through every other crate from Phase 1
-    onward; no I/O surface in the codebase may bypass it.
+    onward; no I/O surface in the codebase may bypass it. Includes the
+    v3.10 TigerBeetle-style safety contract: paired assertions at
+    durable/network boundaries, an explicit simulator fault model, liveness
+    checks tied to the recovery SLOs, and fixed upper bounds for queues,
+    buffers, and scan windows.
 - CI: GitHub Actions running `cargo fmt --check`, `cargo clippy -D warnings`,
   `cargo test`, `cargo deny`, codecov.
 - Logging via `tracing` with OTEL exporter feature flag.
@@ -477,6 +481,8 @@ distribution and fault tolerance. (IVM.md §13 IVM-13.)
 - **Deterministic simulation testing**: borrow SlateDB's `slatedb-dst`
   pattern; a single-threaded, seeded-RNG harness drives source connectors
   deterministically and verifies bit-identical output across reruns.
+  Paired-assertion checks are mandatory for every durable arrangement write,
+  frontier advance, epoch replay, and sink idempotency key.
 - **Storage correctness audit**: verify every cleanup path works without SlateDB
   range deletion; prove each compaction filter is snapshot-safe; run a WAL
   retention/listing-cost test with long-lived readers.
@@ -893,7 +899,14 @@ protocol. Make RockStream self-contained (no external broker required).
   frontier, checkpoint, 2PC sink, reassignment, schema evolution) with
   `BUGGIFY` enabled. Pre-release runs scale N to millions of seeds; failing
   seeds are checked in as regression tests and replayed on every subsequent
-  build.
+  build. The gate checks both safety (oracle divergence, invariant assertion,
+  invalid recovery state) and liveness (a recoverable fault must either commit
+  a new epoch inside the 5 s / 30 s / 60 s recovery budgets or surface a named
+  degraded state).
+- **Continuous simulation soak** (DESIGN.md §17.6): a scheduled job runs new
+  deterministic seeds against `main` around the clock. Failures are minimized,
+  stored as regression seeds, and block release until either fixed or explicitly
+  accepted with a documented limitation.
 - **Frontier aggregator deployment** (DESIGN.md §3.1): document and ship
   the `rockstream start --role=frontier` deployment topology for Tier 3.
   Frontier-role processes are stateless and horizontally scalable; the

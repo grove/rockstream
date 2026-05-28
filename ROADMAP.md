@@ -88,7 +88,7 @@ without that proof, the version is not done.
 | Version | Focus | Scope | Proof |
 |---|---|---|---|
 | v0.1 | Repository workbench | Cargo workspace, core crates, CI, dev container, `rockstream` binary stub, basic `tracing`, pinned MSRV, dependency policy. | Clean CI on an empty no-op binary; `rockstream --help` works; repository has no hidden local setup step. |
-| v0.2 | Runtime abstraction and simulation seed | `rockstream-sim`, `Runtime` trait, `TokioRuntime`, `SimRuntime`, in-memory object store and network, seeded clock, first `buggify!()` macro. | A deterministic test replays the same seed byte-for-byte; changing the seed changes event order; production build compiles with `buggify!()` as no-op. |
+| v0.2 | Runtime abstraction and simulation seed | `rockstream-sim`, `Runtime` trait, `TokioRuntime`, `SimRuntime`, in-memory object store and network, seeded clock, first `buggify!()` macro, explicit fault-model registry, paired-assertion helper pattern. | A deterministic test replays the same seed byte-for-byte; changing the seed changes event order; production build compiles with `buggify!()` as no-op; every `buggify!()` site names a fault-model entry. |
 | v0.3 | SlateDB storage contract | `rockstream-storage`, key encoders, `ShardDb`, `WriteBatch` builders, `DbReader`, WAL reader smoke tests, merge operator registry, no range-delete dependency. | Storage API validation suite proves only supported SlateDB features are used; unsupported operations fail at compile/test time. |
 | v0.4 | No-op pipeline and local CLI | `rockstream start --storage=./data`, no-op source, no-op operator, no-op view sink, support-bundle skeleton, audit-log skeleton, error-code registry. | `make e2e` starts a local process, runs a no-op pipeline, emits audit events, writes a support bundle, and shuts down cleanly. |
 
@@ -142,7 +142,7 @@ without that proof, the version is not done.
 | v0.33 | Distributed recursion and skew stress | Exchange inside recursive scopes, inner frontier convergence, skewed inputs, per-shard recompute fallback. | Sharded 10M-edge reachability benchmark converges; stalled inner frontier surfaces a named error. |
 | v0.34 | Cluster checkpoints | Barrier injection, bounded alignment buffers, per-shard checkpoint creation, atomic cluster checkpoint commit, old checkpoint GC. | Checkpoint under slow input and credit exhaustion never grows unbounded and either succeeds or reports `RECOVERING`. |
 | v0.35 | Recovery driver and SLO metrics | Recovery from cluster checkpoint, shard reassignment, failure detection, recovery histograms, `RECOVERING_SLOW`. | At target shard size: failure detection <=5s, shard reassignment <=30s, pipeline freshness recovery <=60s in chaos runs. |
-| v0.36 | Exactly-once and chaos alpha | 2PC sink protocol, Kafka/S3/Postgres sink stubs, simulation suite for epoch/frontier/checkpoint/2PC interleavings. | >=100k simulation seeds pass; a 24-hour 32-shard chaos run has zero data loss and zero duplicates. |
+| v0.36 | Exactly-once and chaos alpha | 2PC sink protocol, Kafka/S3/Postgres sink stubs, simulation suite for epoch/frontier/checkpoint/2PC interleavings, liveness checks tied to recovery SLOs. | >=100k simulation seeds pass; every recoverable injected fault either commits a new epoch within the 5s/30s/60s budgets or surfaces a named degraded state; a 24-hour 32-shard chaos run has zero data loss and zero duplicates. |
 
 ### Elasticity, Gateway, and Connectors
 
@@ -165,7 +165,7 @@ without that proof, the version is not done.
 | v0.46 | Observability and admin surface | Prometheus metrics, OTEL traces, JSON logs, admin CLI, support bundle completeness, dashboard template. | Operator can diagnose a slow pipeline from SLO compliance -> degraded reason -> explain -> support bundle. |
 | v0.47 | Auto-tuner hardening | Adaptive parallelism, epoch sizing, source throttle, hysteresis, stability tests, override docs. | Random workload property tests converge without oscillation; every tuning action is audit logged. |
 | v0.48 | Upgrades, migration, and security review | Storage format gate, rolling upgrade test, migration skeleton, disaster recovery drill, independent security review. | N -> N+1 rolling upgrade loses no epoch; incompatible format fails safely with `RS-5001`; security review issues are triaged. |
-| v0.49 | Long production soak | 30-day 64-shard soak, Nexmark/TPC-H continuous, chaos automation, release-blocking defect burn-down. | 99.99% availability target met or miss is understood and fixed; no correctness divergence. |
+| v0.49 | Long production soak | 30-day 64-shard soak, Nexmark/TPC-H continuous, chaos automation, continuous simulation soak on `main`, release-blocking defect burn-down. | 99.99% availability target met or miss is understood and fixed; no correctness divergence; all historical failing simulator seeds replay in CI. |
 | v0.50 | Production beta handoff | Helm/Terraform packaging, deployment playbooks, SQL reference, connector guide, operator guide, reference architecture. | First pilot workload runs with support agreement, documented runbook, rollback plan, and known limitations. |
 
 ---
@@ -181,6 +181,8 @@ evidence-based:
 - Every supported SQL feature has an oracle test or batch-equivalence test.
 - The deterministic simulator runs millions of seeds before release, and any
   historical failing seed is replayed in CI.
+- Continuous simulation has run against `main` long enough to cover both safety
+  and liveness failures across the explicit fault model.
 - Recovery-time invariants hold at the target shard size.
 - The upgrade path from the previous beta is tested and documented.
 - The public docs state what RockStream is not: not an OLTP Postgres clone, not

@@ -1273,6 +1273,13 @@ same pattern for RockStream: a single-thread, deterministic-RNG harness
 that drives source connectors with a fixed seed and verifies bit-identical
 output across runs.
 
+The operator harness follows DESIGN.md §17.3: the simulator amplifies explicit
+invariants rather than replacing them. Every operator that writes arrangement
+state must assert its encoded `(row_id, schema_version, weight)` contract before
+the write and assert the same contract after readback through the storage
+wrapper. Every frontier-producing operator asserts monotonicity before emission;
+the downstream consumer asserts it again on receipt.
+
 ---
 
 ## 15. Open Questions

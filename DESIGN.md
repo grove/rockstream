@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.9. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.10. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -81,6 +81,12 @@ object storage.
 > lets file-format sinks (Iceberg, Delta Lake, Parquet) buffer across epochs
 > before physically writing, solving the small-files problem without
 > sacrificing exactly-once semantics.
+>
+> **v3.10 adopts TigerBeetle-style safety discipline** (§17): deterministic
+> simulation remains the foundation, but the simulator is backed by paired
+> assertions on durable/network boundaries, an explicit fault model,
+> liveness checks tied to the recovery SLOs, continuous long-run simulation
+> soak, and a "bounded everything" rule for queues, buffers, and scan windows.
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -2060,7 +2066,53 @@ Every `buggify!()` site has a comment explaining the race it simulates. CI
 requires that any new race-prone code adds a `buggify!()` annotation reviewed
 by a second engineer.
 
-### 17.3 What Simulation Tests Cover
+### 17.3 TigerBeetle-Style Assertion Discipline
+
+The simulator is a force multiplier for invariants already stated in code; it
+is not a substitute for them. RockStream therefore requires **paired
+assertions** on every correctness property that crosses a durable or network
+boundary: assert the property before the boundary and assert it again after the
+boundary is observed.
+
+Required assertion pairs include:
+
+- Arrangement writes: assert `(row_id, schema_version, weight)` validity before
+  constructing the SlateDB `WriteBatch`; assert the same invariant after
+  decoding through `ShardDb::get_merged()` / `scan_merged()`.
+- Frontier movement: assert antichain monotonicity before publishing a shard
+  frontier; assert monotonicity again after reading the control-plane frontier.
+- Epoch commits: assert that every persisted connector offset, frontier, and
+  state mutation carries the same `epoch`; assert the equality again during
+  recovery replay.
+- Sink commits: assert idempotency key uniqueness before `prepare`; assert the
+  same key maps to exactly one committed external artifact after recovery.
+
+Assertion failures indicate a programmer or storage-corruption bug, not an
+operating condition. The worker crashes, the shard lease is released, and
+recovery proceeds through the normal reassignment path (§10.4, §11.5).
+
+### 17.4 Explicit Fault Model
+
+Simulation coverage is defined by an enumerated fault model, not by a vague
+"random failures" label. The first simulator release must cover:
+
+- Network: delay, drop, duplicate, reorder, partition, and reconnect.
+- Object store / SlateDB boundary: delayed visibility, transient errors,
+  stale reads where the API permits them, checksum/corruption errors surfaced
+  by SlateDB, and LIST throttling.
+- Process lifecycle: crash before, during, and after each durable write;
+  restart with an old manifest view; fenced writer attempts after eviction.
+- Clock and scheduling: delayed timers, reordered task wakeups, slow workers,
+  credit exhaustion, and barrier skew.
+- Connector behavior: source stalls, duplicate batches after retry, invalid
+  records routed to DLQ, sink commit retry, and file-sink buffering across
+  epochs.
+
+Every new `buggify!()` site names the fault-model entry it exercises. A fault
+not named here is treated as uncovered until the list and simulator are both
+extended.
+
+### 17.5 What Simulation Tests Cover
 
 | Subsystem | What the simulator must demonstrate |
 |---|---|
@@ -2070,8 +2122,24 @@ by a second engineer.
 | Fault-driven reassignment (§10.4) | Killing any subset of workers and restarting them in any order recovers to the same final state as no failure. |
 | Schema evolution (§4.2) | A schema-version change concurrent with an in-flight epoch produces no row decoded with the wrong version. |
 | 2PC sinks (§11.4) | Any crash during pre-commit, between pre-commit and commit, or during commit recovers idempotently. |
+| Liveness under faults (§11.5) | After any injected recoverable fault, the cluster commits at least one new epoch within the 5 s / 30 s / 60 s recovery-time budgets or surfaces a named degraded state. |
+| Resource bounds (§7.2, §14.10) | Shuffle queues, barrier buffers, connector inboxes, and arrangement scan windows hit explicit limits and apply backpressure or transition to `BLOCKED`; they never grow without bound. |
+| Storage-boundary corruption (§5.3) | Any checksum/corruption error surfaced by SlateDB crashes the affected worker and recovers by shard reassignment; corrupted bytes are never interpreted as valid arrangement state. |
 
-### 17.4 Why This Is Worth the Cost
+### 17.6 Continuous Simulation Soak
+
+Every commit runs a bounded number of deterministic seeds in CI. In addition,
+RockStream maintains a continuous simulation job that runs new seeds around the
+clock against the current `main` branch. Failing seeds are minimized, checked in
+as regression tests, and replayed on every subsequent build. Pre-release gates
+scale the seed count to millions across the coordination suite.
+
+The continuous job tracks both safety failures (oracle divergence, invariant
+assertion, invalid recovery state) and liveness failures (no committed epoch
+within the recovery budget after a recoverable fault). A simulator that only
+checks final output equivalence is incomplete.
+
+### 17.7 Why This Is Worth the Cost
 
 FoundationDB's defining property in production is that *correctness bugs are
 rare*. The cause is not exceptional discipline; it is a test harness that runs
