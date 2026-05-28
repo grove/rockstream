@@ -1,4 +1,4 @@
-FROM rust:1.82-bookworm
+FROM rust:1.85-bookworm
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install cargo tools
-RUN cargo install cargo-deny cargo-watch
+RUN cargo install --locked cargo-deny@0.18.3 cargo-watch
 
 # Set up workspace
 WORKDIR /workspace
