@@ -162,6 +162,15 @@ object storage.
 > endpoint can be implemented when the cold tier ships without a gateway
 > rewrite.
 >
+> **v3.19 adds a §13.8 scope note and DuckLake native server placeholder**:
+> §13.7 is Iceberg REST only. Delta Lake table discovery is covered by path
+> access (§13.6) and Unity Catalog via `catalog = 'rest'` (§13.6.5). A native
+> DuckLake 1.0 catalog server is architecturally feasible but deferred: the
+> Iceberg REST catalog (§13.7) already covers DuckDB table-by-name discovery;
+> a native DuckLake server adds value only for deployments that are
+> DuckLake-first and want zero external endpoints. §13.8 documents the
+> design decision and the conditions under which it should be revisited.
+>
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
 >   itself (PlanIR, the differentiation pass, the per-operator rules, the
@@ -190,6 +199,7 @@ object storage.
 13. [Connectors & External I/O](#13-connectors--external-io)
     - [13.6 Iceberg/Delta Cold-Tier Sink](#136-icebergdelta-cold-tier-sink)
     - [13.7 Native Iceberg REST Catalog](#137-native-iceberg-rest-catalog)
+    - [13.8 Native DuckLake Catalog Server (deferred)](#138-native-ducklake-catalog-server-deferred)
 14. [Operations: Deploy, Monitor, Diagnose](#14-operations-deploy-monitor-diagnose)
 15. [Comparison to Prior Art](#15-comparison-to-prior-art)
 16. [Optimality Assessment (v3.7)](#16-optimality-assessment-v37)
@@ -2527,6 +2537,75 @@ implementation is a future deliverable, sequenced after the cold-tier sink
 (§13.6) ships, since the catalog endpoint serves cold snapshot metadata.
 The implementation is a single `rockstream-catalog` module inside
 `rockstream-gateway` — no new crate, no new binary.
+
+**Scope boundary**: §13.7 covers the Iceberg REST Catalog spec only.
+Delta Lake table discovery is covered by path access (`delta_scan`) via
+the §13.6 Delta cold-tier sink, and by Unity Catalog via `catalog = 'rest'`
+in §13.6.5. DuckLake native catalog server support is addressed in §13.8.
+
+---
+
+### 13.8 Native DuckLake Catalog Server (Deferred)
+
+#### 13.8.1 What It Would Mean
+
+DuckLake (released 2025) uses a **DuckDB database as the catalog layer**:
+table metadata and snapshot history are rows in a DuckDB file (local or
+MotherDuck cloud) rather than files in object storage. Clients `ATTACH` the
+database and query tables by name. This is architecturally distinct from
+the Iceberg REST spec — there is no REST endpoint to implement; RockStream
+would instead maintain a DuckDB metadata database and keep it in sync.
+
+Being a native DuckLake catalog server would mean:
+
+1. After each cold snapshot flush, RockStream appends new table/snapshot
+   metadata rows to a dedicated DuckLake database.
+2. The DuckLake database lives at a configured location: a local `.duckdb`
+   file on object storage, or a MotherDuck account.
+3. DuckDB clients `ATTACH` that database and see all RockStream views as
+   named tables, with full snapshot history, alongside any other DuckLake
+   tables from other systems.
+
+#### 13.8.2 No Architectural Blockers
+
+Nothing in the current design prevents this:
+
+- The sync step is a natural step 7 appended to the §13.6.2 snapshot
+  lifecycle, after the catalog API call in step 6.
+- The DuckLake database is a derived artifact, like Iceberg snapshots.
+  It can be fully rebuilt from the RockStream control-plane metadata on
+  recovery.
+- Failure isolation follows the §13.6.5 pattern: if the DuckLake write
+  fails, the sink enters `CATALOG_WARN` and retries at the next flush.
+  IVM is never blocked.
+- Credentials for MotherDuck use the same named-secret mechanism as
+  §13.6.5 `catalog_credentials`.
+
+#### 13.8.3 Why It Is Deferred
+
+The native Iceberg REST catalog (§13.7) already solves the primary
+table-discovery use case for DuckDB:
+
+```sql
+-- DuckDB discovers RockStream views by name via §13.7, no DuckLake needed
+CREATE SECRET rs (TYPE iceberg_rest, ENDPOINT 'http://rockstream:8181/iceberg/v1', ...);
+SELECT * FROM iceberg_catalog('rs', 'reporting.orders_mv');
+```
+
+A native DuckLake server adds value only in a narrower case: the deployment
+is **DuckLake-first** (other tables from Spark, dbt, etc. already live in
+a DuckLake database), and the operator wants RockStream views to appear
+in that same database alongside those other tables — without configuring
+an Iceberg REST catalog endpoint.
+
+**Conditions to revisit:**
+- A production deployment explicitly requests DuckLake-first discovery.
+- The DuckLake 1.0 write protocol is formally specified and stable.
+- The ROI justifies the operational footprint of a second metadata store.
+
+Until then, `catalog = 'ducklake'` in §13.6.5 (push registration into an
+existing DuckLake database) covers the integration use case, and §13.7
+covers self-contained DuckDB discovery.
 
 ---
 
