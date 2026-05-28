@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rockstream",
+    "crates/rockstream-cli",
+    "crates/rockstream-connectors",
+    "crates/rockstream-control",
+    "crates/rockstream-diff",
+    "crates/rockstream-gateway",
+    "crates/rockstream-ops",
+    "crates/rockstream-oracle",
+    "crates/rockstream-plan",
+    "crates/rockstream-runtime",
+    "crates/rockstream-sim",
+    "crates/rockstream-sql",
+    "crates/rockstream-storage",
+    "crates/rockstream-types",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/geir-gronmo/rockstream"
+
+[workspace.dependencies]
+# Shared workspace dependencies
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Workspace crate references
+rockstream-cli = { path = "crates/rockstream-cli" }
+rockstream-connectors = { path = "crates/rockstream-connectors" }
+rockstream-control = { path = "crates/rockstream-control" }
+rockstream-diff = { path = "crates/rockstream-diff" }
+rockstream-gateway = { path = "crates/rockstream-gateway" }
+rockstream-ops = { path = "crates/rockstream-ops" }
+rockstream-oracle = { path = "crates/rockstream-oracle" }
+rockstream-plan = { path = "crates/rockstream-plan" }
+rockstream-runtime = { path = "crates/rockstream-runtime" }
+rockstream-sim = { path = "crates/rockstream-sim" }
+rockstream-sql = { path = "crates/rockstream-sql" }
+rockstream-storage = { path = "crates/rockstream-storage" }
+rockstream-types = { path = "crates/rockstream-types" }

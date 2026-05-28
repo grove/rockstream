@@ -1,0 +1,27 @@
+{
+  "name": "RockStream Development",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "1.82"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.cargo.features": "all"
+      }
+    }
+  },
+  "postCreateCommand": "cargo fetch",
+  "remoteUser": "root"
+}

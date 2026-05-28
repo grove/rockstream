@@ -1,0 +1,10 @@
+[package]
+name = "rockstream-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Worker process, circuit executor, scheduler, and exchange for RockStream"
+
+[dependencies]
+rockstream-types = { workspace = true }

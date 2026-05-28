@@ -1,0 +1,11 @@
+[package]
+name = "rockstream-diff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "DiffCtx differentiation pass for RockStream IVM"
+
+[dependencies]
+rockstream-types = { workspace = true }
+rockstream-plan = { workspace = true }

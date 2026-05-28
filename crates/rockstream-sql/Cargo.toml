@@ -1,0 +1,11 @@
+[package]
+name = "rockstream-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQL frontend built on DataFusion for RockStream"
+
+[dependencies]
+rockstream-types = { workspace = true }
+rockstream-plan = { workspace = true }
