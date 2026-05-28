@@ -44,11 +44,11 @@ The phase numbers here map to ROADMAP.md roadmap versions as follows:
 | 5 | v0.31–v0.32 | Frontier protocol and progress tracking |
 | 6 | v0.33–v0.36 | Fault tolerance, exactly-once, chaos |
 | 7 | v0.37–v0.39 | Elasticity: split, merge, drain, clone |
-| 8 | v0.40–v0.43 | Postgres query gateway, introspection, freshness, subscribe, direct-write CRDT surface |
+| 8 | v0.40–v0.43 | Postgres query gateway, introspection, freshness, subscribe, direct-write CRDT surface, OLTP session ergonomics |
 | 9 | v0.44–v0.45 | Connectors and sinks (Tier 1 + Tier 2 contract); OR-Set; CRDT schema metadata |
-| 10 | v0.46–v0.49 | Auth, observability, upgrades, security |
-| 11 | v0.50–v0.51 | Long soak and production beta handoff |
-| 12 | v0.52–v0.54 | Cold-tier sink, Iceberg REST catalog, snapshot GC |
+| 10 | v0.46–v0.50 | Auth, observability, auto-tuner, secondary indexes, upgrades, security |
+| 11 | v0.51–v0.52 | Long soak and production beta handoff |
+| 12 | v0.53–v0.55 | Cold-tier sink, Iceberg REST catalog, snapshot GC |
 
 Durations are indicative effort, not calendar time, and assume a small
 dedicated team. The ROADMAP.md version table is the single source of truth
@@ -846,7 +846,7 @@ production-ready.
   seed-bisection tool, stored as regression seeds in the repository, and
   block release until either fixed or explicitly accepted with a documented
   limitation. The soak starts small (hundreds of seeds/night) and scales
-  to millions of seeds/night by v0.50. The CI job is the evidence that the
+  to millions of seeds/night by v0.51. The CI job is the evidence that the
   FoundationDB simulation discipline is active, not aspirational.
 - Routine worker restart surfaces `RECOVERING` with `recovery_progress` and
   suppresses false SLO alerts until `recovery_deadline`; missed deadlines alert.
@@ -950,7 +950,7 @@ production-ready.
   that have already passed earlier phases (storage, planner, compaction,
   duplicate policy, `EXPLAIN`); unknown or experimental laws are rejected
   with `RS-5002`. User-defined laws via `CREATE MERGE LAW` remain gated
-  until Phase 11 v0.50. The connector SDK ships an example declaring a
+  until Phase 11 v0.51. The connector SDK ships an example declaring a
   `COUNTER` column end-to-end.
 - **Dead-letter sink routing**: per-record decode errors become `RS-1003`
   events and are routed to a configurable DLQ sink. Implemented as a
@@ -1170,6 +1170,15 @@ binding.
 - `EXPLAIN` shows `read_dependent=true/false` for CRDT delta DML.
 - `TxnShape` classifier correctly identifies blind-commutative vs.
   read-dependent transactions in unit tests.
+- **Session-scoped automatic read-your-writes** (DESIGN.md §12.8.1): after
+  a `COMMIT` the session's `last_written_epoch` is set; subsequent `SELECT`s
+  in the same connection automatically apply `wait_for` with no client action.
+  `session_wait_for_triggered_total` metric increments on each implicit
+  wait-for application. Timeout returns `RS-2012`.
+- **`INSERT ... RETURNING`** (DESIGN.md §12.8.2 and §13.5.2): single-round-trip
+  write + read back for auto-generated keys. Multi-row form (`INSERT ... SELECT
+  ... RETURNING`) works. `UPDATE ... RETURNING` and `DELETE ... RETURNING` are
+  not yet implemented.
 
 ---
 
@@ -1259,6 +1268,61 @@ binding.
   - Rolling-upgrade integration test: deploy N→N+1 with one worker at a time;
     assert no epoch loss and format-version gate fires on incompatible binary.
 
+---
+
+### v0.49 — Secondary Indexes
+
+This version adds `CREATE INDEX` as a user-facing OLTP ergonomics feature,
+backed by the existing IVM engine. See DESIGN.md §13.9 for the design.
+
+- **`CREATE INDEX <name> ON <table> (<column>[, ...])`** DDL:
+  - Planner creates a system-managed materialized view `__idx_<name>` with
+    `ARRANGE BY (index_cols, pk_cols)`.
+  - Index enters `BUILDING` state during backfill; transitions to `READY`
+    when index frontier catches up to base-table frontier.
+  - Index is invisible to `SHOW VIEWS`; queryable via
+    `rockstream.views WHERE view_type = 'INDEX'`.
+- **`CREATE INDEX ... WHERE <predicate>` (partial indexes)**: the system view
+  applies the predicate as a filter before the arrangement, reducing state
+  size for selective conditions.
+- **`DROP INDEX <name>`**: removes catalog entry and tears down the IVM
+  operator; arrangement state GC'd by frontier-aware compaction.
+- **`REBUILD INDEX <name>`**: re-runs backfill from current base-table
+  checkpoint.
+- **Planner index-selection rule**: optimizer recognizes
+  `<indexed_col> = <value>` predicates and compares estimated selectivity vs.
+  `index_prefer_selectivity_threshold` (default 0.01). Chooses between
+  `index_scan` and `shard_scan` path. `EXPLAIN` shows the selected path,
+  selectivity estimate, and frontier lag.
+- **Frontier lag guard**: if index frontier lags base-table frontier by more
+  than `index_max_lag_ms` (default: `freshness_target_ms × 2`), planner
+  falls back to `shard_scan` and emits `RS-2015 index.frontier_lag`.
+- **State accounting**: index state bytes count against the pipeline's
+  `state_budget_gb`; `EXPLAIN INCREMENTAL ESTIMATE` reports projected index
+  size.
+- **Error codes**: `RS-2014` (`index.building`), `RS-2015`
+  (`index.frontier_lag`), `RS-2016` (`index.name_conflict`).
+- **Simulation tests**: index backfill during concurrent writes; shard split
+  during backfill; index operator crash and recovery; planner correctly
+  selects index vs. full scan at the selectivity threshold boundary.
+
+**Exit criteria for v0.49**
+
+- `SELECT * FROM orders WHERE customer_id = 42` uses the index path when
+  `customer_id` is indexed and selectivity < threshold; `EXPLAIN` shows
+  `index_scan`.
+- Same query uses `shard_scan` when the index is in `BUILDING` state or
+  `frontier_lag > index_max_lag_ms`.
+- Partial index on `status = 'active'` stores fewer rows than a full index;
+  query using the index returns the same result as a base-table scan.
+- `DROP INDEX` removes the system view and index state GCs within the next
+  compaction cycle.
+- Index state bytes appear in `EXPLAIN INCREMENTAL ESTIMATE` output.
+- Simulation: no data loss or duplicate rows after shard split during index
+  backfill.
+
+---
+
 **Exit criteria**
 
 - 99.99% availability over a 30-day soak test on a 64-shard cluster.
@@ -1279,7 +1343,7 @@ binding.
 - Hosted-service deployment package (Helm chart, Terraform modules).
 - Public benchmarks vs. Feldera, RisingWave, Materialize on Nexmark / TPC-H.
 - Launch blog post + reference architecture diagrams.
-- **User-defined merge laws (`CREATE MERGE LAW`, v0.50)** behind a feature
+- **User-defined merge laws (`CREATE MERGE LAW`, v0.51)** behind a feature
   flag. A user-supplied law is rejected unless it ships:
   - a registered encoder/decoder pair;
   - a passing run of the shared property-test harness from v0.5 IVM-0
@@ -1293,7 +1357,7 @@ binding.
   A sample user-defined law (min-clamped counter) is included with the
   release and is exercised by the long-soak chaos suite.
 - **Optimistic transaction subset (`--experimental-optimistic-crdt-transactions`,
-  v0.50)** (DESIGN.md §13.5.1;
+  v0.51)** (DESIGN.md §13.5.1;
   [ideas/optimistic-locking-crdts.md](ideas/optimistic-locking-crdts.md)):
   - **`SERIALIZABLE LOCAL`**: when the planner proves all reads and writes
     touch one base-table shard, the gateway delegates to SlateDB per-shard
@@ -1337,7 +1401,7 @@ data lake ecosystem (DuckDB, Trino, Spark, dbt) without those tools
 needing to talk to RockStream's gateway. Implement the two-tier storage model
 designed in DESIGN.md §12.7 and the cold-tier sink/catalog designed in §13.6–§13.7.
 
-**Prerequisite decision gate**: by Production Beta (v0.51), the team evaluates
+**Prerequisite decision gate**: by Production Beta (v0.52), the team evaluates
 whether cold-tier storage is worth implementing or whether pushing Iceberg
 snapshots to external catalogs via sinks (§13.6.5 path only) is sufficient.
 If cold tier is confirmed, Phase 12 proceeds.
@@ -1362,7 +1426,7 @@ the audit log with the evidence considered.
 
 ---
 
-### v0.52 — Cold-Tier Parquet/Iceberg Sink
+### v0.53 — Cold-Tier Parquet/Iceberg Sink
 
 - **Iceberg cold-tier sink writer** (DESIGN.md §13.6):
   - `CREATE SINK ... TO ICEBERG '<path>' WITH (...)` DDL processing.
@@ -1405,7 +1469,7 @@ the audit log with the evidence considered.
   - Metrics: `cold_snapshot_count`, `cold_snapshot_bytes`,
     `cold_gc_last_run_epoch`, `cold_gc_bytes_reclaimed`.
 
-**Exit criteria for v0.52**
+**Exit criteria for v0.53**
 
 - DuckDB `iceberg_scan('s3://...')` reads a valid Iceberg v2 table written
   by RockStream.
@@ -1420,10 +1484,10 @@ the audit log with the evidence considered.
 
 ---
 
-### v0.53 — Catalog Registration & Iceberg REST Catalog Server
+### v0.54 — Catalog Registration & Iceberg REST Catalog Server
 
 - **Catalog registration backends** (DESIGN.md §13.6.5):
-  - `catalog = 'filesystem'` — no-op (already functional from v0.52).
+  - `catalog = 'filesystem'` — no-op (already functional from v0.53).
   - `catalog = 'glue'` — AWS Glue Data Catalog API integration.
   - `catalog = 'rest'` — Iceberg REST Catalog spec client for Polaris,
     Unity Catalog, Gravitino, Nessie.
@@ -1441,7 +1505,7 @@ the audit log with the evidence considered.
   - Auth: same bearer/mTLS as SQL gateway.
   - `rockstream-catalog` module inside `rockstream-gateway`.
 
-**Exit criteria for v0.53**
+**Exit criteria for v0.54**
 
 - Spark configured with `catalog.type=rest, catalog.uri=http://rockstream:8181/iceberg/v1`
   discovers and reads a RockStream view by name.
@@ -1453,7 +1517,7 @@ the audit log with the evidence considered.
 
 ---
 
-### v0.54 — Cold-Tier Correctness Soak & Cost Accounting
+### v0.55 — Cold-Tier Correctness Soak & Cost Accounting
 
 - **Delta Lake full support**: remove `--experimental-delta-sink` flag;
   Delta `_delta_log/` format with add/remove actions; readable by DuckDB
@@ -1486,7 +1550,7 @@ the audit log with the evidence considered.
   integration examples, catalog configuration reference, optimistic
   transaction user guide (shapes, error codes, retry patterns).
 
-**Exit criteria for v0.54 (Phase 12 complete)**
+**Exit criteria for v0.55 (Phase 12 complete)**
 
 - 7-day soak shows zero merge divergence.
 - Delta `_delta_log/` readable by DuckDB `delta_scan`.
@@ -1539,8 +1603,8 @@ These run in parallel with every phase.
 | Compaction filters break snapshot safety | Treat filters as retention only; explicit deletes for correctness; safety proofs and stale-reader tests before enabling filters. |
 | MergeOperator used for non-associative state | Restrict merge operators to registered `MergeLaw` entries (v0.5 IVM-0 catalog) with the shared property-test harness; implement MIN/MAX/Top-K/window/recursive retractions with explicit arrangements that may only use registered laws as cached subcomponents (DESIGN.md §6.11). |
 | Commutative monoids are mistaken for replay-safe CRDTs | `MergeLaw.properties.duplicate_policy` is mandatory at registration; non-idempotent laws (`SumCount/v1`, `WeightAdd/v1`, `PNCounter/v1`) require exactly-once source epochs or idempotency keys (gateway returns `RS-2007` if both are missing); every law contributes a duplicate-replay seed to the continuous simulation soak. |
-| User-defined CRDT functions break correctness or compaction | `CREATE MERGE LAW` is gated until v0.50 behind a feature flag and the shared property-test harness; the built-in catalog (v0.5–v0.45) must prove storage, planner, exchange, gateway, connector, compaction, and `EXPLAIN` first. |
-| Arrangement state outlives the law-version code | Every arrangement header stores `(law_id, law_version)`; old versions remain registered; mounts against unknown laws return `RS-5002`; incompatible law-version upgrades take the v0.39 blue/green plan-replacement path; v0.54 cold-tier soak proves law-version replay correctness. |
+| User-defined CRDT functions break correctness or compaction | `CREATE MERGE LAW` is gated until v0.51 behind a feature flag and the shared property-test harness; the built-in catalog (v0.5–v0.45) must prove storage, planner, exchange, gateway, connector, compaction, and `EXPLAIN` first. |
+| Arrangement state outlives the law-version code | Every arrangement header stores `(law_id, law_version)`; old versions remain registered; mounts against unknown laws return `RS-5002`; incompatible law-version upgrades take the v0.39 blue/green plan-replacement path; v0.55 cold-tier soak proves law-version replay correctness. |
 | Frontier protocol implementation bugs | Heavy property testing; reference implementation in pure logic for comparison. |
 | Object-store cost dominates | Aggressive local SST cache; coalesce small writes; tier cold state; WAL listing cache. |
 | WAL listing becomes a hot-path cost | Per-shard WAL listing cache, tail via `WalReader::get(latest_id+1)`; Phase 3.5 listing-cost test. |
@@ -1566,7 +1630,7 @@ These run in parallel with every phase.
 | **Partial multi-shard visibility leaks through CRDT writes** | Require transaction envelope for atomic visibility or document feature as idempotent write batches; add `crdt_txn_pending_visible_total` invariant metric that must stay at zero. |
 | **Row-version metadata bloats hot write path** | Start at row-level granularity; measure write amplification; consider column-group versions only if false-conflict rate exceeds threshold. |
 | **Compaction folds pending transaction operands** | Pending operands use distinct visibility state; compaction refuses to fold until committed frontier/envelope is stable; Phase 12 soak verifies. |
-| **Optimistic transactions become a hidden transaction manager** | Keep accepted subset exact-key only pre-1.0; document every unsupported shape in `EXPLAIN`; v0.54 decision gate determines promotion vs. deferral. |
+| **Optimistic transactions become a hidden transaction manager** | Keep accepted subset exact-key only pre-1.0; document every unsupported shape in `EXPLAIN`; v0.55 decision gate determines promotion vs. deferral. |
 
 ### Team Structure (Suggested)
 
@@ -1624,9 +1688,9 @@ Total: 8–9 engineers for ~12-month path to GA.
     alongside the HA hardening milestone.
 12. **Transaction envelope vs. documented weaker visibility for multi-shard
     CRDT writes**: if atomic all-or-nothing visibility across shards is not
-    implemented by v0.50, multi-shard CRDT transactions must be renamed to
+    implemented by v0.51, multi-shard CRDT transactions must be renamed to
     "commutative write batches" and the feature flag becomes
-    `--experimental-commutative-write-batches`. Resolve by v0.50 based on
+    `--experimental-commutative-write-batches`. Resolve by v0.51 based on
     implementation feasibility and simulation results. See
     [ideas/optimistic-locking-crdts.md §9](ideas/optimistic-locking-crdts.md).
 

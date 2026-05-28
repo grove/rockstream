@@ -186,6 +186,16 @@ object storage.
 > (IMPLEMENTATION_PLAN.md); data quality/expectations explicitly deferred to
 > post-1.0 with extension-point design (§15.1).
 >
+> **v3.21 adds three HTAP ergonomics gaps** that were absent from the
+> design despite being directly enabled by existing machinery: session-scoped
+> automatic read-your-writes so applications never thread freshness tokens
+> manually (§12.8); `INSERT ... RETURNING` so applications receive written
+> rows back without a second round-trip (§12.8.2); and secondary indexes so
+> non-primary-key lookups on base tables do not require a full shard scan or
+> a user-managed materialized view (§13.9). Version schedule updated:
+> v0.43 extended to cover §12.8 features; secondary indexes land at v0.49
+> (new slot); v0.49–v0.54 shift to v0.50–v0.55.
+>
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
 >   itself (PlanIR, the differentiation pass, the per-operator rules, the
@@ -212,10 +222,12 @@ object storage.
 11. [Fault Tolerance & Exactly-Once Semantics](#11-fault-tolerance--exactly-once-semantics)
 12. [Query Serving](#12-query-serving)
     - [12.7 Two-Tier View Storage](#127-two-tier-view-storage-design-decision)
+    - [12.8 OLTP Session Ergonomics](#128-oltp-session-ergonomics)
 13. [Connectors & External I/O](#13-connectors--external-io)
     - [13.6 Iceberg/Delta Cold-Tier Sink](#136-icebergdelta-cold-tier-sink)
     - [13.7 Native Iceberg REST Catalog](#137-native-iceberg-rest-catalog)
     - [13.8 Native DuckLake Catalog Server (deferred)](#138-native-ducklake-catalog-server-deferred)
+    - [13.9 Secondary Indexes](#139-secondary-indexes)
 14. [Operations: Deploy, Monitor, Diagnose](#14-operations-deploy-monitor-diagnose)
 15. [Comparison to Prior Art](#15-comparison-to-prior-art)
 16. [Optimality Assessment (v3.7)](#16-optimality-assessment-v37)
@@ -269,7 +281,7 @@ attempting them would compromise the rest of the design:
   and `REPEATABLE READ` are fully supported by the existing vector-frontier
   model (§12.6) and cover the vast majority of analytical and streaming
   workloads. `SERIALIZABLE LOCAL` (single-shard, planner-proven) is a candidate
-  extension (v0.50). Optimistic exact-key guarded writes for non-CRDT columns
+  extension (v0.51). Optimistic exact-key guarded writes for non-CRDT columns
   and blind commutative writes for CRDT columns are planned pre-1.0 (§13.5.1).
   General cross-shard `SERIALIZABLE` remains out of scope. See
   [ideas/optimistic-locking-crdts.md](ideas/optimistic-locking-crdts.md).
@@ -284,7 +296,7 @@ attempting them would compromise the rest of the design:
   an idempotent join-semilattice column could become a region-spanning surface
   later, but no version through 1.0 promises that path.
 - **Arbitrary user-defined merge functions before the built-in CRDT catalog
-  ships.** `CREATE MERGE LAW` is gated on the v0.50 built-in catalog and shared
+  ships.** `CREATE MERGE LAW` is gated on the v0.51 built-in catalog and shared
   property-test suite (§6.11; [ideas/crdts.md](ideas/crdts.md)).
 - **Per-query cost accounting ($/query) in the hot path.** Cost visibility in
   `EXPLAIN ESTIMATE` is a design goal; per-query billing middleware and
@@ -1112,7 +1124,7 @@ in [ideas/crdts.md](ideas/crdts.md); the design-level commitments are:
 7. **User-visible CRDT column types** (`COUNTER`, `MAX_REGISTER`,
    `MIN_REGISTER`, `LWW`, `G_SET`, `OR_SET`, plus `APPROX_*` sketches)
    land in v0.43–v0.45 once the internal law contract is proven.
-   `CREATE MERGE LAW` for user-defined laws is gated until v0.50 and
+   `CREATE MERGE LAW` for user-defined laws is gated until v0.51 and
    the built-in catalog property suite must accept it before it can be
    used in a `PlanNode`. Non-idempotent laws written through the
    direct-write gateway require either exact-once source offsets or an
@@ -1981,7 +1993,7 @@ streaming workloads.
 | `READ COMMITTED` | Each statement pins to the latest published vector frontier at statement start. |
 | `REPEATABLE READ` | `BEGIN` pins the session to a specific vector frontier; all statements in the transaction see that snapshot. |
 | `SERIALIZABLE` | **Not supported** for cross-shard transactions (requires cross-shard conflict detection; see §1.1). Returns `RS-2003 isolation.serializable_not_supported`. |
-| `SERIALIZABLE LOCAL` | Candidate v0.50: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
+| `SERIALIZABLE LOCAL` | Candidate v0.51: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
 
 **Optimistic write semantics** (§13.5.1): direct-write transactions may use
 optimistic exact-key guards (`RS-2008` on conflict) and blind CRDT writes
@@ -2219,6 +2231,111 @@ roadmap version. See IMPLEMENTATION_PLAN.md §Phase 9.
 
 ---
 
+### 12.8 OLTP Session Ergonomics
+
+Two capabilities make the direct-write path feel transactional to application
+developers without requiring them to manage freshness tokens or issue extra
+read round-trips.
+
+#### 12.8.1 Session-Scoped Automatic Read-Your-Writes
+
+v0.42 added `wait_for=<FreshnessToken>` as an explicit per-query opt-in.
+For OLTP patterns — write a row, then read it back — clients must thread the
+token from the write response into the next read. Standard database drivers
+do not do this, so application developers face stale reads unless they add
+custom middleware.
+
+**Session-scoped tracking.** The gateway session maintains:
+
+```rust
+struct SessionState {
+    // ...existing fields...
+    last_written_epoch: Option<FreshnessToken>,
+}
+```
+
+On any successful `COMMIT` through the internal source connector (§13.5),
+the gateway updates `last_written_epoch` with the freshness token for that
+commit. On any subsequent `SELECT` in the same session, the gateway
+automatically applies `wait_for = last_written_epoch` before pinning the
+vector frontier — exactly as if the client had passed the token explicitly.
+
+**Visibility contract.** Within a session:
+- Any row written by a prior `COMMIT` in the same session is visible to all
+  subsequent `SELECT` statements, with no client-side coordination.
+- If the frontier has not yet advanced (e.g. under high write rate), the
+  gateway waits up to `session_wait_for_timeout` (default: equal to the
+  pipeline's freshness SLO) before returning. Timeout returns `RS-2012
+  session.wait_for_timeout` and the query proceeds at the current frontier.
+- The token is reset on explicit `SET TRANSACTION ISOLATION LEVEL READ
+  COMMITTED` / `REPEATABLE READ` or on connection close.
+
+**Opt-out.** A session can disable automatic wait-for with
+`SET rockstream.session_wait_for = off`. This is useful for analytical
+sessions that perform bulk reads after streaming ingestion and do not need
+read-your-writes.
+
+**No new distributed machinery.** Automatic session wait-for is purely
+gateway session bookkeeping. It reuses the existing `wait_for` code path;
+the only new state is one `Option<FreshnessToken>` per session and the
+`session_wait_for_timeout` SLO parameter.
+
+**Metrics added:**
+
+| Metric | Description |
+|---|---|
+| `session_wait_for_triggered_total` | Count of queries where implicit wait-for was applied. |
+| `session_wait_for_satisfied_ms` | Histogram: time from trigger to frontier satisfaction. |
+| `session_wait_for_timeout_total` | Count of queries that exceeded the SLO and fell through to current frontier. |
+
+**Ships**: v0.43 (extends the direct-write surface).
+
+#### 12.8.2 `INSERT ... RETURNING`
+
+The standard OLTP pattern is: write a row with an auto-assigned identity
+(e.g. a UUID primary key or a sequence), then use that identity in a
+subsequent operation. Without `RETURNING`, the client must either pre-generate
+the key client-side or issue a second `SELECT` after commit.
+
+**Syntax:**
+
+```sql
+INSERT INTO orders (customer_id, total)
+VALUES (42, 199.99)
+RETURNING order_id, created_at;
+```
+
+**Execution.** The gateway:
+1. Executes the `INSERT` through the internal source connector, receiving the
+   committed `FreshnessToken`.
+2. Sets `last_written_epoch` (§12.8.1) and waits for the frontier to advance
+   to the written epoch.
+3. Executes a point read `SELECT ... WHERE <pk> = <inserted_pk>` against the
+   shard at the satisfied frontier.
+4. Returns the projected columns to the client inline with the `INSERT`
+   response.
+
+From the client's perspective, `INSERT ... RETURNING` is a single round-trip:
+the response contains the written row as if it were a `SELECT` result.
+
+**Constraints and error handling:**
+
+| Case | Behaviour |
+|---|---|
+| Auto-generated primary key (default UUID or `gen_random_uuid()`) | Key is assigned before the `WriteBatch` commit; `RETURNING` reads by that key. |
+| Sequence column | Sequence is incremented atomically in the `WriteBatch`; `RETURNING` reads the assigned value. |
+| Multi-row `INSERT ... SELECT` | `RETURNING` returns one row per inserted row in insertion order. |
+| Wait-for timeout | Returns `RS-2012`; partial row may be committed but not readable; client must retry with idempotency key. |
+
+`INSERT ... RETURNING` does **not** extend to `UPDATE ... RETURNING` or
+`DELETE ... RETURNING` in v0.43. Those variants require the gateway to read
+old state before the write, which adds read-modify-write latency. They are
+deferred post-1.0.
+
+**Ships**: v0.43 (extends the direct-write surface).
+
+---
+
 ## 13. Connectors & External I/O
 
 ### 13.1 Source Connectors
@@ -2425,10 +2542,10 @@ transaction into one of five shapes:
 
 | Shape | Description | Pre-1.0? |
 |---|---|---:|
-| `ShardLocalSerializable` | Planner proves all reads/writes touch one shard; delegates to SlateDB transaction. | v0.50 |
+| `ShardLocalSerializable` | Planner proves all reads/writes touch one shard; delegates to SlateDB transaction. | v0.51 |
 | `BlindCommutative` | All writes are registered CRDT operands with `read_dependent = false`. | v0.43+ |
-| `OptimisticExactKey` | Non-CRDT exact-key writes validated against per-row versions. | v0.50 |
-| `MixedCrdtAndOptimisticExactKey` | CRDT writes skip validation; non-CRDT exact-key writes validate. | v0.54 experimental |
+| `OptimisticExactKey` | Non-CRDT exact-key writes validated against per-row versions. | v0.51 |
+| `MixedCrdtAndOptimisticExactKey` | CRDT writes skip validation; non-CRDT exact-key writes validate. | v0.55 experimental |
 | `Unsupported` | Predicate reads, range reads, cross-shard uniqueness, foreign keys, or any shape requiring general serializability. Returns `RS-2009`. | No |
 
 **Row-version metadata.** Each direct-write base-table row carries a
@@ -2474,6 +2591,31 @@ convergence, not as atomic SQL transactions.
 CRDT writes coordination-light. Write-skew cycles across shards are not
 detected. Users requiring general serializability must use `SERIALIZABLE LOCAL`
 (single-shard) or accept `RS-2009`.
+
+---
+
+### 13.5.2 `INSERT ... RETURNING` Implementation
+
+See §12.8.2 for the design. This subsection records the implementation
+constraints specific to the internal source connector path.
+
+**Key assignment before commit.** When the `INSERT` statement targets a column
+with `DEFAULT gen_random_uuid()` or a sequence, the gateway generates or
+advances the value *inside the transaction buffer* before calling
+`WriteBatch`. This ensures `RETURNING` can read by the known key without a
+read-before-write on the shard.
+
+**Point-read after frontier advance.** After the `WriteBatch` commits, the
+gateway issues a `ShardDb::get()` call on the base-table shard at the
+frequently-satisfied frontier. This is a single key lookup — O(1) cost — not a
+scan. If the key is not found at the expected frontier (e.g. due to an
+indexed delete in the same epoch), the gateway returns `RS-2013
+transaction.returning_key_not_found` and the client should re-read.
+
+**Interaction with §13.5.1 optimistic validation.** `INSERT ... RETURNING`
+for a `BlindCommutative` or `ShardLocalSerializable` transaction shape does
+not trigger extra validation — the post-commit read is a read at the
+already-committed frontier, not a read inside the commit protocol.
 
 ---
 
@@ -2864,6 +3006,117 @@ an Iceberg REST catalog endpoint.
 Until then, `catalog = 'ducklake'` in §13.6.5 (push registration into an
 existing DuckLake database) covers the integration use case, and §13.7
 covers self-contained DuckDB discovery.
+
+---
+
+### 13.9 Secondary Indexes
+
+Without secondary indexes, looking up base-table rows by a non-primary-key
+column requires either a full shard scan or a manually-declared materialized
+view. Both are painful for OLTP applications that need `SELECT ... WHERE
+customer_id = ?` to run at µs–ms latency.
+
+#### 13.9.1 Design: A Secondary Index Is a Materialized IVM View
+
+A secondary index is syntactic sugar for a system-managed materialized view
+over the base table, arranged by the index column(s):
+
+```sql
+CREATE INDEX orders_by_customer ON orders (customer_id);
+-- Internally equivalent to:
+-- CREATE MATERIALIZED VIEW __idx_orders_by_customer AS
+--   SELECT * FROM orders ARRANGE BY (customer_id, <pk>);
+```
+
+The index view:
+- Is maintained incrementally by the IVM engine, like any other view.
+- Stores rows arranged as `(index_key, pk_cols) → row_bytes` in `view_output/`
+  on the shards assigned to the index operator.
+- Advances its frontier with the base-table source; index freshness lags base
+  table by at most one epoch (same guarantee as any derived view).
+- Is invisible to users as a queryable view (`SHOW VIEWS` does not list it);
+  it is accessible only through the planner's index-selection path.
+
+The index name is reserved in the catalog namespace. It cannot conflict with
+existing table or view names.
+
+#### 13.9.2 Planner Integration
+
+The SQL compiler's optimizer recognizes index-scannable predicates:
+
+```sql
+SELECT * FROM orders WHERE customer_id = 42;
+-- Planner choice: base-table shard scan vs. index on customer_id
+```
+
+The planner chooses the index path when:
+1. An index exists on the predicate column(s).
+2. The estimated selectivity (predicate matches / total rows) is below
+   `index_prefer_selectivity_threshold` (default 0.01 — prefer index if the
+   predicate matches fewer than 1% of rows).
+3. The index frontier satisfies the query's freshness requirement (i.e.
+   `index_frontier >= wait_for` if set).
+
+If condition 3 is not met (index is behind the base table frontier), the
+planner falls back to the base-table scan path.
+
+`EXPLAIN` output shows `index_scan(orders_by_customer, customer_id = 42)` vs.
+`shard_scan(orders)` and the selectivity estimate used.
+
+#### 13.9.3 Partial Indexes
+
+An index may declare a `WHERE` predicate to index only matching rows:
+
+```sql
+CREATE INDEX active_orders ON orders (customer_id) WHERE status = 'active';
+```
+
+The IVM view for the partial index filters the base-table delta before
+arranging, so only `status = 'active'` rows are stored. This reduces index
+state size for high-cardinality filtered columns.
+
+Partial index queries must include the index predicate (or a stronger
+predicate) in the query's `WHERE` clause for the planner to use the index.
+
+#### 13.9.4 Lifecycle
+
+**Online creation.** `CREATE INDEX` triggers a backfill: the base-table
+checkpoint is scanned once to build the initial arrangement, then live deltas
+are applied. During backfill, the index is in `BUILDING` state and the planner
+does not use it. Once the index frontier catches up to the base-table frontier,
+it transitions to `READY`.
+
+**Concurrent writes.** Writes to the base table during backfill are buffered
+as normal IVM deltas and applied to the index after the initial scan. No write
+blocking occurs.
+
+**`DROP INDEX`.** Removes the catalog entry and the system view. The IVM
+operator is torn down; arrangement state is GC'd by a frontier-aware
+compaction filter after the index frontier is closed.
+
+**`REBUILD INDEX`.** Re-runs the backfill from the current base-table
+checkpoint. Useful when compaction debt has degraded index read performance.
+
+#### 13.9.5 State and Storage Budget
+
+Each index view is a separate arrangement. Its state bytes count against the
+pipeline's `state_budget_gb` quota (§14.13). `EXPLAIN INCREMENTAL ESTIMATE`
+reports projected index state size based on source cardinality and the column
+value distribution (from connector stats, §4.0).
+
+`rockstream.views` (§12.6.1) lists system index views with `view_type =
+'INDEX'` alongside user views, so operators can observe state size and
+frontier lag per index.
+
+#### 13.9.6 Error Codes
+
+| Code | Name | Meaning |
+|---|---|---|
+| `RS-2014` | `index.building` | Query used index path but index is still in `BUILDING` state (should not reach client; planner falls back). |
+| `RS-2015` | `index.frontier_lag` | Index frontier lags base-table frontier by more than `index_max_lag_ms`; query fell back to base-table scan. |
+| `RS-2016` | `index.name_conflict` | `CREATE INDEX` name conflicts with existing table, view, or index name. |
+
+**Ships**: v0.49.
 
 ---
 
@@ -3339,15 +3592,15 @@ no local-state assumptions) **+ full SQL via DBSP** (correctness guarantees) **+
 adaptive per-operator parallelism**.
 
 **GA vs. Data Lake GA scope.** The table above describes the system at
-full design scope (v0.54+). At Production Beta / v1.0 (v0.51), the cold-tier
+full design scope (v0.55+). At Production Beta / v1.0 (v0.52), the cold-tier
 Iceberg sink, Iceberg REST Catalog server, and DuckDB/Spark/Trino discovery-
-by-name are **not yet shipped** — they are Phase 12 deliverables (v0.52–v0.54).
+by-name are **not yet shipped** — they are Phase 12 deliverables (v0.53–v0.55).
 The v1.0 positioning therefore rests on: object-storage-native IVM, full SQL,
-adaptive parallelism, Postgres wire access, direct DML writes, and the
-connector ecosystem. The "first-class Iceberg table" story (§12.7, §13.6,
-§13.7) is a differentiator at Data Lake GA, not at Production Beta. Marketing
-materials and competitive positioning prior to v0.52 must not claim cold-tier
-or external-catalog features as shipping capabilities.
+adaptive parallelism, Postgres wire access, direct DML writes, secondary
+indexes, and the connector ecosystem. The "first-class Iceberg table" story
+(§12.7, §13.6, §13.7) is a differentiator at Data Lake GA, not at Production
+Beta. Marketing materials and competitive positioning prior to v0.53 must not
+claim cold-tier or external-catalog features as shipping capabilities.
 
 ### 15.1 Explicitly Deferred: Data Quality / Expectations
 

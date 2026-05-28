@@ -215,9 +215,9 @@ Each roadmap version is sized at roughly **10 person-weeks** of implementation e
 | Single-Shard Beta | v0.27 | Advanced IVM feature-complete for serious single-node testing |
 | Distributed Alpha | v0.36 | Multi-shard execution, frontier protocol, recovery, and exactly-once basics work |
 | Integration Beta | v0.45 | Postgres gateway, direct writes, and major external connectors work end to end |
-| Production Beta | v0.51 | Observability, auth, upgrades, security review, and long soaks ready for a pilot |
-| Data Lake GA | v0.54 | Cold-tier Iceberg/Delta sinks, native Iceberg REST catalog, external tool consumption proven |
-| 1.0 | post-v0.54 | Tagged only after a real production workload succeeds without design exceptions |
+| Production Beta | v0.52 | Observability, auth, upgrades, security review, and long soaks ready for a pilot |
+| Data Lake GA | v0.55 | Cold-tier Iceberg/Delta sinks, native Iceberg REST catalog, external tool consumption proven |
+| 1.0 | post-v0.55 | Tagged only after a real production workload succeeds without design exceptions |
 
 ### Phase Summary
 
