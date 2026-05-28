@@ -41,10 +41,10 @@ The phase numbers here map to ROADMAP.md roadmap versions as follows:
 | 5 | v0.31–v0.32 | Frontier protocol and progress tracking |
 | 6 | v0.33–v0.36 | Fault tolerance, exactly-once, chaos |
 | 7 | v0.37–v0.39 | Elasticity: split, merge, drain, clone |
-| 8 | v0.42–v0.44 | Connectors and sinks (Tier 1 + Tier 2 contract) |
-| 9 | v0.40–v0.41 | Postgres query gateway, freshness, subscribe |
-| 10 | v0.45–v0.48 | Auth, observability, upgrades, security |
-| 11 | v0.49–v0.50 | Long soak and production beta handoff |
+| 8 | v0.43–v0.45 | Connectors and sinks (Tier 1 + Tier 2 contract) |
+| 9 | v0.40–v0.42 | Postgres query gateway, introspection, freshness, subscribe |
+| 10 | v0.46–v0.49 | Auth, observability, upgrades, security |
+| 11 | v0.50–v0.51 | Long soak and production beta handoff |
 
 Durations are indicative effort, not calendar time, and assume a small
 dedicated team. The ROADMAP.md version table is the single source of truth
@@ -884,10 +884,12 @@ protocol. Make RockStream self-contained (no external broker required).
 
 **Deliverables**
 
+### v0.40 — Postgres Read Gateway (core)
+
 - **pgwire gateway** (stateless, horizontally scalable):
   - Postgres wire protocol (`pgwire` crate): startup, query, extended-query,
     copy-out, terminate message flows.
-  - Routes lookups & range scans to the correct shards via `DbReader`.
+  - Routes lookups \& range scans to the correct shards via `DbReader`.
   - Ad-hoc SQL over materialized views (DataFusion on a snapshot).
   - Connection pooling, query timeouts, rate limiting.
 - **Postgres catalog stubs** required by ORMs:
@@ -904,14 +906,44 @@ protocol. Make RockStream self-contained (no external broker required).
   - `REPEATABLE READ`: `BEGIN` captures a vector frontier; all statements in
     the transaction see that snapshot; `COMMIT`/`ROLLBACK` releases it.
   - `SERIALIZABLE`: rejected with `RS-2003 isolation.serializable_not_supported`.
-- **Internal (direct-write) source connector** (DESIGN.md §13.5):
-  - `INSERT`/`UPDATE`/`DELETE` DML over the Postgres wire protocol appended to
-    a per-connection write buffer.
-  - `COMMIT` flushes as an atomic Z-set delta via `WriteBatch` to a dedicated
-    base-table shard, receiving the shard's next `source_epoch`.
-  - `ROLLBACK` discards the buffer without shard writes.
-  - Exit criterion: `psql` can `INSERT INTO t VALUES (...); SELECT * FROM view`
-    and see the view reflect the insert within `freshness_target_ms`.
+
+**Exit criteria for v0.40**
+
+- `psql` connects, runs `SELECT * FROM my_view LIMIT 10`, returns < 10 ms.
+- SQLAlchemy ORM reflects view schema without errors.
+- `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` returns `RS-2003`.
+
+---
+
+### v0.41 — Gateway Introspection and Read Performance
+
+- **Cross-shard partial aggregation pushdown** (DESIGN.md §12.3.1): for queries
+  of the form `SELECT agg, key FROM mv GROUP BY key`, the gateway pushes partial
+  aggregation to shards and merges O(groups) rows rather than O(view rows).
+- **`rockstream` system schema** (DESIGN.md §12.6.1): virtual tables
+  (`rockstream.epochs`, `rockstream.pipelines`, `rockstream.views`,
+  `rockstream.shards`, `rockstream.connectors`, `rockstream.audit_log`,
+  `rockstream.schema_history`) projecting control-plane state through the
+  standard SQL interface. No additional storage required.
+- **Arrangement segment cache** (DESIGN.md §5.4): per-worker LRU cache
+  keyed by `(shard_id, segment_id)`, bounded by `segment_cache_bytes`
+  (default 512 MB). Populated on `DbReader` segment fetches for join lookups
+  and gateway reads; invalidated on compaction via manifest-poll. Reported
+  as `segment_cache_hit_ratio` and `segment_cache_bytes_used` metrics.
+
+**Exit criteria for v0.41**
+
+- `SELECT COUNT(*), region FROM mv GROUP BY region` pushes partial agg to
+  shards; gateway receives O(groups) rows, not O(view rows).
+- `SELECT * FROM rockstream.epochs WHERE pipeline_id = 'orders'` returns
+  committed epoch history without additional storage writes.
+- Segment cache hit ratio > 80% for a hot-join benchmark with a working set
+  that fits within `segment_cache_bytes`.
+
+---
+
+### v0.42 — Freshness, Subscribe, Isolation, and Historical Queries
+
 - **Subscribe API**: gRPC streaming endpoint that tails view changes (via
   `WalReader` on the relevant shards). Gateway proxies subscriptions; raw
   shard access is never exposed to clients.
@@ -928,16 +960,27 @@ protocol. Make RockStream self-contained (no external broker required).
   - Configurable `checkpoint_retention_count` (default 128) and
     `checkpoint_retention_duration` (default min(view retention, 7d)) control
     how far back historical queries can reach.
-- **`rockstream` system schema** (DESIGN.md §12.6.1): virtual tables
-  (`rockstream.epochs`, `rockstream.pipelines`, `rockstream.views`,
-  `rockstream.shards`, `rockstream.connectors`, `rockstream.audit_log`,
-  `rockstream.schema_history`) projecting control-plane state through the
-  standard SQL interface. No additional storage required.
-- **Arrangement segment cache** (DESIGN.md §5.4): per-worker LRU cache
-  keyed by `(shard_id, segment_id)`, bounded by `segment_cache_bytes`
-  (default 512 MB). Populated on `DbReader` segment fetches for join lookups
-  and gateway reads; invalidated on compaction via manifest-poll. Reported
-  as `segment_cache_hit_ratio` and `segment_cache_bytes_used` metrics.
+- **Internal (direct-write) source connector** (DESIGN.md §13.5):
+  - `INSERT`/`UPDATE`/`DELETE` DML over the Postgres wire protocol appended to
+    a per-connection write buffer.
+  - `COMMIT` flushes as an atomic Z-set delta via `WriteBatch` to a dedicated
+    base-table shard, receiving the shard's next `source_epoch`.
+  - `ROLLBACK` discards the buffer without shard writes.
+
+**Exit criteria for v0.42 (Phase 9 complete)**
+
+- `psql` runs `INSERT INTO t VALUES (...); COMMIT` and view reflects it within
+  `freshness_target_ms`.
+- Read-your-writes demo passes.
+- Subscribe stream survives gateway restart with no data loss.
+- `SELECT * FROM orders_mv AS OF EPOCH <past>` returns the correct historical
+  snapshot; queries beyond retention return `RS-2005`.
+- `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` returns `RS-2003`.
+
+---
+
+**Additional Phase 9 deliverables (cross-cutting)**
+
 - **Authentication / authorization**: OIDC / bearer-token auth at the gateway;
   per-view RBAC with `viewer` / `pipeline_owner` / `admin` roles stored in the
   control-plane catalog (DESIGN.md §12.5). `rockstream login` CLI flow for
@@ -948,21 +991,6 @@ protocol. Make RockStream self-contained (no external broker required).
 - **Storage format version gate**: binary reads `shard_meta/0x06 0xFV` on
   shard open; refuses if version out of supported range (DESIGN.md §5.5,
   error `RS-5001`). `rockstream migrate` tool skeleton.
-
-**Exit criteria**
-
-- `psql` connects, runs `SELECT * FROM my_view LIMIT 10`, returns < 10 ms.
-- `psql` runs `INSERT INTO t VALUES (...); COMMIT` and view reflects it within
-  `freshness_target_ms`.
-- SQLAlchemy ORM reflects view schema without errors.
-- Subscribe stream survives gateway restart with no data loss.
-- `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` returns `RS-2003`.
-- `SELECT * FROM orders_mv AS OF EPOCH <past>` returns the correct historical
-  snapshot; queries beyond retention return `RS-2005`.
-- `SELECT * FROM rockstream.epochs WHERE pipeline_id = 'orders'` returns
-  committed epoch history without additional storage writes.
-- Segment cache hit ratio > 80% for a hot-join benchmark with a working set
-  that fits within `segment_cache_bytes`.
 
 ---
 
