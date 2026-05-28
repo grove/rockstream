@@ -204,6 +204,7 @@ object storage.
 4. [SQL Compilation Pipeline](#4-sql-compilation-pipeline)
 5. [Per-Shard SlateDB Storage Layout](#5-per-shard-slatedb-storage-layout)
 6. [Operator Catalog & State Encodings](#6-operator-catalog--state-encodings)
+    - [6.11 Algebraic Merge Laws and CRDTs](#611-algebraic-merge-laws-and-crdts)
 7. [The Exchange (Shuffle) Subsystem](#7-the-exchange-shuffle-subsystem)
 8. [Frontier Protocol & Progress Tracking](#8-frontier-protocol--progress-tracking)
 9. [Atomic Epoch Commit Protocol](#9-atomic-epoch-commit-protocol)
@@ -244,6 +245,7 @@ object storage.
 | P15 | **Bounded staleness for cross-shard reads.** | Query gateways pin to a published cluster frontier (a vector of per-shard checkpoints) rather than to wall-clock "fresh"; the staleness budget is documented and observable. |
 | P16 | **Operability is a first-class system property.** | The system is SLO-driven (operators state intent; the control plane chooses mechanism), self-tuning by default, deployable as a single binary, observable by construction, and unable to surprise its operator: every degradation has a named reason, every control action is auditable, and every pipeline runs inside enforced quotas. One number (frontier lag against the SLO) answers "is it healthy?"; everything else is a drill-down. |
 | P17 | **Scale down before scaling out.** | A one-shard local pipeline must avoid distributed overhead; a thousand-shard pipeline must avoid all-to-all amplification. Placement, exchange, and frontier aggregation optimize for locality first, then parallelism. |
+| P18 | **Algebraic merge laws are a database-wide contract.** | A single registered `MergeLaw` catalog in `rockstream-types` describes every commutative monoid, join-semilattice CRDT, and operation CRDT used by the engine. Storage, planner, exchange, frontier, gateway, connectors, compaction, and `EXPLAIN INCREMENTAL` all consume the same catalog; none of them redefines its own merge semantics. See §6.11 and [ideas/crdts.md](ideas/crdts.md). |
 
 ### 1.1 Non-Goals (Explicit)
 
@@ -275,7 +277,12 @@ attempting them would compromise the rest of the design:
 - **Active-active multi-region writes.** The single-writer fence per shard is
   a hard constraint against concurrent writers in different regions. Multi-region
   active-passive (read replicas via `DbReader` on a cross-region object-store
-  bucket) is future work, not v1.
+  bucket) is future work, not v1. The §6.11 merge-law catalog is structured so
+  an idempotent join-semilattice column could become a region-spanning surface
+  later, but no version through 1.0 promises that path.
+- **Arbitrary user-defined merge functions before the built-in CRDT catalog
+  ships.** `CREATE MERGE LAW` is gated on the v0.50 built-in catalog and shared
+  property-test suite (§6.11; [ideas/crdts.md](ideas/crdts.md)).
 - **Per-query cost accounting ($/query) in the hot path.** Cost visibility in
   `EXPLAIN ESTIMATE` is a design goal; per-query billing middleware and
   chargeback to tenants is an application-layer concern out of scope.
@@ -1049,6 +1056,72 @@ Sorted index keyed by value-descending:
 `scan(prefix..).take(K)` returns the top-K. Maintenance is incremental:
 insert/delete updates the index; if the change crosses the K-th boundary, emit a
 delta replacing the displaced entry.
+
+### 6.11 Algebraic Merge Laws and CRDTs
+
+Many operators in §6.2, §6.6, the watermark plumbing in §6.9, the
+exchange combiner in §7.5, and the gateway pushdown in §12.3.1 share
+the same underlying question: *when can two updates be merged without
+coordination?* RockStream answers that question once, in a single
+catalog of **merge laws** (commutative monoids, join-semilattice CRDTs,
+and operation CRDTs) that every layer consumes. The full strategy lives
+in [ideas/crdts.md](ideas/crdts.md); the design-level commitments are:
+
+1. **The catalog lives in `rockstream-types`**, not in storage. Every
+   law is registered with a stable `MergeLawId`, a `version`, and a
+   `LawBundle` carrying the encoder, the SlateDB merge function, a
+   frontier-aware compaction filter, an optional gateway combiner for
+   partial-aggregation pushdown, and an `EXPLAIN` formatter.
+
+2. **Every persisted arrangement and every persisted plan stores
+   `(law_id, law_version)`.** A shard mount that cannot resolve the
+   bundle refuses with `RS-5002 unknown merge law` rather than
+   silently mis-merging. Law versions interact with the storage-format
+   versioning of §5.5: compaction never folds across a version boundary
+   unless the law declares it safe.
+
+3. **Commutative monoids are not idempotent CRDTs.** `SumCount/v1` and
+   `WeightAdd/v1` are associative and commutative but require the
+   exactly-once epoch envelope of §11 and the connector contract of
+   §13.3. Replay-tolerance lives only in laws explicitly tagged
+   `idempotent` (e.g. `MaxRegister/v1`, `GSet/v1`, `HyperLogLog/v1`,
+   `BloomUnion/v1`). The two classes never get conflated in code, in
+   storage, or in `EXPLAIN INCREMENTAL`.
+
+4. **Combiner eligibility comes from the planner.** §7.5's pre-shuffle
+   combiner and the hierarchical-exchange variant consume the
+   planner-attached `MergeLawId` on each `Exchange` node. The v0.4
+   SUM/COUNT/AVG allowlist disappears in v0.30 in favour of generic
+   law-driven combining, with an uncombined-equivalence property test
+   per registered law.
+
+5. **`EXPLAIN INCREMENTAL` always prints either the law or the reason
+   no law applies.** The set of `not_merge_safe_reason` strings is a
+   closed enum in `rockstream-types`.
+
+6. **Retraction-aware operators are not CRDTs.** MIN/MAX with deletes
+   (§6.3), exact Top-K (§6.10), windows (§6.9), and recursive DRed
+   state (§6.8) keep their explicit arrangements. A retraction-aware
+   operator *may* use a registered law for a cached subcomponent
+   (e.g. a `MaxRegister/v1` slot inside MIN/MAX), but the operator as
+   a whole is not a pure CRDT.
+
+7. **User-visible CRDT column types** (`COUNTER`, `MAX_REGISTER`,
+   `MIN_REGISTER`, `LWW`, `G_SET`, `OR_SET`, plus `APPROX_*` sketches)
+   land in v0.43–v0.45 once the internal law contract is proven.
+   `CREATE MERGE LAW` for user-defined laws is gated until v0.50 and
+   the built-in catalog property suite must accept it before it can be
+   used in a `PlanNode`. Non-idempotent laws written through the
+   direct-write gateway require either exact-once source offsets or an
+   idempotency key; a write missing both is rejected with `RS-2007`.
+
+8. **Active-active multi-region writes remain a non-goal through 1.0.**
+   The law contract is structured so an idempotent join semilattice
+   could become a region-spanning column later, but no public surface
+   promises it and no §11 invariant relaxes for it.
+
+The reserved `MergeLawId` block and built-in catalog (tag bytes, law
+classes, lands-in versions) are listed in [ideas/crdts.md §6](ideas/crdts.md).
 
 ---
 
@@ -3047,10 +3120,14 @@ RS-2001  view.unsupported_sql_construct
 RS-2002  view.state_budget_exceeded
 RS-2003  isolation.serializable_not_supported
 RS-2005  history.epoch_before_retention
+RS-2007  write.idempotency_key_required
 RS-3001  shard.fence_lost
 RS-3002  shard.recovery_replay_failed
+RS-3009  merge.malformed_operand
 RS-4001  control.quota_violation
 RS-4002  control.autotune_bounds_exhausted
+RS-5001  storage.format_version_incompatible
+RS-5002  merge.unknown_law
 ```
 
 `rockstream` exits non-zero on any RS-coded error and prints a one-line
