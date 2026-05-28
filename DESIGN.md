@@ -1,8 +1,8 @@
 # RockStream: Massively-Parallel Incremental View Maintenance on SlateDB
 
 A design for a horizontally-scalable, full-SQL incremental view maintenance (IVM)
-system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWave,
-and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
+system inspired by Feldera (DBSP), Materialize (Differential Dataflow), and RisingWave
+— built on a mesh of SlateDB instances backed by
 object storage.
 
 > **Status**: Design v3.20. v3 reframed the engine around DBSP-native operators
@@ -133,7 +133,7 @@ object storage.
 >
 > **v3.16 fills in the external consumption story**: the cold tier writes valid
 > Iceberg v2 tables (§12.7.2) to object storage so downstream tools (DuckDB,
-> Snowflake, Trino, Spark) can query view snapshots directly — no RockStream
+> Trino, Spark) can query view snapshots directly — no RockStream
 > in the read path. §13.6 adds the Iceberg/Delta cold-tier sink connector as a
 > first-class built-in, with `CREATE SINK` syntax, the checkpoint-to-manifest
 > lifecycle, and the external consumption contract. This firmly establishes
@@ -2062,12 +2062,6 @@ CREATE VIEW orders_mv AS
   SELECT * FROM iceberg_scan('s3://bucket/views/orders_mv/iceberg_table');
 SELECT region, SUM(total) FROM orders_mv GROUP BY region;
 
--- Snowflake external Iceberg table
-CREATE EXTERNAL TABLE orders_mv
-  USING TEMPLATE (SELECT ARRAY_CONSTRUCT(*) FROM TABLE(INFER_SCHEMA(
-    LOCATION => '@my_stage/views/orders_mv/iceberg_table/',
-    FILE_FORMAT => 'my_parquet_fmt')))
-  LOCATION = '@my_stage/views/orders_mv/iceberg_table/';
 ```
 
 For the hot LSM tail (epochs after the last cold snapshot), external tools
@@ -2119,17 +2113,17 @@ slot-fits without touching the gateway planner.
 
 #### 12.7.4 Competitive Position
 
-| Workload | RockStream (hot only) | RockStream (two-tier) | Snowflake | DuckDB/Trino |
-|---|---|---|---|---|
-| Incremental view freshness | **10–250 ms** | **10–250 ms** | 1–5 min | n/a |
-| Point lookup on view | **µs–ms** | **µs–ms** | ms | n/a |
-| Pre-aggregated dashboard read | fast | fast | fast | n/a |
-| Full scan over 1B-row view | slow | **fast** | fast | fast |
-| Ad-hoc analytics | slow | **fast** | fast | fast |
+| Workload | RockStream (hot only) | RockStream (two-tier) | DuckDB/Trino |
+|---|---|---|---|
+| Incremental view freshness | **10–250 ms** | **10–250 ms** | n/a |
+| Point lookup on view | **µs–ms** | **µs–ms** | n/a |
+| Pre-aggregated dashboard read | fast | fast | n/a |
+| Full scan over 1B-row view | slow | **fast** | fast |
+| Ad-hoc analytics | slow | **fast** | fast |
 
 Without the cold tier, RockStream's natural role is producing fresh,
 pre-computed results and serving point/range lookups on them — **feeding**
-columnar analytics tools (Snowflake, DuckDB, Trino) via live Iceberg snapshots
+columnar analytics tools (DuckDB, Trino) via live Iceberg snapshots
 rather than competing with them on full-scan queries. With the cold tier, it
 becomes competitive for ad-hoc analytics over its own data as well.
 
@@ -2466,7 +2460,6 @@ gateway involvement**:
 | Tool | Access pattern |
 |---|---|
 | **DuckDB** | `iceberg_scan('s3://...')` or `delta_scan('s3://...')` — full predicate/column pushdown via Parquet statistics |
-| **Snowflake** | External Iceberg table on the same S3 prefix — auto-refreshes on new snapshots |
 | **Apache Spark / Trino** | Iceberg catalog pointing at the metadata path; reads via the standard Iceberg REST or Hive catalog |
 | **Apache Flink** | Iceberg source connector; can also subscribe to the Iceberg changelog for incremental reads |
 | **dbt** | Reads Iceberg/Delta tables as sources; runs `dbt run` against the cold snapshots |
@@ -2486,7 +2479,7 @@ This makes the architectural split explicit:
   Source data         │         RockStream                  │
   (Kafka, Postgres,   │  IVM engine: incremental SQL views  │
    direct DML)  ────► │  SlateDB hot LSM (10–250 ms fresh)  │ ──► psql / app point lookups
-                      │  Checkpoint → Iceberg cold snapshots│ ──► DuckDB / Snowflake / Trino
+                      │  Checkpoint → Iceberg cold snapshots│ ──► DuckDB / Trino
                       └─────────────────────────────────────┘       (full analytical scans)
 ```
 
@@ -2506,7 +2499,7 @@ The `catalog` option in `CREATE SINK` selects the registration backend:
 
 | `catalog` value | Mechanism | Tools that benefit |
 |---|---|---|
-| `filesystem` (default) | Self-contained `metadata.json` in the object store prefix. No external service. | DuckDB `iceberg_scan`, Snowflake external table by path |
+| `filesystem` (default) | Self-contained `metadata.json` in the object store prefix. No external service. | DuckDB `iceberg_scan` |
 | `glue` | AWS Glue Data Catalog API — creates/updates the table in the specified Glue database. Credentials from the node's IAM role or `catalog_credentials` secret. | Athena, Redshift Spectrum, Glue ETL, any tool using Glue as Hive Metastore |
 | `rest` | Iceberg REST Catalog spec (`POST /namespaces/{ns}/tables` / `POST /namespaces/{ns}/tables/{table}/snapshots`). Compatible with Polaris, Apache Gravitino, Unity Catalog, Nessie, and any spec-compliant REST catalog. | Spark, Flink, Trino, DuckDB with `iceberg` extension catalog config |
 | `hive` | Hive Metastore Thrift API — `AlterTable` on each snapshot commit. | Spark (legacy), Hive, Presto |
@@ -3177,19 +3170,19 @@ restart required.
 
 ## 15. Comparison to Prior Art
 
-| Aspect | Feldera | Materialize | RisingWave | Snowflake DT | **RockStream** |
-|---|---|---|---|---|---|
-| **SQL coverage** | Full ANSI + recursion | Full ANSI + recursion | Full ANSI | Subset (no recursion) | Full ANSI + recursion |
-| **Theoretical model** | DBSP | Differential Dataflow | DBSP-like | Proprietary refresh | DBSP + DD frontiers |
-| **State backend** | RocksDB (local NVMe) | LSM in-memory + S3 spill | Hummock (S3-native) | Internal | **SlateDB** (S3-native) |
-| **Compute-storage split** | Tight | Tight | Decoupled | Decoupled | **Fully decoupled** |
-| **Single-node baseline** | Excellent | Excellent | Good | N/A | Good |
-| **Horizontal scale** | Limited (single-node focus) | Limited | Excellent | Excellent | **Excellent** |
-| **Object-storage native** | No | Partial | Yes | Yes | **Yes (end-to-end)** |
-| **Postgres wire protocol** | No | Yes | Yes | No | **Yes (§12.6)** |
-| **Direct DML writes** | No | No (CDC only) | No (CDC only) | No | **Yes (§13.5)** |
-| **SERIALIZABLE isolation** | No | Emulated | Emulated | N/A | **No (§1.1)** |
-| **Open source** | Yes | Yes | Yes | No | Yes |
+| Aspect | Feldera | Materialize | RisingWave | **RockStream** |
+|---|---|---|---|---|
+| **SQL coverage** | Full ANSI + recursion | Full ANSI + recursion | Full ANSI | Full ANSI + recursion |
+| **Theoretical model** | DBSP | Differential Dataflow | DBSP-like | DBSP + DD frontiers |
+| **State backend** | RocksDB (local NVMe) | LSM in-memory + S3 spill | Hummock (S3-native) | **SlateDB** (S3-native) |
+| **Compute-storage split** | Tight | Tight | Decoupled | **Fully decoupled** |
+| **Single-node baseline** | Excellent | Excellent | Good | Good |
+| **Horizontal scale** | Limited (single-node focus) | Limited | Excellent | **Excellent** |
+| **Object-storage native** | No | Partial | Yes | **Yes (end-to-end)** |
+| **Postgres wire protocol** | No | Yes | Yes | **Yes (§12.6)** |
+| **Direct DML writes** | No | No (CDC only) | No (CDC only) | **Yes (§13.5)** |
+| **SERIALIZABLE isolation** | No | Emulated | Emulated | **No (§1.1)** |
+| **Open source** | Yes | Yes | Yes | Yes |
 
 The unique positioning: **end-to-end object-storage native** (no NVMe required,
 no local-state assumptions) **+ full SQL via DBSP** (correctness guarantees) **+
