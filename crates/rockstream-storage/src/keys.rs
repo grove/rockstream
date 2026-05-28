@@ -1,0 +1,276 @@
+//! Key encoders for shard-local and catalog keys.
+//!
+//! All catalog keys include `namespace_id` immediately after the type byte
+//! to support multi-tenancy from day one.
+//!
+//! Shard-local key prefixes (per DESIGN.md):
+//! - `0x01` → op_state
+//! - `0x02` → op_index
+//! - `0x03` → view_output
+//! - `0x04` → shuffle_inbox
+//! - `0x05` → shuffle_outbox
+//! - `0x06` → shard_meta
+
+/// Shard-local key namespace prefixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ShardPrefix {
+    /// Operator state storage.
+    OpState = 0x01,
+    /// Secondary indexes, cached extrema.
+    OpIndex = 0x02,
+    /// Materialized view outputs.
+    ViewOutput = 0x03,
+    /// Incoming shuffle batches.
+    ShuffleInbox = 0x04,
+    /// Outgoing shuffle batches.
+    ShuffleOutbox = 0x05,
+    /// Shard metadata (frontiers, epoch markers, offsets).
+    ShardMeta = 0x06,
+}
+
+impl ShardPrefix {
+    /// Returns the single-byte prefix.
+    pub fn as_byte(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Encoder for shard-local keys.
+///
+/// Format: `[prefix:1][operator_id:8][suffix...]`
+pub struct ShardKeyEncoder;
+
+impl ShardKeyEncoder {
+    /// Encode a shard-local key.
+    ///
+    /// # Arguments
+    /// - `prefix`: The shard namespace prefix
+    /// - `operator_id`: The operator instance ID
+    /// - `suffix`: Arbitrary suffix bytes (key within operator state)
+    pub fn encode(prefix: ShardPrefix, operator_id: u64, suffix: &[u8]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 8 + suffix.len());
+        key.push(prefix.as_byte());
+        key.extend_from_slice(&operator_id.to_be_bytes());
+        key.extend_from_slice(suffix);
+        key
+    }
+
+    /// Decode a shard-local key into (prefix_byte, operator_id, suffix).
+    /// Returns None if the key is too short.
+    pub fn decode(key: &[u8]) -> Option<(u8, u64, &[u8])> {
+        if key.len() < 9 {
+            return None;
+        }
+        let prefix = key[0];
+        let operator_id = u64::from_be_bytes(key[1..9].try_into().ok()?);
+        let suffix = &key[9..];
+        Some((prefix, operator_id, suffix))
+    }
+
+    /// Build the prefix bytes for scanning all keys of a given operator.
+    pub fn operator_prefix(prefix: ShardPrefix, operator_id: u64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(9);
+        key.push(prefix.as_byte());
+        key.extend_from_slice(&operator_id.to_be_bytes());
+        key
+    }
+
+    /// Build the prefix bytes for scanning all keys in a shard namespace.
+    pub fn namespace_prefix(prefix: ShardPrefix) -> Vec<u8> {
+        vec![prefix.as_byte()]
+    }
+
+    /// Encode a shard metadata key (frontier, epoch marker, etc).
+    pub fn meta_key(meta_type: &[u8]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + meta_type.len());
+        key.push(ShardPrefix::ShardMeta.as_byte());
+        key.extend_from_slice(meta_type);
+        key
+    }
+
+    /// The frontier key for a shard.
+    pub fn frontier_key() -> Vec<u8> {
+        Self::meta_key(b"frontier")
+    }
+
+    /// The epoch marker key for a given epoch number.
+    pub fn epoch_key(epoch: u64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 8 + 8);
+        key.push(ShardPrefix::ShardMeta.as_byte());
+        key.extend_from_slice(b"epoch");
+        key.extend_from_slice(&epoch.to_be_bytes());
+        key
+    }
+}
+
+/// Encoder for catalog (control-plane) keys.
+///
+/// Format: `[type_byte:1][namespace_id:16][object_id:16][suffix...]`
+///
+/// The `namespace_id` is always present in catalog keys to enable multi-tenancy
+/// from day one. Default namespace uses `namespace_id = 0`.
+pub struct CatalogKeyEncoder;
+
+/// Catalog object types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CatalogType {
+    /// Pipeline definition.
+    Pipeline = 0x10,
+    /// Source definition.
+    Source = 0x11,
+    /// View definition.
+    View = 0x12,
+    /// Table definition.
+    Table = 0x13,
+    /// Schema version.
+    Schema = 0x14,
+    /// Connector configuration.
+    Connector = 0x15,
+}
+
+impl CatalogKeyEncoder {
+    /// Encode a catalog key with namespace.
+    ///
+    /// # Arguments
+    /// - `catalog_type`: The type of catalog object
+    /// - `namespace_id`: The namespace (tenant) identifier (128-bit)
+    /// - `object_id`: The object identifier (128-bit)
+    pub fn encode(catalog_type: CatalogType, namespace_id: u128, object_id: u128) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 16 + 16);
+        key.push(catalog_type as u8);
+        key.extend_from_slice(&namespace_id.to_be_bytes());
+        key.extend_from_slice(&object_id.to_be_bytes());
+        key
+    }
+
+    /// Encode a catalog key with namespace and an additional suffix.
+    pub fn encode_with_suffix(
+        catalog_type: CatalogType,
+        namespace_id: u128,
+        object_id: u128,
+        suffix: &[u8],
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 16 + 16 + suffix.len());
+        key.push(catalog_type as u8);
+        key.extend_from_slice(&namespace_id.to_be_bytes());
+        key.extend_from_slice(&object_id.to_be_bytes());
+        key.extend_from_slice(suffix);
+        key
+    }
+
+    /// Decode a catalog key into (type_byte, namespace_id, object_id, suffix).
+    pub fn decode(key: &[u8]) -> Option<(u8, u128, u128, &[u8])> {
+        if key.len() < 33 {
+            return None;
+        }
+        let type_byte = key[0];
+        let namespace_id = u128::from_be_bytes(key[1..17].try_into().ok()?);
+        let object_id = u128::from_be_bytes(key[17..33].try_into().ok()?);
+        let suffix = &key[33..];
+        Some((type_byte, namespace_id, object_id, suffix))
+    }
+
+    /// Build a prefix for scanning all objects of a type in a namespace.
+    pub fn namespace_prefix(catalog_type: CatalogType, namespace_id: u128) -> Vec<u8> {
+        let mut key = Vec::with_capacity(1 + 16);
+        key.push(catalog_type as u8);
+        key.extend_from_slice(&namespace_id.to_be_bytes());
+        key
+    }
+
+    /// Build a prefix for scanning all objects of a type (across all namespaces).
+    pub fn type_prefix(catalog_type: CatalogType) -> Vec<u8> {
+        vec![catalog_type as u8]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shard_key_encode_decode_roundtrip() {
+        let key = ShardKeyEncoder::encode(ShardPrefix::OpState, 42, b"hello");
+        let (prefix, op_id, suffix) = ShardKeyEncoder::decode(&key).unwrap();
+        assert_eq!(prefix, ShardPrefix::OpState.as_byte());
+        assert_eq!(op_id, 42);
+        assert_eq!(suffix, b"hello");
+    }
+
+    #[test]
+    fn shard_key_prefix_is_proper_prefix() {
+        let key = ShardKeyEncoder::encode(ShardPrefix::OpIndex, 99, b"data");
+        let prefix = ShardKeyEncoder::operator_prefix(ShardPrefix::OpIndex, 99);
+        assert!(key.starts_with(&prefix));
+    }
+
+    #[test]
+    fn shard_key_ordering_preserves_operator_id() {
+        let k1 = ShardKeyEncoder::encode(ShardPrefix::OpState, 1, b"a");
+        let k2 = ShardKeyEncoder::encode(ShardPrefix::OpState, 2, b"a");
+        assert!(k1 < k2);
+    }
+
+    #[test]
+    fn catalog_key_includes_namespace() {
+        let key = CatalogKeyEncoder::encode(CatalogType::View, 1, 100);
+        let (type_byte, ns, obj, suffix) = CatalogKeyEncoder::decode(&key).unwrap();
+        assert_eq!(type_byte, CatalogType::View as u8);
+        assert_eq!(ns, 1);
+        assert_eq!(obj, 100);
+        assert!(suffix.is_empty());
+    }
+
+    #[test]
+    fn catalog_key_default_namespace_is_zero() {
+        let key = CatalogKeyEncoder::encode(CatalogType::Pipeline, 0, 42);
+        let (_, ns, obj, _) = CatalogKeyEncoder::decode(&key).unwrap();
+        assert_eq!(ns, 0);
+        assert_eq!(obj, 42);
+    }
+
+    #[test]
+    fn catalog_key_with_suffix() {
+        let key = CatalogKeyEncoder::encode_with_suffix(CatalogType::Schema, 5, 10, b"version_3");
+        let (_, ns, obj, suffix) = CatalogKeyEncoder::decode(&key).unwrap();
+        assert_eq!(ns, 5);
+        assert_eq!(obj, 10);
+        assert_eq!(suffix, b"version_3");
+    }
+
+    #[test]
+    fn catalog_namespace_prefix_filters_correctly() {
+        let key1 = CatalogKeyEncoder::encode(CatalogType::View, 1, 100);
+        let key2 = CatalogKeyEncoder::encode(CatalogType::View, 2, 100);
+        let prefix = CatalogKeyEncoder::namespace_prefix(CatalogType::View, 1);
+        assert!(key1.starts_with(&prefix));
+        assert!(!key2.starts_with(&prefix));
+    }
+
+    #[test]
+    fn shard_key_too_short_returns_none() {
+        assert!(ShardKeyEncoder::decode(b"short").is_none());
+    }
+
+    #[test]
+    fn catalog_key_too_short_returns_none() {
+        assert!(CatalogKeyEncoder::decode(b"short").is_none());
+    }
+
+    #[test]
+    fn frontier_key_has_shard_meta_prefix() {
+        let key = ShardKeyEncoder::frontier_key();
+        assert_eq!(key[0], ShardPrefix::ShardMeta.as_byte());
+    }
+
+    #[test]
+    fn epoch_keys_sort_by_epoch_number() {
+        let k1 = ShardKeyEncoder::epoch_key(1);
+        let k2 = ShardKeyEncoder::epoch_key(2);
+        let k100 = ShardKeyEncoder::epoch_key(100);
+        assert!(k1 < k2);
+        assert!(k2 < k100);
+    }
+}

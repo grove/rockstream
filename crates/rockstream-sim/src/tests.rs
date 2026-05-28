@@ -143,8 +143,8 @@ fn object_store_deterministic_snapshot() {
 
     // Same operations in same order
     for i in 0..100 {
-        let key = format!("data/{:04}", i);
-        let value = Bytes::from(format!("value_{}", i));
+        let key = format!("data/{i:04}");
+        let value = Bytes::from(format!("value_{i}"));
         store1.put(&key, value.clone()).unwrap();
         store2.put(&key, value).unwrap();
     }
@@ -198,7 +198,7 @@ fn run_workload(rt: &SimRuntime) -> WorkloadState {
 
     // Write to object store based on RNG values
     for (i, &val) in rng_sequence.iter().enumerate() {
-        let key = format!("obj/{:04}", i);
+        let key = format!("obj/{i:04}");
         let data = Bytes::from(val.to_le_bytes().to_vec());
         rt.object_store().put(&key, data).unwrap();
     }
@@ -207,7 +207,7 @@ fn run_workload(rt: &SimRuntime) -> WorkloadState {
     for (i, &val) in rng_sequence.iter().enumerate().take(10) {
         let from = val % 5;
         let to = (val / 5) % 5;
-        let payload = Bytes::from(format!("msg_{}_{}", i, val));
+        let payload = Bytes::from(format!("msg_{i}_{val}"));
         rt.network().send(from, to, payload);
     }
 
