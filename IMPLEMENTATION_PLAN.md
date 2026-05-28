@@ -1137,6 +1137,21 @@ binding.
   Writes missing both are rejected with `RS-2007 write.idempotency_key_required`.
   The idempotency-key table is per-shard, time-bounded (default 24 h), and
   participates in the per-shard epoch commit.
+- **Optimistic transaction metadata hooks** (DESIGN.md §13.5.1;
+  [ideas/optimistic-locking-crdts.md](ideas/optimistic-locking-crdts.md)):
+  - `RowVersionMeta` per direct-write row: `row_version: u64`,
+    `last_modified_frontier`, `last_writer_txn`, stored under
+    `op_state/txn_meta/table/{table_id}/pk/{pk_hash}`.
+  - Row version increments on every committed non-CRDT write.
+  - Stable `op_id` generation for CRDT operands:
+    `hash(namespace_id, txn_id, statement_index, op_index, law_id)`.
+  - `EXPLAIN` prints `read_dependent=true/false` for CRDT DML lowered from SQL.
+  - `TxnShape` enum skeleton in `rockstream-gateway`: classifier marks
+    transactions as `BlindCommutative`, `ShardLocalSerializable`,
+    `OptimisticExactKey`, `MixedCrdtAndOptimisticExactKey`, or `Unsupported`.
+  - `UnsupportedTxnReason` closed enum in `rockstream-types`.
+  - Do NOT expose multi-shard optimistic transactions yet — only the metadata
+    that enables them later.
 
 **Exit criteria for v0.43 (Phase 8 complete)**
 
@@ -1150,6 +1165,11 @@ binding.
 - A non-idempotent write missing both an exactly-once envelope and an
   idempotency key returns `RS-2007`.
 - `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` returns `RS-2003`.
+- `row_version` increments on every committed non-CRDT write and is readable
+  via `RowVersionMeta`.
+- `EXPLAIN` shows `read_dependent=true/false` for CRDT delta DML.
+- `TxnShape` classifier correctly identifies blind-commutative vs.
+  read-dependent transactions in unit tests.
 
 ---
 
@@ -1272,6 +1292,35 @@ binding.
     the law claims to survive.
   A sample user-defined law (min-clamped counter) is included with the
   release and is exercised by the long-soak chaos suite.
+- **Optimistic transaction subset (`--experimental-optimistic-crdt-transactions`,
+  v0.50)** (DESIGN.md §13.5.1;
+  [ideas/optimistic-locking-crdts.md](ideas/optimistic-locking-crdts.md)):
+  - **`SERIALIZABLE LOCAL`**: when the planner proves all reads and writes
+    touch one base-table shard, the gateway delegates to SlateDB per-shard
+    transaction semantics. Commits are truly serializable within that shard.
+  - **Optimistic exact-key guarded writes**: the gateway tracks read
+    footprints (`ExactKey` entries only pre-1.0) and validates observed
+    `row_version` at commit. Conflict returns `RS-2008
+    transaction.optimistic_conflict`. Retry is the caller's responsibility.
+  - **CRDT-only transaction envelope prototype**: if atomic multi-shard
+    visibility is implemented, a `TxnEnvelope` (home shard, participants,
+    state machine: Pending→Committed/Aborted) enables all-or-nothing
+    visibility. If not implemented, multi-shard CRDT writes are documented
+    as idempotent write batches, not as SQL transactions.
+  - **Clear rejection for unsupported shapes**: any transaction with
+    predicate reads, range reads, cross-shard uniqueness, or foreign-key
+    checks returns `RS-2009 transaction.unsupported_shape` with the specific
+    `UnsupportedTxnReason` in the error payload.
+  - **Observability**: `optimistic_validation_attempt_total{shape}`,
+    `optimistic_validation_conflict_total{table,shard}`,
+    `txn_shape_rejected_total{reason}`,
+    `crdt_txn_envelope_committed_total`, `crdt_txn_pending_visible_total`.
+  - **`EXPLAIN TRANSACTION`**: prints `txn_shape`, participants,
+    `crdt_ops`, `validation_keys`, `predicate_reads`,
+    `unsupported_reason`.
+  - **Simulation tests**: gateway crash after participant 1 apply, envelope
+    commit race, concurrent row-version bump, pending-operand compaction
+    safety, unsupported write-skew shape rejection.
 
 **Exit criteria**
 
@@ -1419,8 +1468,23 @@ the audit log with the evidence considered.
   `snapshot_interval_epochs` based on observed write rate and target
   cold snapshot file size (avoid small files, avoid excessively large
   buffering in shard pending_buffer).
+- **Mixed optimistic transaction soak** (DESIGN.md §13.5.1;
+  [ideas/optimistic-locking-crdts.md](ideas/optimistic-locking-crdts.md)):
+  - Mixed exact-key + CRDT validation under randomized concurrent writes.
+  - Transaction envelope recovery from cold + hot tail.
+  - Row-version metadata preserved in cold snapshots where needed.
+  - Compaction safety for pending and committed transaction operands.
+  - Oracle comparison: single-shard serializable, exact-key optimistic under
+    random conflicts, blind CRDT write batches under random
+    reorder/duplicate/retry, mixed exact-key + CRDT where all non-CRDT
+    reads are exact keys.
+  - **Decision gate**: if simulation finds no partial visibility and abort
+    rates are explainable (< 5% under representative contention), promote
+    the optimistic transaction subset to pre-1.0 documented behavior. If
+    not, keep it experimental and defer to v1.1.
 - **Documentation**: cold-tier operator guide, DuckDB/Trino
-  integration examples, catalog configuration reference.
+  integration examples, catalog configuration reference, optimistic
+  transaction user guide (shapes, error codes, retry patterns).
 
 **Exit criteria for v0.54 (Phase 12 complete)**
 
@@ -1432,6 +1496,10 @@ the audit log with the evidence considered.
   pauses the sink with `RS-4010 cold_tier.quota_exceeded`.
 - Snapshot interval auto-tuning produces ≥ 128 MB Parquet files under a
   10k rows/s continuous workload.
+- Mixed optimistic transaction abort rate < 5% under representative
+  contention; no partial-visibility leaks over 7-day soak;
+  `crdt_txn_pending_visible_total` stays at zero when atomic visibility
+  is enabled.
 
 ---
 
@@ -1494,6 +1562,11 @@ These run in parallel with every phase.
 | **Quota enforcement adds hot-path overhead** | Token-bucket admission and state accounting are per-shard, lock-free; benchmark in Phase 3.5 must show < 2% throughput cost. |
 | **Error-code registry rots** | CI gate: any new `tracing::error!` / returned `Error` without a registered `RS-XXXX` fails the build. Doc URL existence is checked. |
 | **Support bundle leaks secrets** | Default redaction is on and not config-overridable; only an explicit CLI flag (`--include-secrets`) can disable it; integration test asserts no credential pattern leaves the bundle by default. |
+| **Users confuse optimistic guards with SERIALIZABLE** | Use distinct names (`SERIALIZABLE LOCAL`, optimistic guarded writes, commutative transaction envelopes); keep cross-shard `SERIALIZABLE` rejection via `RS-2003`; `EXPLAIN TRANSACTION` always prints the shape name. |
+| **Partial multi-shard visibility leaks through CRDT writes** | Require transaction envelope for atomic visibility or document feature as idempotent write batches; add `crdt_txn_pending_visible_total` invariant metric that must stay at zero. |
+| **Row-version metadata bloats hot write path** | Start at row-level granularity; measure write amplification; consider column-group versions only if false-conflict rate exceeds threshold. |
+| **Compaction folds pending transaction operands** | Pending operands use distinct visibility state; compaction refuses to fold until committed frontier/envelope is stable; Phase 12 soak verifies. |
+| **Optimistic transactions become a hidden transaction manager** | Keep accepted subset exact-key only pre-1.0; document every unsupported shape in `EXPLAIN`; v0.54 decision gate determines promotion vs. deferral. |
 
 ### Team Structure (Suggested)
 
@@ -1549,6 +1622,13 @@ Total: 8–9 engineers for ~12-month path to GA.
     current quorum health before proceeding, and record the change in the audit
     log. Resolve the exact joint-consensus or single-server protocol in Phase 10
     alongside the HA hardening milestone.
+12. **Transaction envelope vs. documented weaker visibility for multi-shard
+    CRDT writes**: if atomic all-or-nothing visibility across shards is not
+    implemented by v0.50, multi-shard CRDT transactions must be renamed to
+    "commutative write batches" and the feature flag becomes
+    `--experimental-commutative-write-batches`. Resolve by v0.50 based on
+    implementation feasibility and simulation results. See
+    [ideas/optimistic-locking-crdts.md §9](ideas/optimistic-locking-crdts.md).
 
 These are explicitly to be revisited and answered with prototypes during
 Phases 1–4.

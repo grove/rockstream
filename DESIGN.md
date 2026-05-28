@@ -268,8 +268,11 @@ attempting them would compromise the rest of the design:
   sequence number, which is an explicit non-goal (see below). `READ COMMITTED`
   and `REPEATABLE READ` are fully supported by the existing vector-frontier
   model (§12.6) and cover the vast majority of analytical and streaming
-  workloads. SERIALIZABLE is available only within a single shard as a future
-  extension.
+  workloads. `SERIALIZABLE LOCAL` (single-shard, planner-proven) is a candidate
+  extension (v0.50). Optimistic exact-key guarded writes for non-CRDT columns
+  and blind commutative writes for CRDT columns are planned pre-1.0 (§13.5.1).
+  General cross-shard `SERIALIZABLE` remains out of scope. See
+  [ideas/optimistic-locking-crdts.md](ideas/optimistic-locking-crdts.md).
 - **A global write sequence number.** SlateDB's per-DB sequence is local. We
   do not synthesize a cluster-wide sequence on top of it.
 - **Loading or linking pg_trickle / Feldera at runtime.** Neither is a Cargo
@@ -1977,7 +1980,14 @@ streaming workloads.
 |---|---|
 | `READ COMMITTED` | Each statement pins to the latest published vector frontier at statement start. |
 | `REPEATABLE READ` | `BEGIN` pins the session to a specific vector frontier; all statements in the transaction see that snapshot. |
-| `SERIALIZABLE` | **Not supported** (requires cross-shard conflict detection; see §1.1). Returns `RS-2003 isolation.serializable_not_supported`. |
+| `SERIALIZABLE` | **Not supported** for cross-shard transactions (requires cross-shard conflict detection; see §1.1). Returns `RS-2003 isolation.serializable_not_supported`. |
+| `SERIALIZABLE LOCAL` | Candidate v0.50: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
+
+**Optimistic write semantics** (§13.5.1): direct-write transactions may use
+optimistic exact-key guards (`RS-2008` on conflict) and blind CRDT writes
+without requesting `SERIALIZABLE`. These are orthogonal to isolation level
+and documented as stale-overwrite protection, not as an ANSI isolation
+guarantee.
 
 **Postgres catalog compatibility** required for ORMs:
 
@@ -2401,6 +2411,69 @@ Client (psql / JDBC)  ──INSERT──►  Gateway  ──delta──►  Base
 needs no external broker or database. Deploy RockStream, issue SQL `INSERT`
 statements, query IVM views — no Kafka, no Postgres, no infrastructure beyond
 object storage.
+
+#### 13.5.1 Optimistic Transaction Protocol
+
+The direct-write connector is the natural interception point for **optimistic
+locking** that combines CRDT merge laws with per-key version checks. The full
+research lives in
+[ideas/optimistic-locking-crdts.md](ideas/optimistic-locking-crdts.md); this
+section states the design-level commitments.
+
+**Transaction shape classifier.** The gateway classifies every direct-write
+transaction into one of five shapes:
+
+| Shape | Description | Pre-1.0? |
+|---|---|---:|
+| `ShardLocalSerializable` | Planner proves all reads/writes touch one shard; delegates to SlateDB transaction. | v0.50 |
+| `BlindCommutative` | All writes are registered CRDT operands with `read_dependent = false`. | v0.43+ |
+| `OptimisticExactKey` | Non-CRDT exact-key writes validated against per-row versions. | v0.50 |
+| `MixedCrdtAndOptimisticExactKey` | CRDT writes skip validation; non-CRDT exact-key writes validate. | v0.54 experimental |
+| `Unsupported` | Predicate reads, range reads, cross-shard uniqueness, foreign keys, or any shape requiring general serializability. Returns `RS-2009`. | No |
+
+**Row-version metadata.** Each direct-write base-table row carries a
+monotonically-incrementing `row_version: u64` and a
+`last_modified_frontier: EncodedFrontier`. Stored in:
+
+```text
+op_state/txn_meta/table/{table_id}/pk/{pk_hash} → RowVersionMeta
+```
+
+**Read footprint tracking.** While a transaction is open, the gateway records
+every exact primary key read as `(shard_id, table_id, pk_hash,
+observed_row_version, observed_frontier)`. Range and predicate reads are
+recorded but force the transaction to `Unsupported` for validation purposes
+pre-1.0.
+
+**Validation protocol.** At `COMMIT`:
+
+1. Blind CRDT writes with `read_dependent = false` skip validation entirely.
+2. Read-dependent CRDT writes validate the reads they depended on.
+3. Non-CRDT writes require exact-key version validation per shard.
+4. Any range/predicate footprint rejects the transaction (`RS-2009`).
+5. Validation RPCs are parallel across participant shards.
+
+**Atomic visibility for multi-shard CRDT batches.** If a transaction touches
+multiple shards and requires all-or-nothing visibility, it uses a
+`TxnEnvelope` written to a home shard. Participant shards apply operands as
+pending; a commit marker promotes them to visible. Without the envelope, multi-
+shard CRDT writes are documented as **idempotent write batches** with eventual
+convergence, not as atomic SQL transactions.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| `RS-2008` | `transaction.optimistic_conflict` | Row version changed between read and commit. |
+| `RS-2009` | `transaction.unsupported_shape` | Transaction shape cannot be validated pre-1.0. |
+| `RS-2010` | `transaction.visibility_pending` | Multi-shard envelope not yet committed (internal). |
+| `RS-2011` | `transaction.ambiguous_commit_retry_with_idempotency_key` | Crash recovery cannot confirm; retry with same key. |
+
+**What this is NOT.** The optimistic protocol does not claim cross-shard
+`SERIALIZABLE`. It prevents stale overwrites on tracked exact keys and makes
+CRDT writes coordination-light. Write-skew cycles across shards are not
+detected. Users requiring general serializability must use `SERIALIZABLE LOCAL`
+(single-shard) or accept `RS-2009`.
 
 ---
 
@@ -3516,6 +3589,7 @@ extended.
 | Liveness under faults (§11.5) | After any injected recoverable fault, the cluster commits at least one new epoch within the 5 s / 30 s / 60 s recovery-time budgets or surfaces a named degraded state. |
 | Resource bounds (§7.2, §14.10) | Shuffle queues, barrier buffers, connector inboxes, and arrangement scan windows hit explicit limits and apply backpressure or transition to `BLOCKED`; they never grow without bound. |
 | Storage-boundary corruption (§5.3) | Any checksum/corruption error surfaced by SlateDB crashes the affected worker and recovers by shard reassignment; corrupted bytes are never interpreted as valid arrangement state. |
+| Optimistic transactions (§13.5.1) | Gateway crash mid-validation, participant apply failures, concurrent row-version bumps, transaction envelope recovery, and pending-operand compaction safety all converge to correct terminal state. |
 
 ### 17.6 Continuous Simulation Soak
 
