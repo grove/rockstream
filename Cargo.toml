@@ -26,7 +26,11 @@ repository = "https://github.com/geir-gronmo/rockstream"
 
 [workspace.dependencies]
 # Shared workspace dependencies
+async-trait = "0.1"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
+parking_lot = "0.12"
+rand = { version = "0.8", features = ["small_rng"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio = { version = "1", features = ["full"] }
