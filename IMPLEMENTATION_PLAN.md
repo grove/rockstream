@@ -893,10 +893,21 @@ production-ready.
 **Goal**: Serve materialized views to applications over the Postgres wire
 protocol. Make RockStream self-contained (no external broker required).
 
+**Design constraint (DESIGN.md §12.7.3)**: The gateway's `ViewReader` trait
+must be cold-tier-aware from this phase. Define `ViewReadStrategy` (with both
+`HotOnly` and `TwoTier` variants) and the `ViewReader` trait in
+`rockstream-gateway` now. Only `HotOnly` is implemented here; the `TwoTier`
+path is a future deliverable. This keeps the cold tier addable later without
+a gateway rewrite.
+
 **Deliverables**
 
 ### v0.40 — Postgres Read Gateway (core)
 
+- **`ViewReader` / `ViewReadStrategy` abstraction** (DESIGN.md §12.7.3):
+  - Define `ViewReadStrategy` enum (`HotOnly` | `TwoTier { snapshot_manifest, hot_tail_from_epoch }`) in `rockstream-gateway`.
+  - Define the `ViewReader` trait with a `read_strategy()` method the planner calls before routing a query.
+  - Implement `HotOnly` fully. `TwoTier` variant is present but returns `RS-4001 cold_tier.not_enabled` if selected.
 - **pgwire gateway** (stateless, horizontally scalable):
   - Postgres wire protocol (`pgwire` crate): startup, query, extended-query,
     copy-out, terminate message flows.
