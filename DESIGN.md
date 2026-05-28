@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), RisingWa
 and Snowflake Dynamic Tables — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.10. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.11. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -87,6 +87,12 @@ object storage.
 > assertions on durable/network boundaries, an explicit fault model,
 > liveness checks tied to the recovery SLOs, continuous long-run simulation
 > soak, and a "bounded everything" rule for queues, buffers, and scan windows.
+>
+> **v3.11 adds three foundation-level changes**: namespace-scoped catalog keys
+> (§5.2) required from day one for multi-tenancy without storage migration;
+> a worker drain protocol (§10.7) enabling graceful scale-in; and cluster
+> autoscaling signals with worker capacity model (§10.8) bridging the control
+> plane to infrastructure autoscalers.
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -516,7 +522,7 @@ Prefix  Namespace            Purpose
 A dedicated control SlateDB (one writer, >=2 readers in Tier 3) holds:
 
 ```
-0x01    catalog/             Tables, views, pipelines, schemas
+0x01    catalog/             Tables, views, pipelines, schemas (namespace-scoped)
 0x02    plan/                Compiled physical plans, operator-instance assignments
 0x03    topology/            Worker registry, shard placement, lease state
 0x04    frontier/            Aggregated per-operator frontier (driven by workers)
@@ -525,7 +531,29 @@ A dedicated control SlateDB (one writer, >=2 readers in Tier 3) holds:
 0x07    audit/               Durable event log for every control-plane action
 0x08    state_accounting/    Per-pipeline state bytes, shard count, quota usage
 0x09    schema/              Versioned source/view schemas and compatibility data
+0x0A    namespace/           Namespace definitions, quotas, worker-pool affinity
 ```
+
+**Namespace dimension.** Every catalog object (table, view, pipeline, schema)
+belongs to exactly one namespace. The `namespace_id` is encoded into the key
+immediately after the catalog type byte:
+
+```
+catalog/table:     0x01 0x01 namespace_id(16) table_id(16)
+catalog/view:      0x01 0x02 namespace_id(16) view_id(16)
+catalog/pipeline:  0x01 0x03 namespace_id(16) pipeline_id(16)
+namespace/def:     0x0A 0x01 namespace_id(16) → { name, quotas, worker_pool }
+```
+
+A namespace is the isolation boundary within one cluster — analogous to a
+PostgreSQL schema or a Databricks workspace. The control plane enforces that
+cross-namespace references are only allowed where explicitly permitted (e.g. a
+shared source namespace that multiple tenant namespaces can read from). The
+default namespace is `default` with `namespace_id = 0`; single-tenant
+deployments never need to think about namespaces.
+
+This key scheme is required from day one. Retrofitting a namespace prefix into
+the catalog after data has been written would require a storage format migration.
 
 Workers read this database (via `DbReader` pinned to fresh checkpoints) on
 startup and subscribe to its CDC feed (`WalReader`) for plan changes and
@@ -1164,6 +1192,67 @@ The reverse operation — merging two cold shards — is also background and
 keyed to a `min_shard_state_bytes` floor (default 4 GB) to prevent fragmentation
 at low load.
 
+### 10.7 Worker Drain Protocol
+
+Scale-in requires gracefully removing a worker. The protocol is explicit:
+
+1. Control plane marks the worker as `DRAINING` — no new shard assignments.
+2. Each shard on the worker migrates to another worker via the §10.2
+   checkpoint-copy flow.
+3. Once all shards have been migrated and cutover is confirmed, the control
+   plane marks the worker as `DECOMMISSIONED`.
+4. The worker process exits (or the infrastructure terminates it).
+
+The CLI surface is:
+
+```
+rockstream cluster workers drain <worker-id>   # initiate drain
+rockstream cluster workers status <worker-id>  # shows DRAINING / DECOMMISSIONED
+```
+
+Without an explicit drain protocol, scale-in either kills the worker immediately
+(losing in-flight state) or has no defined end condition. The drain state is
+recorded in `topology/worker/` and audited. A worker in `DRAINING` state still
+processes its remaining shards normally until migration completes — it is not
+paused, merely ineligible for new placements.
+
+### 10.8 Cluster Autoscaling Signals
+
+**Cluster worker pressure.** The control plane continuously computes a pressure
+signal that bridges intra-cluster adaptation and infrastructure provisioning:
+
+```
+cluster_worker_pressure = max over all pipelines of:
+  (demanded_shard_count / placed_shard_count)
+```
+
+When `cluster_worker_pressure > 1.0` for `T` seconds (configurable,
+default 60 s), the control plane emits a scale-out recommendation. When
+it stays below a low-water threshold for `T_in` seconds (default 300 s),
+it emits a scale-in recommendation.
+
+**Infrastructure integration.** RockStream exports `cluster_worker_pressure`,
+`demanded_shard_count`, and `placed_shard_count` as Prometheus metrics. The k8s
+HPA or KEDA reads them and drives the autoscaler. Zero new RockStream code
+beyond shipping the metrics; standard cloud-native pattern. The control plane
+does not call infrastructure APIs directly.
+
+**Worker capacity model.** Each worker reports `capacity_headroom` to the
+control plane — the remaining available shards based on observed resource
+utilisation (memory, I/O throughput, CPU). The placement algorithm respects
+this signal: a worker at zero headroom receives no new shard assignments
+regardless of hash affinity. Without this, the control plane can silently
+overload a worker.
+
+```
+control: topology/worker/ worker_id → {
+  ...,
+  state: ACTIVE | DRAINING | DECOMMISSIONED,
+  capacity_headroom: u32,       // remaining shard slots
+  last_heartbeat: Timestamp,
+}
+```
+
 ---
 
 ## 11. Fault Tolerance & Exactly-Once Semantics
@@ -1331,10 +1420,11 @@ auth layer:
 | `pipeline_owner` | Deploy, alter, pause, resume, drop pipelines they own; all viewer rights on owned pipelines. |
 | `admin` | Everything, including granting roles and viewing all audit-log entries. |
 
-- **Multi-tenancy isolation**: pipelines are namespaced by `tenant_id`. A
-  principal with `pipeline_owner` on tenant A cannot see or affect tenant B's
-  pipelines. Quota enforcement (§14.13) is per-pipeline, so tenants cannot
-  starve each other by default.
+- **Multi-tenancy isolation**: pipelines are namespaced (§5.2). A
+  principal with `pipeline_owner` on namespace A cannot see or affect namespace
+  B's pipelines. Quota enforcement (§14.13) is per-pipeline and per-namespace,
+  so tenants cannot starve each other by default. Hard isolation is available
+  via worker-pool affinity (`CREATE NAMESPACE ... WITH (worker_pool = '...')`).
 - **Audit trail**: every query, subscription, deploy, and alter carries the
   authenticated principal as the `actor` in the audit log (§14.11).
 
@@ -2178,9 +2268,9 @@ Per-shard SlateDB:
   shard_meta/epoch:    0x06 0xEP
 
 Control-plane SlateDB:
-  catalog/table:       0x01 0x01 table_id(16)
-  catalog/view:        0x01 0x02 view_id(16)
-  catalog/pipeline:    0x01 0x03 pipeline_id(16)
+  catalog/table:       0x01 0x01 namespace_id(16) table_id(16)
+  catalog/view:        0x01 0x02 namespace_id(16) view_id(16)
+  catalog/pipeline:    0x01 0x03 namespace_id(16) pipeline_id(16)
 
   plan/physical:       0x02 0x01 pipeline_id(16)
   plan/assignment:     0x02 0x02 pipeline_id(16) op_id(16) instance(4 BE)
@@ -2201,4 +2291,5 @@ Control-plane SlateDB:
   state_accounting:    0x08 pipeline_id(16) metric_id(2)
   schema/source:        0x09 0x01 source_id(16) version(8 BE)
   schema/view:          0x09 0x02 view_id(16) version(8 BE)
+  namespace/def:        0x0A 0x01 namespace_id(16)
 ```

@@ -89,7 +89,7 @@ without that proof, the version is not done.
 |---|---|---|---|
 | v0.1 | Repository workbench | Cargo workspace, core crates, CI, dev container, `rockstream` binary stub, basic `tracing`, pinned MSRV, dependency policy. | Clean CI on an empty no-op binary; `rockstream --help` works; repository has no hidden local setup step. |
 | v0.2 | Runtime abstraction and simulation seed | `rockstream-sim`, `Runtime` trait, `TokioRuntime`, `SimRuntime`, in-memory object store and network, seeded clock, first `buggify!()` macro, explicit fault-model registry, paired-assertion helper pattern. | A deterministic test replays the same seed byte-for-byte; changing the seed changes event order; production build compiles with `buggify!()` as no-op; every `buggify!()` site names a fault-model entry. |
-| v0.3 | SlateDB storage contract | `rockstream-storage`, key encoders, `ShardDb`, `WriteBatch` builders, `DbReader`, WAL reader smoke tests, merge operator registry, no range-delete dependency. | Storage API validation suite proves only supported SlateDB features are used; unsupported operations fail at compile/test time. |
+| v0.3 | SlateDB storage contract | `rockstream-storage`, key encoders (including `namespace_id` in all catalog keys from day one), `ShardDb`, `WriteBatch` builders, `DbReader`, WAL reader smoke tests, merge operator registry, no range-delete dependency. | Storage API validation suite proves only supported SlateDB features are used; unsupported operations fail at compile/test time; catalog key encoders include namespace dimension. |
 | v0.4 | No-op pipeline and local CLI | `rockstream start --storage=./data`, no-op source, no-op operator, no-op view sink, support-bundle skeleton, audit-log skeleton, error-code registry. | `make e2e` starts a local process, runs a no-op pipeline, emits audit events, writes a support bundle, and shuts down cleanly. |
 
 ### Single-Shard IVM Kernel
@@ -134,7 +134,7 @@ without that proof, the version is not done.
 
 | Version | Focus | Scope | Proof |
 |---|---|---|---|
-| v0.28 | Control plane and worker discovery | Control service, worker registration, topology catalog, bootstrap command, mTLS scaffolding, role flags. | Tier 1 and Tier 2 start flows work; workers join through `--control=<url>`; topology changes are audited. |
+| v0.28 | Control plane and worker discovery | Control service, worker registration (with `capacity_headroom` reporting), topology catalog, bootstrap command, mTLS scaffolding, role flags. | Tier 1 and Tier 2 start flows work; workers join through `--control=<url>`; topology changes are audited; placement algorithm respects reported capacity. |
 | v0.29 | Shard leasing and scheduling | Shard manager, per-shard SlateDB handles, lease acquisition, writer fencing, distributed operator placement. | Two-writer fence test proves only one writer can commit; killing a worker causes clean lease release/reassignment. |
 | v0.30 | Direct exchange | gRPC shuffle service, worker-level multiplexing, exchange operators, Arrow serialization, credit backpressure. | 16-shard single-host cluster runs partitioned TPC-H subset with bounded connection count. |
 | v0.31 | Durable shuffle fallback | Object-store fallback path, coalesced shuffle objects, outbox/inbox metadata, receiver notifications, no LIST hot path. | Inject receiver failure and large batch; sender falls back durably and receiver catches up without duplicates. |
@@ -149,7 +149,7 @@ without that proof, the version is not done.
 | Version | Focus | Scope | Proof |
 |---|---|---|---|
 | v0.37 | Online split and merge | Online shard split, cold shard merge, checkpoint-copy-replay, shard-map version bump, cleanup after cutover. | Sustained workload continues through split/merge; output remains equal to uninterrupted reference. |
-| v0.38 | Proactive scaling and rebalancing | `target_shard_state_bytes`, proactive splitter, worker scale-out, skew detection, adaptive re-sharding. | Drive one shard to 30GB; split starts before alert threshold and no freshness SLO is missed. |
+| v0.38 | Proactive scaling and rebalancing | `target_shard_state_bytes`, proactive splitter, worker scale-out, worker drain protocol (DRAINING → DECOMMISSIONED), `cluster_worker_pressure` metric for infrastructure autoscaling, skew detection, adaptive re-sharding. | Drive one shard to 30GB; split starts before alert threshold and no freshness SLO is missed; drain a 4-shard worker within 120s with no epoch loss; `cluster_worker_pressure` metric is exposed and HPA-consumable. |
 | v0.39 | Clone and schema evolution | Pipeline clone, blue/green plan replacement, atomic flip, compatible/incompatible schema workflows. | Breaking schema change goes through clone/backfill/flip without source offset loss. |
 | v0.40 | Postgres read gateway | pgwire startup/query/extended-query, row descriptions with Postgres OIDs, catalog stubs, snapshot reads. | `psql` and SQLAlchemy can read views; `SELECT * FROM my_view LIMIT 10` returns under the target local latency. |
 | v0.41 | Freshness, subscribe, isolation | `READ COMMITTED`, `REPEATABLE READ`, freshness tokens, `wait_for=<token>`, subscribe API, gateway restart behavior. | Read-your-writes demo passes; subscribe stream survives gateway restart without gaps or duplicates. |

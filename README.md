@@ -174,7 +174,7 @@ RockStream brings these ideas to an open, cloud-native storage foundation.
 
 ## Status
 
-This project is in the **design phase** (current revision: **v3.10**). Four
+This project is in the **design phase** (current revision: **v3.11**). Four
 documents describe the system in progressively more detail:
 
 | Document | Audience | What it covers |

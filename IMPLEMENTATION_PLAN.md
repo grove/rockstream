@@ -54,7 +54,8 @@ Durations are indicative effort, not calendar time, and assume a small dedicated
   - `rockstream-types` — shared types (timestamp, frontier, Z-set row, schema).
   - `rockstream-storage` — wrappers around SlateDB, key encoders/decoders,
     merge operator registry, segment extractor configuration, checkpoint
-    helpers, scan-and-delete cleanup utilities.
+    helpers, scan-and-delete cleanup utilities. Key encoders must include
+    `namespace_id` in all catalog key paths from day one (DESIGN.md §5.2).
   - `rockstream-plan` — `PlanNode` enum (the PlanIR from IVM.md §5) and the
     physical `OpNode` graph.
   - `rockstream-diff` — the `DiffCtx` differentiation pass (IVM.md §6–7).
@@ -730,6 +731,19 @@ production-ready.
   `min_shard_state_bytes` floor (default 4 GB) to prevent fragmentation.
 - **Worker scale-out**: new worker process joins, control plane assigns
   un-leased shards or rebalances from over-loaded workers.
+- **Worker drain protocol** (DESIGN.md §10.7):
+  - `DRAINING` state in `topology/worker/`: no new shard assignments.
+  - Each shard on the draining worker migrates via the checkpoint-copy path.
+  - `DECOMMISSIONED` state once all shards have cut over.
+  - `rockstream cluster workers drain <worker-id>` CLI command.
+  - Audit event for every state transition.
+- **Worker capacity model** (DESIGN.md §10.8): workers report
+  `capacity_headroom` (remaining shard slots based on observed memory, I/O,
+  CPU utilisation). The placement algorithm refuses to assign shards to a
+  worker at zero headroom.
+- **Cluster autoscaling signals** (DESIGN.md §10.8):
+  `cluster_worker_pressure`, `demanded_shard_count`, `placed_shard_count`
+  exported as Prometheus metrics; k8s HPA / KEDA drives scale-out/in.
 - **Skew detection**: per-shard load metrics trigger automatic re-sharding for
   hot operators.
 - **`Clone` for blue/green**: control plane creates a clone of an entire
@@ -745,6 +759,10 @@ production-ready.
 - **Proactive split test**: drive a single shard's state footprint to 30 GB;
   the control plane initiates a split before the shard exceeds operational
   thresholds, with no operator alert and no observable freshness-SLO impact.
+- **Worker drain test**: drain a worker hosting 4 shards; all shards complete
+  migration within 120 s; no epoch is lost; worker reaches `DECOMMISSIONED`.
+- **Capacity headroom test**: place shards until a worker reaches zero
+  headroom; subsequent placement attempts route to other workers.
 
 ---
 
@@ -885,6 +903,7 @@ protocol. Make RockStream self-contained (no external broker required).
 - **Admin CLI** (`rockstream` binary):
   - `pipeline create/start/pause/delete`
   - `cluster status`, `cluster scale`
+  - `cluster workers {list, drain, status}`
   - `shard list/migrate`
   - `checkpoint list/restore`
 - **Web console** (optional, post-MVP): pipeline graph viewer, frontier lag
