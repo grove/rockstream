@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), and Risi
 — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.27. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.28. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -263,7 +263,67 @@ object storage.
 > session token and `/*+ ALLOW_STALE */` per-query hint (§12.8.1);
 > `ALTER ... DISCARD REPLACEMENT` (§4.2); `replay_attempt` counter and
 > `dlq_warn_threshold` configuration in DLQ surface (§13.3.1);
-> `workload_source` column in `rockstream.views` catalog.
+> `workload_source` column in `rockstream_catalog.views`.
+>
+> **v3.28 is a contracts and consistency pass** that integrates the
+> [plans/plan-assessment-v0.4.md](plans/plan-assessment-v0.4.md) review.
+> It tightens semantic edge cases and operational contracts without changing
+> the overall architecture:
+>
+> 1. **Latency classes** (§3.0) make the freshness contract explicit:
+>    `local_visible`, `local_durable`, `distributed_fresh`,
+>    `distributed_exact_sink`, and `analytical_cold` each have a named
+>    target and a designated frontier. The dual-frontier model
+>    (`visible_frontier` vs `durable_frontier`) lets embedded mode reach
+>    sub-millisecond visibility without overpromising durable distributed
+>    latency.
+> 2. **Stable CDC row identity** (§6.4): `row_id` for keyed CDC sources is
+>    `(source_id, table_id, primary_key_bytes)`. LSNs and source offsets
+>    are version metadata only; they never participate in arrangement
+>    identity. Keyless mutable sources without a stable identity column
+>    are rejected for retraction-capable views.
+> 3. **Versioned Z-set cold/hot merge** (§12.7.1): the hot/cold tier merge
+>    is a signed Z-set merge ordered by epoch, not a blind `row_id` dedup.
+>    `row_id` deduplication is permitted only for insert-only views whose
+>    root operator proves monotonicity.
+> 4. **Virtual buckets** (§7.1, §10.2, §10.6) replace ambiguous key-range
+>    splitting. Keys hash to many virtual buckets; buckets are the unit of
+>    rebalancing, hot-key salting, and online migration. Rendezvous
+>    hashing now maps virtual buckets to physical shards, not raw keys.
+> 5. **Bucket migration state machine** (§10.2): `PLANNED →
+>    SNAPSHOTTING → COPYING → DUAL_WRITING → CATCHING_UP →
+>    FENCING_OLD → CUTOVER → VERIFYING → GC_ELIGIBLE → DONE`. Every
+>    transition is idempotent and audit-logged. Cleanup is forbidden
+>    until the bucket's consumer frontier passes the cutover epoch.
+> 6. **Watermark fail-closed** (§6.9, §13.3): event-time windows require
+>    an explicit `WATERMARK = PROCESSING_TIME | EXTERNAL '<source>' |
+>    NONE` policy when the source cannot supply a watermark. The default
+>    is to reject the DDL with `RS-1005 connector.watermark_required`
+>    rather than silently leave windows open forever.
+> 7. **Vector freshness tokens** (§12.4): `FreshnessToken` now carries a
+>    `BTreeMap<SourceId, SourceProgress>` so views over multiple sources
+>    and view-on-view DAGs can express read-your-writes correctly. The
+>    scalar form is retired.
+> 8. **Namespace, not schema** (§5.2, §14): the user-facing surface uses
+>    `NAMESPACE` consistently. Inside a namespace there is no PostgreSQL
+>    schema layer; dotted names appear only in cross-namespace admin
+>    commands. `ALTER SCHEMA` is removed in favor of `ALTER NAMESPACE`.
+> 9. **System schema consolidation** (§12.6.1): the single canonical
+>    user-facing system schema is `rockstream_catalog`. The historical
+>    `rockstream.*` names are documented as legacy aliases scheduled for
+>    removal in v0.50.
+> 10. **Error-code ranges and uniqueness** (§14.14): every `RS-XXXX` code
+>     lives in one reserved owner range and must be globally unique. CI
+>     fails on duplicates. Colliding coordinator and cold-tier codes are
+>     reassigned into their owner ranges (`RS-25xx` for coordinator
+>     group, `RS-40xx` for cold-tier quota).
+> 11. **Hot-path metrics** (§14.15): added object-store p99 latency,
+>     SlateDB manifest/WAL/SST detail, write amplification, compaction
+>     debt, event-time watermark lag, `windows_held_without_watermark_total`,
+>     visible vs durable frontier lag, and migration-state duration.
+> 12. **Section reference fixes**: §13.10 and §13.6.6 (renamed from
+>     §13.6.2.1) are corrected. §3.4 frontier-aggregator references are
+>     redirected to §3.2.
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -499,11 +559,45 @@ synchronous barrier.
    Object storage holds *all* durable state. Workers and the control plane have
    no local persistent state (modulo a small write-through cache).
 
+### 3.0 Latency Classes and Frontier Semantics
+
+RockStream's freshness contract is explicit per execution path, not a single
+number. Each materialized view and each query is classified into one of five
+**latency classes**, each with its own target and its own frontier semantics:
+
+| Class | Applies to | Target | Frontier used |
+|---|---|---:|---|
+| `local_visible` | Embedded direct writes and in-process reads on the same worker. | sub-ms to low-ms | `visible_frontier` |
+| `local_durable` | Local filesystem SlateDB commit-to-read in `embedded` or `single_worker`. | low-ms to tens-of-ms | `durable_frontier` |
+| `distributed_fresh` | Distributed source-to-view freshness over object storage. | 10–250 ms | published cluster vector frontier |
+| `distributed_exact_sink` | External sink with exactly-once semantics (Kafka EOS, Iceberg snapshot). | checkpoint-bounded (seconds) | cluster checkpoint frontier |
+| `analytical_cold` | Iceberg/Delta full scans, ad-hoc analytics. | seconds (throughput-optimized) | cold snapshot epoch |
+
+**The dual-frontier model.** A view advances two frontiers, not one:
+
+- `visible_frontier` advances when deltas are folded into the in-memory
+  arrangement cache (§4.2 of the hot-arrangement cache pattern) and become
+  queryable to in-process readers. In `embedded` mode this can be sub-ms.
+- `durable_frontier` advances only after the corresponding SlateDB
+  `WriteBatch` is acknowledged. This is the frontier used for external
+  sinks, replay, checkpointing, cross-worker reads, recovery, and
+  freshness tokens issued to clients.
+
+The visible frontier may lead the durable frontier only in runtime profiles
+that explicitly allow it (`embedded`, and `single_worker` for same-process
+reads). Distributed reads, exactly-once sinks, recovery, and any client-side
+`FreshnessToken` always reference the **durable frontier**. This separation
+is what lets the laptop story honestly claim sub-millisecond commit-to-read
+while the distributed story honestly claims 10–250 ms freshness without
+either number lying about the other.
+
+`EXPLAIN INCREMENTAL ESTIMATE` prints the latency class for every view and
+every query path, alongside the freshness target it commits to.
+
 ### 3.1 Runtime Profiles: Tiny to Massive
 
 Storage profile (§5.6) controls durability/cost assumptions; **runtime
 profile** controls how much distributed machinery is actually in the hot path.
-The same binary supports three runtime profiles:
 
 | Runtime profile | Typical shape | Hot-path behavior |
 |---|---|---|
@@ -1159,11 +1253,33 @@ side guarantees both inputs are partitioned by the join key, so each shard sees
 matching pairs locally.
 
 `row_id` is a stable 128-bit identity assigned by the source connector, never a
-fresh random value at replay time. For log sources it is derived from
-`(source_id, partition, offset, row_ordinal)`; for CDC sources from the table
-primary key plus source LSN; for keyless snapshots from
-`(snapshot_id, file_path, row_group, row_ordinal)`. Idempotent replay therefore
-rewrites the same arrangement key instead of duplicating rows.
+fresh random value at replay time. The rule is **strict** because join, set-op,
+distinct, and outer-join match accounting all depend on retraction matching the
+original insert byte-for-byte:
+
+- **Append-only log sources** (Kafka, append-only files): `row_id =
+  hash(source_id, partition, offset, row_ordinal)`. The LSN/offset is part of
+  identity because the row genuinely is "the row at this offset".
+- **Keyed CDC sources** (Postgres logical replication, Debezium, MySQL
+  binlog, RockStream's own CDC sink): `row_id = hash(source_id, table_id,
+  primary_key_bytes)`. The LSN/offset is **version metadata stored alongside
+  the row** (`source_lsn`, `source_epoch`), never part of `row_id`. An
+  `UPDATE` that changes a non-key column must retract the previous row and
+  insert the new row at the **same** `row_id`; using the LSN would silently
+  break this.
+- **Keyless snapshot/file sources**: `row_id = hash(snapshot_id, file_path,
+  row_group, row_ordinal)`. Idempotent re-scan rewrites the same arrangement
+  key.
+- **Keyless mutable sources without a stable identity column** are rejected
+  at `CREATE SOURCE` time with `RS-1006 source.no_stable_identity` for any
+  view that needs retractions. The error message names the connector and
+  asks the operator either to declare a `PRIMARY KEY (...)` clause or to
+  mark the source `INSERT_ONLY = true` so the planner can restrict the
+  downstream operator set.
+
+Idempotent replay therefore rewrites the same arrangement key instead of
+duplicating rows, regardless of the LSN at which the record happens to be
+re-delivered.
 
 ```
 0x01 0xJL op_id(16) join_key(var) row_id(16) → row_bytes  (left arrangement)
@@ -1261,6 +1377,38 @@ emitted by source connectors (§13.3). Without a connector-supplied
 watermark, event-time semantics degrade to best-effort guesswork; the
 connector contract therefore makes watermark emission a first-class return
 value of `poll_delta`, separate from the source-epoch dimension.
+
+**Watermark fail-closed policy.** Event-time windows are silent-data-loss
+prone if the source cannot supply a watermark, because windows would either
+stay open forever (memory blow-up) or be closed by wall-clock heuristics
+(silently dropping legitimate late data). The DDL contract is therefore
+fail-closed:
+
+- `CREATE SOURCE` records whether the connector's `poll_delta` returns a
+  watermark in its `WATERMARK_CAPABILITY` metadata
+  (`NATIVE` | `EXTERNAL_HINT` | `NONE`).
+- `CREATE MATERIALIZED VIEW` over any TUMBLE/HOP/SESSION window must specify
+  one of:
+  - `WATERMARK = NATIVE` — require `WATERMARK_CAPABILITY = NATIVE` on every
+    contributing source; otherwise reject with
+    `RS-1005 connector.watermark_required`.
+  - `WATERMARK = PROCESSING_TIME` — fall back to wall-clock at the operator;
+    drops late data silently and is logged at `WARN` on every window close.
+    Allowed only when explicitly named.
+  - `WATERMARK = EXTERNAL '<channel>'` — accept a watermark from a separate
+    control-plane channel (heartbeats, manual advance).
+  - `WATERMARK = NONE WITH WINDOW_CLOSE_DISABLED` — explicitly opt into a
+    monotonically-growing windowed arrangement (the operator never closes
+    windows; reads see all accumulated state). Required to be paired with
+    `MEMORY_LIMIT` on the workload; otherwise rejected.
+- The default — omitting the clause — fails the DDL with
+  `RS-1005 connector.watermark_required` rather than picking any of the above
+  for the user. There is no silent fallback.
+
+The chosen policy is printed by `EXPLAIN INCREMENTAL` and shown by `SHOW
+VIEW STATUS`. Metric `windows_held_without_watermark_total` counts windows
+that have been open longer than `2 × window_size` without watermark advance,
+making silent-stuck-window scenarios observable.
 
 **Late-data policy.** A row is *late* for window `W` if its event-time falls
 below the operator's current input frontier minus `allowed_lateness`. Per
@@ -1364,14 +1512,37 @@ crosses shard boundaries.
 
 ### 7.1 Partition Function
 
-For partition key `k` and target width `W`:
+Partitioning is **two-level**: keys hash to virtual buckets, virtual buckets
+map to physical shards. This is the only correct way to handle online
+re-sharding, hot-key salting, and skew rebalancing without scanning the
+entire keyspace at every change.
 
 ```
-target_shard = consistent_hash(k, W)
+virtual_bucket_id = hash(partition_key) mod B
+physical_shard_id = rendezvous_hash(virtual_bucket_id, live_shards, W)
+worker_id         = lease(physical_shard_id)
 ```
 
-We use **rendezvous hashing** so that adding or removing one shard moves only
-`1/W` of the keyspace.
+`B` (virtual bucket count) is fixed for the lifetime of the pipeline at
+`B = 16 × max_expected_shards`, default `B = 4096`. `W` is the current
+physical shard count and is the only value that changes at scale events.
+
+- **Rendezvous hashing** maps virtual buckets to physical shards so that
+  changing `W` moves only `1/W` of the buckets, never partial keys.
+- **Buckets, not keys, are the unit of online migration** (§10.2). All
+  migration state, fence epochs, and shuffle-outbox metadata are
+  bucket-scoped. The migration plan never has to enumerate keys.
+- **Hot-key salting** is expressed as a per-bucket override: a known hot key
+  is salted across `S` virtual buckets, all of which route the bucket-level
+  pre-aggregation through a registered associative `MergeLawId` (§6.11) and
+  re-aggregate at the consumer. The salt is recorded in the catalog so it
+  survives restart and replay.
+- **Skew rebalancing** moves whole buckets between physical shards via the
+  §10.2 state machine; it never requires a key-range scan.
+
+A bucket-to-shard map version (`bucket_map_version`) is stamped into every
+exchange frame and every commit. Stale shuffle traffic referencing an old
+map version is rejected at the receiver and re-routed via the fallback path.
 
 ### 7.2 Hybrid Transport: Direct + Object-Store
 
@@ -1792,19 +1963,45 @@ epoch boundary.
 
 ### 10.2 Adding a Shard
 
-1. Provision a new SlateDB instance (just a path on object storage).
-2. Assign it to a worker (capacity-based scheduling).
-3. Compute the new shard map; identify keys that will move from existing shards
-   to the new one (consistent hashing ⇒ small fraction).
-4. For each existing shard losing keys:
-   - Snapshot the relevant key range via SlateDB `Checkpoint`.
-   - The new shard reads the range from the donor shard's checkpoint (via
-     `DbReader`) and ingests into its own SlateDB.
-   - Once caught up, the control plane atomically flips the shard map to the
-     new version at a chosen epoch boundary.
-5. After cutover, the donor shards mark the migrated key ranges as retired and
-  reclaim them via bounded scan-and-delete or a frontier-aware compaction
-  filter. This avoids depending on a missing SlateDB range-delete API.
+Migration is **bucket-scoped** (§7.1) and runs through a strict state
+machine. Buckets, not key ranges, are the unit of work; the migration plan
+never enumerates individual keys.
+
+```
+PLANNED → SNAPSHOTTING → COPYING → DUAL_WRITING → CATCHING_UP →
+         FENCING_OLD → CUTOVER → VERIFYING → GC_ELIGIBLE → DONE
+```
+
+Each transition is **idempotent**, **persisted in the control catalog**
+under `topology/migration/{migration_id}`, and **emits an audit event**.
+Each transition publishes a `migration_state_duration_seconds` histogram
+sample so stalled migrations are observable.
+
+| State | Done when |
+|---|---|
+| `PLANNED` | Migration request accepted; donor/recipient shards, bucket set, source frontier `F_plan`, and target shard map version computed. |
+| `SNAPSHOTTING` | A SlateDB `Checkpoint` exists on every donor shard that pins the bucket's state at `F_plan`. |
+| `COPYING` | Recipient has ingested the snapshot via `DbReader`. Recipient's local arrangement matches donor's at `F_plan`. |
+| `DUAL_WRITING` | Both donor and recipient receive new writes for the migrating buckets through the exchange. Recipient buffers writes; donor remains authoritative for reads. |
+| `CATCHING_UP` | Recipient's frontier has reached `F_plan`. The dual-write tail is being replayed into the recipient until its frontier reaches donor's current frontier within `cutover_lag_budget` (default 100 ms). |
+| `FENCING_OLD` | Donor is fenced for the migrating buckets via shard-map version bump (`bucket_map_version + 1`). New writes route only to recipient. Old in-flight writes referencing the prior version are rejected at the receiver. |
+| `CUTOVER` | All readers, all exchange receivers, and the gateway have observed the new `bucket_map_version`. Recipient is authoritative. |
+| `VERIFYING` | A scan compares donor and recipient state at the cutover epoch for the migrated buckets. Any divergence aborts (rolls back to `DUAL_WRITING`); otherwise proceed. Verification is bounded by `verify_sample_rate` (default 1.0 for buckets ≤ 1 GB, sampled above). |
+| `GC_ELIGIBLE` | The migration's consumer frontier — the minimum of every downstream operator's input frontier for the migrating buckets — has passed the cutover epoch. Only now is donor cleanup allowed to start. Cleanup before this state is forbidden; the §11 frontier protocol is the gate. |
+| `DONE` | Donor cleanup complete. Migration record is closed and moved to history. |
+
+**Cleanup safety rule.** No bucket-scoped delete, compaction filter, or
+checkpoint discard fires until the migration reaches `GC_ELIGIBLE`. This
+is what makes the absence of a SlateDB range-delete API safe: cleanup is a
+frontier-gated, audit-logged action, not a side effect of the cutover.
+
+**Rollback.** Any state from `PLANNED` through `VERIFYING` can transition
+to `ABORTED`, which restores the previous `bucket_map_version` and removes
+the recipient's partial state. `FENCING_OLD` and beyond are committed; a
+post-cutover rollback is a new migration in the reverse direction.
+
+**Online split, online merge, and worker drain** (§10.4–§10.7) all use
+this state machine; they differ only in how the bucket set is computed.
 
 ### 10.3 Removing a Shard (Graceful)
 
@@ -2233,19 +2430,50 @@ to the remaining shards. `EXPLAIN` reports both effects separately.
 ### 12.4 Freshness Tokens and Read-Your-Writes
 
 Every source commit, sink commit, and query response can carry a **freshness
-token**:
+token**. The token is **vector-valued**: a single materialized view can have
+many sources upstream (joins, unions, view-on-view DAGs), and "fresh enough"
+requires committing to a point on each contributing source, not on the
+scalar that happened to commit last.
 
-```
-FreshnessToken { source_id, source_epoch, cluster_frontier_hash }
+```rust
+pub struct FreshnessToken {
+    /// One entry per source that feeds the view, directly or transitively.
+    /// Empty for views with no source dependencies (constant views).
+    pub source_progress: BTreeMap<SourceId, SourceProgress>,
+    /// Hash of the published cluster vector frontier this token was issued
+    /// against. Used for fast equality on the gateway hot path; not a
+    /// substitute for source_progress.
+    pub cluster_frontier_hash: u64,
+}
+
+pub struct SourceProgress {
+    /// Per-connector strictly-increasing source epoch (§8.1.1, §13.3).
+    pub source_epoch: u64,
+    /// Optional event-time watermark at the point of issue (§6.9). Used by
+    /// AS OF MONOTONE PARTIAL and by analytics that need to know how stale
+    /// the wall-clock view of the source is.
+    pub event_time_watermark_ms: Option<i64>,
+}
 ```
 
-For normal low-latency reads, the gateway pins to the freshest published vector
-frontier and returns the token it used. For read-your-writes, clients pass
-`wait_for=<FreshnessToken>`; the gateway waits until the published vector
-frontier dominates the requested source epoch or until a caller-supplied
-timeout expires. The query result then explicitly says whether the token was
-satisfied. This gives application developers a simple contract without
-exposing antichains in the default path.
+For normal low-latency reads, the gateway pins to the freshest published
+vector frontier and returns the token it used. For read-your-writes, clients
+pass `wait_for=<FreshnessToken>`; the gateway waits until **every entry** in
+`source_progress` is dominated by the published vector frontier or until a
+caller-supplied timeout expires. The query result then explicitly says
+whether the token was satisfied.
+
+Tokens compose: a `COMMIT` from one connection returns a token; the same or
+another client may pass that token to a `SELECT` against any view that
+transitively depends on the same source. View-on-view DAGs (§5.7) propagate
+the source set through the catalog so a token for an upstream commit is
+honored by any downstream view automatically. Tokens of disjoint source sets
+are independent; passing an unrelated token is a no-op (the wait condition
+is vacuously satisfied).
+
+The scalar single-source form previously used in v0.42 is retained on the
+wire only as the special case `source_progress.len() == 1`; the gateway
+always serializes the vector form going forward.
 
 ### 12.4.1 Historical Queries (`AS OF`)
 
@@ -2366,23 +2594,30 @@ TABLE`, `ALTER TABLE`) is handled via `CREATE MATERIALIZED VIEW` / `CREATE VIEW`
 `CREATE WORKLOAD` semantics. Write DML goes through the internal source connector (§13.5).
 Extensions, `COPY`, `LISTEN`/`NOTIFY`, and advisory locks are out of scope.
 
-### 12.6.1 The `rockstream` System Schema
+### 12.6.1 The `rockstream_catalog` System Schema
 
-In addition to `pg_catalog` and `information_schema`, the gateway exposes a
-`rockstream` schema containing virtual tables materialized from the
+The canonical user-facing system schema is `rockstream_catalog`. In addition
+to `pg_catalog` and `information_schema`, the gateway exposes
+`rockstream_catalog` containing virtual tables materialized from the
 control-plane catalog and checkpoint index. These tables are read-only and
 require no additional storage — they project existing control-plane state
 through the standard SQL interface.
 
+> **Legacy aliases.** Older specifications and earlier roadmap versions
+> referred to these tables under the unqualified `rockstream.*` prefix.
+> `rockstream.*` is accepted as a read-only alias through v0.45 and removed
+> in v0.50. The DLQ table previously named `rockstream_catalog.dead_letter_queue`
+> stays under `rockstream_catalog`; that naming was already correct.
+
 | Table | Source | Purpose |
 |---|---|---|
-| `rockstream.epochs` | `control: checkpoints/` + `shard_meta/0x06` | Per-view committed epoch history: epoch number, commit timestamp, frontier hash, shard count, row delta count. |
-| `rockstream.workloads` | `control: catalog/workload` | Workload metadata, resource policy, current quota utilisation, priority. |
-| `rockstream.views` | `control: catalog/view` | View definitions, retention policy, arrangement count, state bytes, lifecycle state, `workload_source` (`view` \| `schema_default` \| `system_default`) indicating how the workload assignment was resolved. |
-| `rockstream.shards` | `control: topology/` | Shard placement, worker assignment, frontier position, state size. |
-| `rockstream.connectors` | `control: connector/` | Connector status, latest committed offset, lag. |
-| `rockstream.audit_log` | `control: audit/` | Recent audit events (bounded by a configurable window, default 7 days). |
-| `rockstream.schema_history` | `control: schema/` | Per-view schema version history: version, applied timestamp, actor, change summary. |
+| `rockstream_catalog.epochs` | `control: checkpoints/` + `shard_meta/0x06` | Per-view committed epoch history: epoch number, commit timestamp, frontier hash, shard count, row delta count. |
+| `rockstream_catalog.workloads` | `control: catalog/workload` | Workload metadata, resource policy, current quota utilisation, priority. |
+| `rockstream_catalog.views` | `control: catalog/view` | View definitions, retention policy, arrangement count, state bytes, lifecycle state, `workload_source` (`view` \| `namespace_default` \| `system_default`) indicating how the workload assignment was resolved. |
+| `rockstream_catalog.shards` | `control: topology/` | Shard placement, worker assignment, frontier position, state size. |
+| `rockstream_catalog.connectors` | `control: connector/` | Connector status, latest committed offset, lag. |
+| `rockstream_catalog.audit_log` | `control: audit/` | Recent audit events (bounded by a configurable window, default 7 days). |
+| `rockstream_catalog.schema_history` | `control: schema/` | Per-view schema version history: version, applied timestamp, actor, change summary. |
 
 **`rockstream.epochs` scalability.** On a busy cluster (e.g. 1,000 shards ×
 10 rows/s/shard × 100 ms epochs = 864 billion logical rows/day), storing one
@@ -2468,9 +2703,24 @@ Cold tier (Parquet/Iceberg): periodic columnar snapshots of view output
 
 For a full-collection query the gateway merges both tiers: read the cold
 snapshot (fast columnar scan) plus the hot LSM tail (small, recent deltas).
-The merge is a union with deduplication by `row_id` — a standard DataFusion
-operation. This is structurally identical to what Apache Paimon, Apache Hudi
-MOR, and Materialize's "persist" layer do.
+The merge is a **versioned signed Z-set merge**, not a blind union with
+`row_id` dedup: every cold-tier row and every hot-tier delta carries
+`(row_id, weight, version)`, where `version` is the commit epoch and `weight`
+is the Z-set sign (±1). The merge folds rows by `row_id` taking the **latest
+version's weight**, then filters to weight ≠ 0. This is the same algebra the
+in-memory operators use; it preserves CDC update semantics (an `UPDATE` that
+arrives in the hot tail after the cold snapshot correctly retracts and
+re-emits) and OR-Set / counter / register semantics through the same
+`LawBundle::merge_fn` (§6.11) the IVM hot path uses.
+
+A simple `row_id` dedup union (cold ∪ hot keyed by `row_id`) is permitted
+only for **insert-only views** whose root operator declares monotonicity in
+`EXPLAIN INCREMENTAL` (e.g. monotone reachability, append-only logs). The
+planner refuses the cheap dedup path for any other view; the §12.7.3
+`ViewReader::TwoTier` always reports which merge mode it chose so
+operators can audit it. This is the difference between "structurally
+identical to Paimon/Hudi MOR" and "actually correct for retraction-bearing
+views" — and we choose correct.
 
 #### 12.7.2 The Cold Tier Is a Natural Extension of Checkpointing
 
@@ -2556,9 +2806,10 @@ The gateway planner selects `TwoTier` when all of the following hold:
 For all other queries (point lookups, range scans by partition key, subscribe),
 the gateway always uses `HotOnly` regardless of whether a cold tier exists.
 
-In Phase 9, only `HotOnly` is implemented. The `ViewReadStrategy` enum and the
-`ViewReader` trait are defined in full so that the cold-tier implementation
-slot-fits without touching the gateway planner.
+In Phase 8 (v0.40), only `HotOnly` is implemented. The `ViewReadStrategy`
+enum and the `ViewReader` trait are defined in full so that the cold-tier
+implementation (Phase 12 / v0.53) slot-fits without touching the gateway
+planner.
 
 #### 12.7.4 Competitive Position
 
@@ -2818,10 +3069,25 @@ processing-time progress. It is not sufficient for time-window operators
 out-of-order event streams. Source connectors therefore emit a second,
 independent signal: a monotonic `EventTimeWatermark` returned alongside
 the delta batch. The source operator propagates this as an event-time
-antichain advance through the frontier protocol (§8). A connector that
-cannot produce a watermark returns `None`; the corresponding event-time
-frontier never advances and the operator's late-data policy (§6.9) treats
-all windows as still open.
+antichain advance through the frontier protocol (§8).
+
+**Watermark capability declaration is mandatory and fail-closed.** Every
+connector declares `watermark_capability() -> WatermarkCapability` in
+`discover_schema`:
+
+| Value | Meaning |
+|---|---|
+| `Native` | Connector produces a watermark on every `poll_delta` from the underlying source (Kafka with embedded watermarks, Postgres CDC LSN as event-time proxy, etc.). |
+| `ExternalHint` | Connector accepts watermarks from an out-of-band control channel (heartbeat connector, manual `ALTER SOURCE ... ADVANCE WATERMARK`). |
+| `None` | Connector cannot produce a watermark under any conditions. |
+
+`CREATE MATERIALIZED VIEW` on any TUMBLE/HOP/SESSION window must pick a
+matching `WATERMARK = NATIVE | PROCESSING_TIME | EXTERNAL '<src>' | NONE
+WITH WINDOW_CLOSE_DISABLED` policy (§6.9). Mismatches (e.g.
+`WATERMARK = NATIVE` against a source whose capability is `None`) are
+rejected at DDL time with `RS-1005 connector.watermark_required`. The
+fail-closed default — silently accepting `None` and leaving windows open
+forever — is the v3.27 behavior this section deprecates.
 
 **Backpressure feedback.** The credit-based backpressure system (§7.2, P14)
 governs operator-to-operator flow, but the connector sits upstream of the
@@ -3664,7 +3930,7 @@ Shard 3–100    Shard 101      Shard 102      Shard 103+
   discipline (§13.5): each `CREATE TABLE` direct-write source gets its own
   dedicated base-table shard by default.
 - The coordinator group reuses lease-based leader election already present in
-  the frontier aggregator (§3.4), with a dedicated lease key per group.
+  the frontier aggregator (§3.2), with a dedicated lease key per group.
 
 **Transaction shape.** When the gateway classifies a direct-write transaction
 (§13.5.1) and all touched shards are within a declared coordinator group, the
@@ -3740,10 +4006,15 @@ coordination layer.
 
 | Code | Name | Meaning |
 |---|---|---|
-| `RS-2012` | `coordinator.group_not_found` | Transaction shape requires a coordinator group but no group covers the shards involved. |
-| `RS-2013` | `coordinator.cross_group_transaction` | Transaction touches shards from more than one coordinator group. |
-| `RS-2017` | `coordinator.leader_unavailable` | Coordinator group leader election in progress; retry after backoff. |
-| `RS-2018` | `coordinator.quorum_write_failed` | Fewer than quorum members acknowledged the prepare; transaction aborted. |
+| `RS-2501` | `coordinator.leader_unavailable` | Coordinator group leader election in progress; retry after backoff. |
+| `RS-2502` | `coordinator.prepare_conflict` | Two prepares contend for the same key under the group's quorum; one aborts. |
+| `RS-2503` | `coordinator.cross_group_rejected` | Transaction touches shards from more than one coordinator group, or no group covers the shards involved. |
+| `RS-2504` | `coordinator.quorum_lost` | Fewer than quorum members acknowledged the prepare; transaction aborted. |
+
+> The earlier draft used `RS-2012`–`RS-2013`, `RS-2017`–`RS-2018` for these
+> conditions, which collided with the session-layer codes already established
+> in §12.8. The session codes keep their numbers; coordinator-group codes are
+> reassigned to the `RS-25xx` range as documented in §14.14.
 
 ---
 
@@ -3830,7 +4101,7 @@ AS
 Multiple views can share a workload. The compiler builds one shared operator
 DAG so common subplans are maintained once and fanned out to multiple view
 sinks. Omitting `WITH WORKLOAD` inherits the schema-level default
-(`ALTER SCHEMA ... SET DEFAULT WORKLOAD = name`). `CREATE REPLACEMENT
+(`ALTER NAMESPACE ... SET DEFAULT WORKLOAD = name`). `CREATE REPLACEMENT
 MATERIALIZED VIEW v2 FOR v1` and `ALTER MATERIALIZED VIEW v1 APPLY
 REPLACEMENT v2` use the schema/plan replacement path from §4.2.
 
@@ -4079,9 +4350,9 @@ transition so the dashboard tells the same story.
 -- Status for one view (backfill progress, freshness, SLO, state)
 SHOW BACKFILL STATUS FOR MATERIALIZED VIEW reporting.daily_summary;
 
--- Status for all views in a schema (shows state, SLO, workload, workload_source)
-SHOW VIEW STATUS FOR SCHEMA reporting;
--- workload_source column: 'view' | 'schema_default' | 'system_default'
+-- Status for all views in a namespace (shows state, SLO, workload, workload_source)
+SHOW VIEW STATUS FOR NAMESPACE reporting;
+-- workload_source column: 'view' | 'namespace_default' | 'system_default'
 -- indicating how the view's workload assignment was resolved.
 
 -- Status for all views in the cluster
@@ -4104,12 +4375,14 @@ CREATE MATERIALIZED VIEW reporting.large_view AS SELECT ...;
 WAIT FOR MATERIALIZED VIEW reporting.large_view TO BE READY TIMEOUT '1 hour';
 ```
 
-**Schema-level lifecycle.** Pause or resume all views in a schema atomically:
+**Namespace-level lifecycle.** Pause or resume all views in a namespace atomically:
 
 ```sql
-ALTER SCHEMA reporting PAUSE;
-ALTER SCHEMA reporting RESUME;
+ALTER NAMESPACE reporting PAUSE;
+ALTER NAMESPACE reporting RESUME;
 ```
+
+(In v3.27 and earlier these commands were spelled `ALTER SCHEMA`; the keyword `SCHEMA` is accepted as a deprecated alias for `NAMESPACE` through v0.45 and removed in v0.50.)
 
 ### 14.11 Audit Log
 
@@ -4168,32 +4441,94 @@ and in the audit log when changed.
 ### 14.14 Error Code Taxonomy
 
 Every error returned to a user, written to a log, or recorded as a
-`view_blocked_reason` carries a stable `RS-XXXX` code with a published
-doc URL. Examples (illustrative):
+`view_blocked_reason` carries a stable, **globally unique** `RS-XXXX` code
+with a published doc URL. CI enforces uniqueness: any duplicate code, or
+any new code outside its owner's reserved range, fails the build.
+
+**Reserved code ranges.** Each owner area has a contiguous range. Numbers
+allocate from the bottom of the range; gaps are normal and never reused
+out-of-range to prevent accidental collisions with future owner additions.
+
+| Range | Owner |
+|---|---|
+| `RS-1000–1499` | Connector / source / sink ingestion |
+| `RS-1500–1999` | Schema / DDL validation |
+| `RS-2000–2099` | Gateway / SQL / session / freshness |
+| `RS-2100–2199` | Index / planner |
+| `RS-2200–2299` | Direct-write transactions (optimistic, exact-key) |
+| `RS-2300–2399` | History / `AS OF` / retention |
+| `RS-2400–2499` | Reserved (gateway expansion) |
+| `RS-2500–2599` | Coordinator group (§13.10) |
+| `RS-3000–3499` | Shard / runtime / placement |
+| `RS-3500–3999` | Merge laws / arrangements |
+| `RS-4000–4099` | Control plane / quotas |
+| `RS-4100–4499` | Cold tier (sink, catalog, quota) |
+| `RS-5000–5499` | Storage format / version |
+| `RS-5500–5999` | Resource budgets / autotune surfaces |
+| `RS-6000–6499` | Schema evolution |
+| `RS-9000–9999` | Internal / fallback (never user-visible without escalation) |
+
+**Canonical registry (illustrative; full list maintained in
+`crates/rockstream-types/src/error_code.rs`).**
 
 ```
 RS-1001  connector.authentication_failed
 RS-1002  connector.schema_drift
 RS-1003  connector.decode_error (DLQ routed)
 RS-1004  connector.dlq_growing
+RS-1005  connector.watermark_required
+RS-1006  source.no_stable_identity
+RS-1010  view.dependent_inline_view_exists
+RS-1011  view.inline_cycle_detected
 RS-2001  view.unsupported_sql_construct
 RS-2002  view.state_budget_exceeded
 RS-2003  isolation.serializable_not_supported
 RS-2005  history.epoch_before_retention
+RS-2006  system_table.requires_filter
 RS-2007  write.idempotency_key_required
+RS-2008  transaction.optimistic_conflict
+RS-2009  transaction.unsupported_shape
+RS-2012  session.wait_for_timeout
+RS-2013  session.returning_unsupported_shape
+RS-2014  index.building
+RS-2015  index.frontier_lag
+RS-2016  index.name_conflict
 RS-2017  shard_stats.too_stale
 RS-2018  session.staleness_exceeded
+RS-2501  coordinator.leader_unavailable        (was RS-2012)
+RS-2502  coordinator.prepare_conflict          (was RS-2013)
+RS-2503  coordinator.cross_group_rejected      (was RS-2017 collision)
+RS-2504  coordinator.quorum_lost               (was RS-2018 collision)
 RS-3001  shard.fence_lost
 RS-3002  shard.recovery_replay_failed
 RS-3009  merge.malformed_operand
 RS-4001  control.quota_violation
 RS-4002  control.autotune_bounds_exhausted
+RS-4101  cold_tier.not_enabled                 (was RS-4001 collision)
+RS-4110  cold_tier.quota_exceeded
 RS-5001  storage.format_version_incompatible
 RS-5002  merge.unknown_law
 RS-5018  resource.budget_warning_80pct
 RS-5019  resource.budget_critical_95pct
+RS-5020  merge.law_version_mismatch            (was RS-5002 overload)
 RS-6001  schema.incompatible_evolution
+RS-6002  schema.evolution_not_applied          (was RS-6001 overload)
 ```
+
+**Collisions resolved in v3.28.** The following codes were previously
+overloaded across owner areas; each has been reassigned into its owner's
+range and the prior occupant retained for its original meaning:
+
+- `RS-2012`, `RS-2013`, `RS-2017`, `RS-2018` previously double-booked for
+  both session-state errors and coordinator-group errors. Coordinator-group
+  errors are renumbered into the `RS-25xx` range.
+- `RS-4001` previously denoted both `control.quota_violation` and
+  `cold_tier.not_enabled`. Cold-tier moves to `RS-41xx`.
+- `RS-5002` previously denoted both `merge.unknown_law` and
+  `merge.law_version_mismatch`. Version mismatch moves to `RS-5020`.
+- `RS-6001` previously denoted both `schema.incompatible_evolution` (a
+  NOTICE) and a separate `evolution_not_applied` error. The latter moves
+  to `RS-6002`.
 
 **`next_steps` requirement.** Every `RS-XXXX` error must include a
 `next_steps` field containing actionable remediation guidance. This is
@@ -4204,33 +4539,61 @@ Users should never receive an error without knowing what to do next.
 
 `rockstream` exits non-zero on any RS-coded error and prints a one-line
 remediation pointer. The codebase has a single error-code registry; CI
-fails if a new code is introduced without a doc entry. "Internal error"
-without a code is itself a bug.
+fails if a new code is introduced without a doc entry or outside its
+reserved owner range. "Internal error" without a code is itself a bug.
 
 ### 14.15 Metrics Reference
 
 Every shard, operator instance, and pipeline reports:
+
+**Workload/SLO surface:**
 - `view_slo_compliance` — the primary indicator (§14.4).
 - `view_degraded_reason` — label when below 1.0 (§14.10).
 - `frontier_lag_ms` — raw lag, per view.
-- `backfill_progress` — for snapshot-mode connectors: `offsets_consumed / snapshot_end_offset` (both reported by the connector's `discover_stats()`). Undefined (omitted) for live-only connectors with no snapshot boundary.
-- `recovery_progress` — fraction of shards whose recovered epoch frontier ≥ the cluster checkpoint epoch.
+- `visible_frontier_lag_ms` — visible-frontier lag (§3.0), per view.
+- `durable_frontier_lag_ms` — durable-frontier lag (§3.0), per view.
+- `event_time_watermark_lag_ms` — wall-clock minus event-time watermark, per source.
+- `windows_open_total` — count of open windows per time-window operator.
+- `windows_held_without_watermark_total` — count of windows open longer than `2 × window_size` without a watermark advance (§6.9).
+- `backfill_progress` — for snapshot-mode connectors.
+- `recovery_progress` — fraction of shards whose recovered epoch frontier ≥ cluster checkpoint epoch.
+
+**Throughput / scheduling:**
 - `rows_in_per_sec`, `rows_out_per_sec` — throughput.
 - `epoch_ms` — per operator, processing time per epoch.
 - `op_state_bytes`, `op_state_rows` — arrangement size.
 - `shuffle_outbox_depth` — pending batches on each exchange sender.
 - `connector_lag_ms` — age of the oldest unread event in the source.
+
+**Storage hot path (SlateDB / object store):**
+- `object_store_request_duration_seconds` — histogram per `(op=get|put|list|delete, status)`. p50/p99 are the primary cost and latency signal.
+- `slatedb_manifest_write_duration_seconds` — histogram per shard; spikes here mean manifest contention or object-store slowness.
+- `slatedb_wal_replay_bytes` — counter incremented during recovery; non-zero outside recovery is a bug.
+- `slatedb_sst_count` — gauge per shard; growing without bound indicates compaction starvation.
+- `write_batch_bytes` — histogram of per-epoch `WriteBatch` size; sized against `min_epoch_bytes` floor.
+- `write_amplification_ratio` — bytes-written / bytes-ingested per shard, sampled per compaction cycle.
 - `compaction_backlog_bytes` — SST bytes awaiting compaction.
+- `compaction_debt_seconds` — estimated time at current throughput to drain the backlog; the alert signal.
 - `checkpoint_age_seconds`, `checkpoint_duration_seconds`, `checkpoint_lag_ms` — recovery planning and checkpoint health.
 - `object_store_rps` — PUT+GET+LIST+DELETE per second per shard.
+
+**Caches / autotune / migration:**
 - `autotune_decisions_total` — counter labeled by `(loop, direction)`.
 - `segment_cache_hit_ratio` — per-worker hit rate for the arrangement segment cache.
 - `segment_cache_bytes_used` — current memory consumption of the segment cache.
 - `historical_query_count` — counter of `AS OF` queries served, labeled by view.
+- `migration_state_duration_seconds` — histogram per `(migration_id, state)`; stuck migrations are visible here long before they affect freshness.
 
 Exported via Prometheus / OpenTelemetry. A starter Grafana dashboard ships
 in `deploy/dashboards/rockstream-overview.json` and contains exactly one
 panel above the fold per pipeline: SLO compliance over time.
+
+**Core hot-path metrics ship in v0.10 and v0.11**, not in the Phase 10
+observability roll-up: `object_store_request_duration_seconds`,
+`slatedb_manifest_write_duration_seconds`, `slatedb_wal_replay_bytes`,
+`write_batch_bytes`, `compaction_debt_seconds`, `visible_frontier_lag_ms`,
+and `durable_frontier_lag_ms`. The single-binary developer story is not
+acceptable without a way to see why something is slow.
 
 ### 14.16 Backpressure and Admission Control
 

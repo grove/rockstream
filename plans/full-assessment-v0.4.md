@@ -1,7 +1,7 @@
 # RockStream — Full Repository Assessment (v0.4)
 
 **Audit scope.** Assessment of the v0.4 implementation: repository state at `main`,
-workspace version `0.1.0`, design revision **DESIGN.md v3.27**, code corpus of
+workspace version `0.4.0`, design revision **DESIGN.md v3.27**, code corpus of
 **4,181 LOC across 14 crates** against **12,215 LOC of design markdown**.
 
 **Headline finding.** The repository is, today, an extremely polished

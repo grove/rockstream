@@ -105,6 +105,15 @@ for sequencing; this table exists only to orient readers between documents.
 - License headers, CONTRIBUTING, CODE_OF_CONDUCT.
 - Dev container (Dockerfile + devcontainer.json) with SlateDB, MinIO,
   Postgres, Kafka pre-installed.
+- **Hot-path observability from day one** (DESIGN.md §14.15). The Phase 0
+  metrics emitter ships the following core histograms / gauges from the
+  first epoch the runtime can produce them, not in the Phase 10 roll-up:
+  `object_store_request_duration_seconds{op,status}`,
+  `slatedb_manifest_write_duration_seconds`, `slatedb_wal_replay_bytes`,
+  `slatedb_sst_count`, `write_batch_bytes`, `compaction_debt_seconds`,
+  `visible_frontier_lag_ms`, `durable_frontier_lag_ms`. The single-binary
+  developer story is not acceptable without a way to see *why* something
+  is slow on a laptop.
 
 **Exit criteria**
 
@@ -462,6 +471,16 @@ standard for analytical workloads.
 - Implement ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, NTILE, sliding SUM/AVG.
 - Optimization (deferred): segment-tree variant for sliding aggregates
   (DESIGN.md §6.7), stored under `op_index/0x02 0xST`.
+
+**Latency-class caveat.** Partition-based recomputation is O(partition_size)
+per change. Windows over partitions large enough that recomputation exceeds
+the workload's `freshness_target_ms` (latency class `distributed_fresh`,
+DESIGN.md §3.0) miss the SLO by construction. `EXPLAIN INCREMENTAL` flags
+window operators over partitions with `est_partition_size_rows >
+partition_recompute_warn_threshold` (default 100k) with a NOTICE that names
+the operator and the estimated per-change cost. The segment-tree optimization
+is the supported path for low-latency large-partition windows; until it lands,
+operators are expected to either accept the relaxed SLO or split partitions.
 
 ### Milestone IVM-8 — Time windows (IVM.md §13 IVM-8)
 
@@ -943,97 +962,6 @@ production-ready.
 
 ---
 
-## Phase 9 — Connectors & Sinks
-
-**Goal**: Connect to the real world.
-
-**Deliverables**
-
-- **Sources**:
-  - Kafka (consumer-group based; offsets recorded in control plane).
-  - Postgres logical replication (decoded via `pgoutput`).
-  - HTTP push (webhook endpoint).
-  - S3 / object-store table format ingest (Parquet + manifest).
-  - SlateDB CDC source (one pipeline feeds another).
-- **Sinks**:
-  - Kafka (transactional).
-  - Postgres upsert.
-  - S3 / Iceberg / Delta Lake.
-  - HTTP webhook (idempotency-key driven).
-  - SlateDB CDC sink.
-- **Connector lifecycle**: deploy, pause, resume, delete; failure isolation.
-- **Connector contract**: built-in Rust traits and external gRPC protocol share
-  the same `discover_schema`, `start_snapshot`, `poll_delta`, `commit_offset`,
-  `prepare`, `commit`, `abort`, and `should_flush` surface from DESIGN.md
-  §13.3. The contract includes the v3.8 additions (opaque `OffsetToken`,
-  `watermark: Option<EventTimeWatermark>`, `credits_available()`) plus the
-  two v3.9 additions: `start_snapshot` and `poll_delta` accept an optional
-  `PartitionFilter` (planner-derived column predicates) so Iceberg/Delta/Hudi
-  connectors skip non-matching partition directories at the source rather than
-  in the operator layer; and sink connectors expose `should_flush(bytes, epochs)
-  -> bool` so file-format sinks buffer across epochs and write properly-sized
-  Parquet files — pending rows are staged as `connector/{id}/pending_buffer` in
-  the shard SlateDB and participate in every epoch checkpoint for exactly-once
-  recovery.
-- **Merge-law schema metadata (`LawSchemaMetadata`)**: connectors declare,
-  for each schema column, which built-in `MergeLawId` (if any) it advertises.
-  The gateway accepts only laws registered through the v0.5 IVM-0 catalog
-  that have already passed earlier phases (storage, planner, compaction,
-  duplicate policy, `EXPLAIN`); unknown or experimental laws are rejected
-  with `RS-5002`. User-defined laws via `CREATE MERGE LAW` remain gated
-  until Phase 11 v0.51. The connector SDK ships an example declaring a
-  `COUNTER` column end-to-end.
-- **Dead-letter sink routing**: per-record decode errors become `RS-1003`
-  events and are routed to a configurable DLQ sink. Implemented as a
-  connector-tier concern; the IVM core never sees malformed records.
-- **DLQ user surface** (DESIGN.md §13.3.1):
-  - `rockstream_catalog.dead_letter_queue` catalog table exposes failed records
-    with columns: `arrived_at`, `source_name`, `source_offset`, `error_code`,
-    `error_message`, `raw_bytes_hex`, `replay_attempt`.
-  - `replay_attempt` starts at 0, increments on each `REPLAY` invocation.
-  - `RS-1004 connector.dlq_growing` proactive warning emitted when a source
-    accumulates entries exceeding `dlq_warn_threshold` per hour (default 100).
-  - `ALTER SOURCE <name> SET (dlq_warn_threshold = <n>)` configures per-source
-    threshold.
-  - `ALTER SOURCE <name> REPLAY DEAD_LETTER_QUEUE [SINCE <ts> UNTIL <ts>]`
-    re-decodes failed records after a schema fix or connector update.
-  - `ALTER SOURCE <name> DISMISS DEAD_LETTER_QUEUE WHERE <predicate>` removes
-    known-bad records that should not be retried.
-  - `DLQ_RETENTION` per source (default 7 days); configurable via
-    `CREATE SOURCE ... WITH (DLQ_RETENTION = '<duration>')`.
-  - GC of expired entries by the control-plane background task.
-- **Per-connector source-epoch vector** (DESIGN.md §8.1.1): each connector
-  maintains a strictly increasing `source_epoch` and persists
-  `control: connector/{id}/epoch_map/{source_epoch} → { partition →
-  committed_offset }` atomically with the epoch commit. Exactly-once
-  recovery looks up the highest committed `source_epoch` and resumes from
-  the recorded partition offsets.
-- **View output retention** (DESIGN.md §5.7): support
-  `CREATE VIEW WITH (retention = '7d')` (and `MATERIALIZED VIEW` default
-  forever); enforce via SlateDB TTL + compaction filter that keeps the
-  current value per primary key regardless of age. Retention bytes counted
-  against the pipeline's `state_budget_gb` quota and shown in
-  `EXPLAIN INCREMENTAL ESTIMATE`.
-- **Schema evolution integration**: connectors publish schema versions before
-  data; incompatible drift returns `RS-1002` and blocks consumption before any
-  offset advances.
-- **Connector marketplace structure**: SDK + example crates; documented
-  contract.
-- **`OR_SET` user-visible column type** (v0.44): registers `ORSet/v1`
-  (ID 0x0008, tag 0x41) with `CompactionPolicy::TombstoneGc`. DDL
-  `CREATE TABLE memberships (group TEXT, members OR_SET TEXT)`; DML
-  `UPDATE memberships SET members = members + 'alice' WHERE group = $1` and
-  `members - 'alice'`. Tombstone GC across shard split/merge (Phase 7) and
-  recovery (Phase 6) is verified in the chaos suite. The add-wins vs
-  remove-wins policy is a DDL flag, defaulting to `ADD_WINS`.
-
-**Exit criteria**
-
-- End-to-end: Postgres CDC → RockStream IVM → Kafka, sustained at 100k rows/s
-  for 24 hours with exactly-once.
-
----
-
 ## Phase 8 — Query Gateway & Postgres Compatibility
 
 **Goal**: Serve materialized views to applications over the Postgres wire
@@ -1053,7 +981,7 @@ a gateway rewrite.
 - **`ViewReader` / `ViewReadStrategy` abstraction** (DESIGN.md §12.7.3):
   - Define `ViewReadStrategy` enum (`HotOnly` | `TwoTier { snapshot_manifest, hot_tail_from_epoch }`) in `rockstream-gateway`.
   - Define the `ViewReader` trait with a `read_strategy()` method the planner calls before routing a query.
-  - Implement `HotOnly` fully. `TwoTier` variant is present but returns `RS-4001 cold_tier.not_enabled` if selected.
+  - Implement `HotOnly` fully. `TwoTier` variant is present but returns `RS-4101 cold_tier.not_enabled` if selected.
 - **HTTP server routing reservation** (DESIGN.md §13.7.2): `--role=gateway`
   starts an HTTP server on port `8181` alongside pgwire on `5432`. Register
   the `/iceberg/v1/` route prefix now (returns `501 Not Implemented`). This
@@ -1304,6 +1232,97 @@ binding.
 - **Storage format version gate**: binary reads `shard_meta/0x06 0xFV` on
   shard open; refuses if version out of supported range (DESIGN.md §5.5,
   error `RS-5001`). `rockstream migrate` tool skeleton.
+
+---
+
+## Phase 9 — Connectors & Sinks
+
+**Goal**: Connect to the real world.
+
+**Deliverables**
+
+- **Sources**:
+  - Kafka (consumer-group based; offsets recorded in control plane).
+  - Postgres logical replication (decoded via `pgoutput`).
+  - HTTP push (webhook endpoint).
+  - S3 / object-store table format ingest (Parquet + manifest).
+  - SlateDB CDC source (one pipeline feeds another).
+- **Sinks**:
+  - Kafka (transactional).
+  - Postgres upsert.
+  - S3 / Iceberg / Delta Lake.
+  - HTTP webhook (idempotency-key driven).
+  - SlateDB CDC sink.
+- **Connector lifecycle**: deploy, pause, resume, delete; failure isolation.
+- **Connector contract**: built-in Rust traits and external gRPC protocol share
+  the same `discover_schema`, `start_snapshot`, `poll_delta`, `commit_offset`,
+  `prepare`, `commit`, `abort`, and `should_flush` surface from DESIGN.md
+  §13.3. The contract includes the v3.8 additions (opaque `OffsetToken`,
+  `watermark: Option<EventTimeWatermark>`, `credits_available()`) plus the
+  two v3.9 additions: `start_snapshot` and `poll_delta` accept an optional
+  `PartitionFilter` (planner-derived column predicates) so Iceberg/Delta/Hudi
+  connectors skip non-matching partition directories at the source rather than
+  in the operator layer; and sink connectors expose `should_flush(bytes, epochs)
+  -> bool` so file-format sinks buffer across epochs and write properly-sized
+  Parquet files — pending rows are staged as `connector/{id}/pending_buffer` in
+  the shard SlateDB and participate in every epoch checkpoint for exactly-once
+  recovery.
+- **Merge-law schema metadata (`LawSchemaMetadata`)**: connectors declare,
+  for each schema column, which built-in `MergeLawId` (if any) it advertises.
+  The gateway accepts only laws registered through the v0.5 IVM-0 catalog
+  that have already passed earlier phases (storage, planner, compaction,
+  duplicate policy, `EXPLAIN`); unknown or experimental laws are rejected
+  with `RS-5002`. User-defined laws via `CREATE MERGE LAW` remain gated
+  until Phase 11 v0.51. The connector SDK ships an example declaring a
+  `COUNTER` column end-to-end.
+- **Dead-letter sink routing**: per-record decode errors become `RS-1003`
+  events and are routed to a configurable DLQ sink. Implemented as a
+  connector-tier concern; the IVM core never sees malformed records.
+- **DLQ user surface** (DESIGN.md §13.3.1):
+  - `rockstream_catalog.dead_letter_queue` catalog table exposes failed records
+    with columns: `arrived_at`, `source_name`, `source_offset`, `error_code`,
+    `error_message`, `raw_bytes_hex`, `replay_attempt`.
+  - `replay_attempt` starts at 0, increments on each `REPLAY` invocation.
+  - `RS-1004 connector.dlq_growing` proactive warning emitted when a source
+    accumulates entries exceeding `dlq_warn_threshold` per hour (default 100).
+  - `ALTER SOURCE <name> SET (dlq_warn_threshold = <n>)` configures per-source
+    threshold.
+  - `ALTER SOURCE <name> REPLAY DEAD_LETTER_QUEUE [SINCE <ts> UNTIL <ts>]`
+    re-decodes failed records after a schema fix or connector update.
+  - `ALTER SOURCE <name> DISMISS DEAD_LETTER_QUEUE WHERE <predicate>` removes
+    known-bad records that should not be retried.
+  - `DLQ_RETENTION` per source (default 7 days); configurable via
+    `CREATE SOURCE ... WITH (DLQ_RETENTION = '<duration>')`.
+  - GC of expired entries by the control-plane background task.
+- **Per-connector source-epoch vector** (DESIGN.md §8.1.1): each connector
+  maintains a strictly increasing `source_epoch` and persists
+  `control: connector/{id}/epoch_map/{source_epoch} → { partition →
+  committed_offset }` atomically with the epoch commit. Exactly-once
+  recovery looks up the highest committed `source_epoch` and resumes from
+  the recorded partition offsets.
+- **View output retention** (DESIGN.md §5.7): support
+  `CREATE VIEW WITH (retention = '7d')` (and `MATERIALIZED VIEW` default
+  forever); enforce via SlateDB TTL + compaction filter that keeps the
+  current value per primary key regardless of age. Retention bytes counted
+  against the pipeline's `state_budget_gb` quota and shown in
+  `EXPLAIN INCREMENTAL ESTIMATE`.
+- **Schema evolution integration**: connectors publish schema versions before
+  data; incompatible drift returns `RS-1002` and blocks consumption before any
+  offset advances.
+- **Connector marketplace structure**: SDK + example crates; documented
+  contract.
+- **`OR_SET` user-visible column type** (v0.44): registers `ORSet/v1`
+  (ID 0x0008, tag 0x41) with `CompactionPolicy::TombstoneGc`. DDL
+  `CREATE TABLE memberships (group TEXT, members OR_SET TEXT)`; DML
+  `UPDATE memberships SET members = members + 'alice' WHERE group = $1` and
+  `members - 'alice'`. Tombstone GC across shard split/merge (Phase 7) and
+  recovery (Phase 6) is verified in the chaos suite. The add-wins vs
+  remove-wins policy is a DDL flag, defaulting to `ADD_WINS`.
+
+**Exit criteria**
+
+- End-to-end: Postgres CDC → RockStream IVM → Kafka, sustained at 100k rows/s
+  for 24 hours with exactly-once.
 
 ---
 
@@ -1634,7 +1653,7 @@ the audit log with the evidence considered.
 - **Delta Lake variant** stub: `CREATE SINK ... TO DELTA` with
   `_delta_log/` JSON transaction entries. Feature-flagged behind
   `--experimental-delta-sink`.
-- **Cold snapshot GC** (DESIGN.md §13.6.6):
+- **Cold snapshot GC** (DESIGN.md §13.6.2.1):
   - `cold_snapshot_retention_count` per-sink (default: 32 snapshots).
   - `cold_snapshot_retention_duration` per-sink (default: 7 days).
   - GC runs after each successful snapshot commit: delete Parquet data
@@ -1764,7 +1783,7 @@ served by `SERIALIZABLE LOCAL` or `OptimisticExactKey`.
 - `CREATE COORDINATOR GROUP … FOR TABLES (…) WITH (quorum_size, lease_ttl_ms)`
   DDL, persisted in the control-plane catalog.
 - Coordinator-group leader election reusing the frontier aggregator's lease
-  mechanism (§3.4) with a dedicated `coordinator_group/{group_id}/leader` key.
+  mechanism (§3.2) with a dedicated `coordinator_group/{group_id}/leader` key.
 - Two-phase-commit round over group members: prepare (per-shard conflict table
   check), commit (inject validated write batch stamped with coordinator epoch),
   abort (return `RS-2008` with conflicting shard/key).
@@ -1773,7 +1792,11 @@ served by `SERIALIZABLE LOCAL` or `OptimisticExactKey`.
 - `EXPLAIN TRANSACTION` output includes coordinator group name, participant
   shards, and a warning when cross-group write-skew is possible.
 - In-process coordinator in `embedded` and `single_worker` deployment modes.
-- Error codes `RS-2012`, `RS-2013`, `RS-2017`, `RS-2018`.
+- Error codes `RS-2501` (`coordinator.leader_unavailable`), `RS-2502`
+  (`coordinator.prepare_conflict`), `RS-2503`
+  (`coordinator.cross_group_rejected`), `RS-2504`
+  (`coordinator.quorum_lost`). These replace the v3.27 coordinator-group
+  codes that collided with session-error codes; see DESIGN.md §14.14.
 - Observability: `coordinator_group_commit_total{group}`,
   `coordinator_group_conflict_total{group,table}`,
   `coordinator_group_leader_elections_total{group}`,
@@ -1860,7 +1883,7 @@ These run in parallel with every phase.
 | **Compaction folds pending transaction operands** | Pending operands use distinct visibility state; compaction refuses to fold until committed frontier/envelope is stable; Phase 12 soak verifies. |
 | **Optimistic transactions become a hidden transaction manager** | Keep accepted subset exact-key only pre-1.0; document every unsupported shape in `EXPLAIN`; v0.55 decision gate determines promotion vs. deferral. |
 | **Coordinator group scope creep** | Coordinator group covers only declared base-table shards; any attempt to add arrangement/view shards is rejected at DDL time; `EXPLAIN TRANSACTION` always prints the group name and warns on cross-group write-skew. |
-| **Coordinator leader becomes a single point of failure** | 3–5 member quorum; lease TTL bounds unavailability window; `RS-2017` surfaces to the client with retry guidance; simulation covers leader crash mid-prepare. |
+| **Coordinator leader becomes a single point of failure** | 3–5 member quorum; lease TTL bounds unavailability window; `RS-2501` surfaces to the client with retry guidance; simulation covers leader crash mid-prepare. |
 
 ### Team Structure (Suggested)
 
