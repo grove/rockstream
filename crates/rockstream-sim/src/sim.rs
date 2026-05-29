@@ -14,7 +14,7 @@ use rand::{Rng, SeedableRng};
 use crate::clock::SimClock;
 use crate::network::SimNetworkHandle;
 use crate::object_store::SimObjectStoreHandle;
-use crate::runtime::{BoxFuture, Runtime};
+use crate::runtime::{BoxFuture, Runtime, Spawner};
 
 /// A record of a spawned task (for inspection/debugging).
 #[derive(Debug, Clone)]
@@ -125,6 +125,24 @@ impl Runtime for SimRuntime {
 
     fn is_simulation(&self) -> bool {
         true
+    }
+}
+
+impl Spawner for SimRuntime {
+    fn spawn_box(&self, name: &'static str, f: BoxFuture<'static, ()>) {
+        // Record the spawn for simulation inspection.
+        let mut counter = self.spawn_counter.lock();
+        *counter += 1;
+        let order = *counter;
+        self.spawned_tasks.lock().push(SpawnedTask {
+            name,
+            spawn_order: order,
+        });
+        drop(counter);
+        // Execute via Tokio. Full deterministic step-scheduling is a Phase 3+
+        // concern; for now tasks run concurrently under the test Tokio runtime,
+        // which preserves correctness while making the spawn site testable.
+        tokio::spawn(f);
     }
 }
 

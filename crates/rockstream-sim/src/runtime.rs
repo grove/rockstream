@@ -43,3 +43,19 @@ pub trait Runtime: Send + Sync + 'static {
     /// Whether this runtime is in simulation mode.
     fn is_simulation(&self) -> bool;
 }
+
+/// Object-safe task spawner.
+///
+/// The generic `Runtime::spawn<F>` method is not object-safe because it takes
+/// a generic future. `Spawner` provides the object-safe equivalent by
+/// accepting a pre-boxed future, allowing `spawn_operator_task_with_config`
+/// and similar call sites to accept `&dyn Spawner` and be testable without
+/// knowing the concrete runtime type.
+///
+/// Production code passes `&TokioRuntime`; tests pass `&SimRuntime`.
+pub trait Spawner: Send + Sync + 'static {
+    /// Spawn a pre-boxed async task.
+    ///
+    /// The `name` parameter is used for diagnostics and simulation inspection.
+    fn spawn_box(&self, name: &'static str, f: BoxFuture<'static, ()>);
+}

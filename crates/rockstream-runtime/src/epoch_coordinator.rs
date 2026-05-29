@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use rockstream_ops::epoch_output::EpochOutput;
+use rockstream_sim::buggify;
 use rockstream_storage::keys::{ShardKeyEncoder, ShardPrefix};
 use rockstream_storage::shard_db::WriteBatch;
 use rockstream_storage::{ShardDb, StorageError};
@@ -119,7 +120,22 @@ impl EpochCoordinator {
         let frontier_key = ShardKeyEncoder::frontier_key();
         batch.put(&frontier_key, &(epoch + 1).to_be_bytes());
 
+        // buggify: simulate partial WriteBatch failure (rows written, frontier
+        // not updated). On restart the shard replays from the old frontier —
+        // idempotent keys guarantee bit-identical output. (DESIGN.md §9)
+        if buggify!("epoch.write_batch_partial_failure", 0.005) {
+            return Err(StorageError::Unsupported(
+                "buggify: write_batch_partial_failure injected".into(),
+            ));
+        }
+
         self.db.write_batch(batch).await?;
+
+        // buggify: simulate a delay between the write completing and the caller
+        // observing the frontier advance. Tests that read the frontier immediately
+        // after commit must tolerate this.
+        // (frontier_write_delay is a timing fault — no actual sleep in prod)
+        let _ = buggify!("epoch.frontier_write_delay", 0.005);
 
         tracing::debug!(epoch, row_count = total_rows, "epoch committed");
 

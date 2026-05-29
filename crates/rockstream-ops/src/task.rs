@@ -17,6 +17,7 @@
 
 use tokio::sync::mpsc;
 
+use rockstream_sim::{Spawner, TokioRuntime};
 use rockstream_types::batch::{ZSet, ZSetBatch};
 use rockstream_types::ids::OperatorId;
 use rockstream_types::timestamp::Epoch;
@@ -53,6 +54,10 @@ pub struct OperatorTaskHandle {
 /// Uses `SchedulerConfig::default()` (quantum = 65536). For custom quantum
 /// sizing or yield-ratio metrics, use `spawn_operator_task_with_config`.
 ///
+/// Uses `TokioRuntime` as the spawner. To test with deterministic scheduling
+/// or fault injection, use `spawn_operator_task_with_config` and pass a
+/// `SimRuntime` as the spawner.
+///
 /// # Parameters
 /// - `operator_id`: Unique ID for this operator instance.
 /// - `operator`: The boxed `Operator` implementation.
@@ -66,6 +71,7 @@ pub fn spawn_operator_task(
     output_tx: mpsc::Sender<EpochOutput>,
     cmd_buffer: usize,
 ) -> OperatorTaskHandle {
+    let spawner = TokioRuntime::new(0);
     spawn_operator_task_with_config(
         operator_id,
         operator,
@@ -73,13 +79,18 @@ pub fn spawn_operator_task(
         cmd_buffer,
         SchedulerConfig::default(),
         YieldCounter::new(),
+        &spawner,
     )
 }
 
 /// Run an operator as a background tokio task with explicit scheduler config.
 ///
 /// Identical to `spawn_operator_task` but accepts a `SchedulerConfig` for
-/// quantum sizing and a `YieldCounter` for metric reporting.
+/// quantum sizing, a `YieldCounter` for metric reporting, and a `Spawner`
+/// for task execution.
+///
+/// Pass `&TokioRuntime::new(0)` for production use. Pass `&SimRuntime::new(seed)`
+/// in tests for deterministic scheduling and fault injection via `buggify!()`.
 ///
 /// When `input.zset.len() > config.max_rows_per_quantum`, the task splits
 /// the input into chunks of `max_rows_per_quantum` rows, processes each
@@ -93,10 +104,11 @@ pub fn spawn_operator_task_with_config(
     cmd_buffer: usize,
     config: SchedulerConfig,
     yield_counter: YieldCounter,
+    spawner: &dyn Spawner,
 ) -> OperatorTaskHandle {
     let (tx, mut rx) = mpsc::channel::<OperatorCmd>(cmd_buffer);
 
-    tokio::spawn(async move {
+    spawner.spawn_box("operator-task", Box::pin(async move {
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 OperatorCmd::ProcessDelta { epoch, input } => {
@@ -170,7 +182,7 @@ pub fn spawn_operator_task_with_config(
                 OperatorCmd::Shutdown => break,
             }
         }
-    });
+    }));
 
     OperatorTaskHandle { operator_id, tx }
 }

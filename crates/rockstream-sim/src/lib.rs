@@ -15,6 +15,7 @@
 
 pub mod buggify;
 pub mod clock;
+pub mod coord_faults;
 pub mod fault_model;
 pub mod law_faults;
 pub mod network;
@@ -26,12 +27,13 @@ pub mod tokio_rt;
 
 pub use buggify::buggify_enabled;
 pub use clock::{Clock, SimClock, TokioClock};
+pub use coord_faults::{register_coord_faults, COORD_FAULT_IDS};
 pub use fault_model::{FaultEntry, FaultModel};
 pub use law_faults::{register_law_faults, LAW_FAULT_IDS};
 pub use network::{SimNetwork, SimNetworkHandle};
 pub use object_store::{SimObjectStore, SimObjectStoreHandle};
 pub use paired_assert::paired_assert;
-pub use runtime::Runtime;
+pub use runtime::{Runtime, Spawner};
 pub use sim::SimRuntime;
 pub use tokio_rt::TokioRuntime;
 

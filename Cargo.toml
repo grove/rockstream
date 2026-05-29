@@ -30,6 +30,7 @@ arrow = "58"
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+criterion = { version = "0.5", features = ["html_reports"] }
 datafusion = "53"
 object_store = "0.12"
 parking_lot = "0.12"

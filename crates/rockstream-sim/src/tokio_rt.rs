@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::clock::TokioClock;
 use crate::network::SimNetworkHandle;
 use crate::object_store::SimObjectStoreHandle;
-use crate::runtime::{BoxFuture, Runtime};
+use crate::runtime::{BoxFuture, Runtime, Spawner};
 
 /// Production runtime using Tokio for real async I/O and wall-clock time.
 pub struct TokioRuntime {
@@ -63,6 +63,12 @@ impl Runtime for TokioRuntime {
 
     fn is_simulation(&self) -> bool {
         false
+    }
+}
+
+impl Spawner for TokioRuntime {
+    fn spawn_box(&self, _name: &'static str, f: BoxFuture<'static, ()>) {
+        tokio::spawn(f);
     }
 }
 

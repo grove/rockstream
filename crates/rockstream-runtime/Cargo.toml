@@ -13,6 +13,7 @@ rockstream-control = { workspace = true }
 rockstream-diff = { workspace = true }
 rockstream-ops = { workspace = true }
 rockstream-plan = { workspace = true }
+rockstream-sim = { workspace = true }
 rockstream-storage = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
@@ -23,3 +24,4 @@ serde_json = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 object_store = { workspace = true }
+rockstream-sim = { workspace = true }

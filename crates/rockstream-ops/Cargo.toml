@@ -9,10 +9,16 @@ description = "Operator trait and per-operator implementations for RockStream"
 [dependencies]
 arrow = { workspace = true }
 datafusion = { workspace = true }
+rockstream-sim = { workspace = true }
 rockstream-types = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 tokio = { workspace = true }
+
+[[bench]]
+name = "operator_throughput"
+harness = false

@@ -339,6 +339,26 @@ async fn embedded_bench_reports_p50_p95_freshness() {
         result.p95_ms
     );
     assert_eq!(result.rows_processed, 1000, "50 epochs × 20 rows = 1000");
+
+    // Phase 1 exit criterion: p95 < 5 ms for embedded latency class
+    // (IMPLEMENTATION_PLAN.md Phase 1, DESIGN.md §14.9 `local_visible`).
+    //
+    // This bound is only enforced in release builds; debug builds are
+    // typically 20-100× slower due to lack of optimisation, so we use a
+    // generous 2 000 ms sentinel that just verifies the test actually ran.
+    #[cfg(not(debug_assertions))]
+    assert!(
+        result.p95_ms < 5.0,
+        "p95 epoch commit latency must be < 5 ms in embedded in-memory mode \
+         (local_visible latency class); got {:.3} ms",
+        result.p95_ms
+    );
+    #[cfg(debug_assertions)]
+    assert!(
+        result.p95_ms < 2_000.0,
+        "p95 latency sanity check (debug build): got {:.3} ms",
+        result.p95_ms
+    );
 }
 
 /// Proof: embedded fast-path issues zero gRPC shuffle calls.

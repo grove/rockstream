@@ -16,6 +16,7 @@ use rockstream_ops::epoch_output::EpochOutput;
 use rockstream_ops::operator::Operator;
 use rockstream_ops::scheduler::{SchedulerConfig, YieldCounter};
 use rockstream_ops::task::{spawn_operator_task_with_config, OperatorCmd};
+use rockstream_sim::TokioRuntime;
 use rockstream_runtime::epoch_coordinator::EpochCoordinator;
 use rockstream_storage::wal_cache::WalListingCache;
 use rockstream_storage::{ShardDb, ShardPrefix};
@@ -296,6 +297,7 @@ async fn scheduler_yield_ratio_nonzero_for_oversized_epoch() {
     let yield_counter = YieldCounter::new();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(64);
+    let spawner = TokioRuntime::new(0);
     let handle = spawn_operator_task_with_config(
         OperatorId(0),
         Box::new(PassthroughOp),
@@ -303,6 +305,7 @@ async fn scheduler_yield_ratio_nonzero_for_oversized_epoch() {
         16,
         config,
         yield_counter.clone(),
+        &spawner,
     );
 
     // Build a 100-row ZSet (10 quanta of 10 rows each).
@@ -366,6 +369,7 @@ async fn scheduler_no_yield_for_small_epoch() {
     let yield_counter = YieldCounter::new();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(64);
+    let spawner = TokioRuntime::new(0);
     let handle = spawn_operator_task_with_config(
         OperatorId(0),
         Box::new(PassthroughOp),
@@ -373,6 +377,7 @@ async fn scheduler_no_yield_for_small_epoch() {
         16,
         config,
         yield_counter.clone(),
+        &spawner,
     );
 
     let mut zset = ZSet::new();
@@ -444,6 +449,7 @@ async fn large_epoch_does_not_starve_heartbeat_task() {
     });
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(64);
+    let spawner = TokioRuntime::new(0);
     let handle = spawn_operator_task_with_config(
         OperatorId(0),
         Box::new(PassthroughOp),
@@ -451,6 +457,7 @@ async fn large_epoch_does_not_starve_heartbeat_task() {
         16,
         config,
         yield_counter.clone(),
+        &spawner,
     );
 
     // Build 50-row ZSet.
@@ -512,6 +519,7 @@ async fn yield_ratio_across_multiple_epochs() {
     let yield_counter = YieldCounter::new();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(64);
+    let spawner = TokioRuntime::new(0);
     let handle = spawn_operator_task_with_config(
         OperatorId(0),
         Box::new(PassthroughOp),
@@ -519,6 +527,7 @@ async fn yield_ratio_across_multiple_epochs() {
         32,
         config,
         yield_counter.clone(),
+        &spawner,
     );
 
     // Epoch 0: 5 rows (within quantum) — no yield.
