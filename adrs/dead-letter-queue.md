@@ -1,6 +1,6 @@
 # ADR: Dead Letter Queue — User-Facing Surface
 
-**Status**: Proposed  
+**Status**: Accepted  
 **Date**: 2026-05-29
 
 ---

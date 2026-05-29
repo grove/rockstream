@@ -1,6 +1,6 @@
 # ADR: Application Ergonomics — Freshness, Lifecycle, and CLI Surface
 
-**Status**: Proposed  
+**Status**: Accepted  
 **Date**: 2026-05-29
 
 ---

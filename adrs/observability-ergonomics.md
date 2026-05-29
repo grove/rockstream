@@ -1,6 +1,6 @@
 # ADR: Operational Observability Ergonomics
 
-**Status**: Proposed  
+**Status**: Accepted  
 **Date**: 2026-05-29
 
 ---

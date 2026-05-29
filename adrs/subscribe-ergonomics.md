@@ -1,6 +1,6 @@
 # ADR: SUBSCRIBE — Change Stream Ergonomics
 
-**Status**: Proposed  
+**Status**: Accepted  
 **Date**: 2026-05-29
 
 ---

@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), and Risi
 — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.25. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.26. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -235,6 +235,24 @@ object storage.
 > name)`. The CLI surface changes from “pipelines and views” to “workloads, schemas, views,
 > and sources”. Metrics rename from `pipeline_slo_compliance` to `view_slo_compliance`.
 > §14.3, §14.4, §14.6–§14.7, §14.9–§14.13, and §14.16 updated throughout.
+>
+> **v3.26 integrates six accepted ergonomics and observability ADRs**
+> (adrs/first-run-ergonomics.md, adrs/observability-ergonomics.md,
+> adrs/subscribe-ergonomics.md, adrs/application-ergonomics.md,
+> adrs/dead-letter-queue.md, adrs/resource-usage-visibility.md):
+> built-in `GENERATE ROWS` data source for zero-friction first run (§13.5.0);
+> backfill cost preview prompt before long DDL with `WITHOUT CONFIRMATION`
+> escape hatch (§14.9); subscribe API gains `CHANGE_RETENTION`, `AS OF NOW
+> WITH SNAPSHOT`, column projection and `WHERE` server-side filtering (§12.3);
+> `CREATE REPLACEMENT MATERIALIZED VIEW` for zero-downtime view replacement
+> (§4.2); user-facing DLQ surface with `rockstream_catalog.dead_letter_queue`,
+> `REPLAY DEAD_LETTER_QUEUE`, and `DISMISS DEAD_LETTER_QUEUE` (§13.3.1);
+> `SHOW RESOURCE USAGE` commands and `rockstream_catalog.view_resource_usage` /
+> `workload_resource_usage` catalog tables (§14.19); `SHOW SCHEMA_EVOLUTION
+> STATUS` and `SHOW SCHEMA_EVOLUTION HISTORY` for proactive incompatibility
+> detection (§4.2); every `RS-XXXX` error must include a `next_steps` field
+> enforced in CI (§14.14); proactive NOTICE at 80% (`RS-5018`) and WARNING at
+> 95% (`RS-5019`) resource utilisation thresholds (§14.19).
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -693,6 +711,22 @@ published frontier, backfill only state whose encoding changed, run old and new
 plans in parallel until the new plan reaches the old frontier, then flip query
 routing atomically in the catalog. This is the default mechanism for `ALTER
 VIEW`, join-key changes, and breaking source-schema updates.
+
+**Proactive schema evolution detection.** Operators can inspect upcoming
+incompatibilities before they block consumption:
+
+```sql
+-- Show pending incompatible schema versions across all sources in a schema
+SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA <name>;
+
+-- Show the full evolution history for a specific view
+SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW <name>;
+```
+
+When a connector detects an incompatible upstream schema change that has not yet
+been applied, the system emits `RS-6001 schema.incompatible_evolution` as a
+proactive `NOTICE` — giving operators time to prepare a `CREATE REPLACEMENT`
+before consumption blocks on `RS-1002`.
 
 ### 4.3 Inline Views (Query-Time Macro Expansion)
 
@@ -2098,6 +2132,34 @@ Subscription connections are authenticated via the same token/certificate checke
 by the gateway (§12.5); the gateway proxies the subscription rather than exposing
 raw shard access to clients.
 
+**Subscribe syntax and semantics:**
+
+```sql
+SUBSCRIBE <view>
+  [AS OF NOW WITH SNAPSHOT]    -- bootstrap: emit current snapshot then live deltas
+  [AS OF EPOCH <n>]            -- resume from a known epoch (within retention)
+  [WHERE <predicate>]          -- server-side row filtering
+  [(<col1>, <col2>, ...)]      -- column projection
+```
+
+Each change row contains: `mz_timestamp` (the epoch), `mz_diff` (`+1` for
+insertion, `-1` for retraction), and the projected view columns. Updates are
+delivered as retraction/insertion pairs at the same timestamp. Server-side
+`WHERE` and column projection reduce network bandwidth for clients that need
+only a subset of the view.
+
+**`CHANGE_RETENTION`:** per-view retention for the change stream log:
+
+```sql
+CREATE MATERIALIZED VIEW orders_mv AS ...
+  WITH (CHANGE_RETENTION = '1 hour');
+```
+
+Default: 1 hour. Subscribes that request `AS OF EPOCH <n>` outside the
+retention window receive `RS-2005 history.epoch_before_retention`. The
+retention period bounds the storage cost of keeping historical deltas for
+late-joining subscribers.
+
 ### 12.3.1 Cross-Shard Read Pushdown
 
 For aggregation queries over a distributed view (e.g., `SELECT COUNT(*), region
@@ -2789,6 +2851,42 @@ drift that cannot be applied online becomes `BLOCKED(RS-1002)`. Per-record
 decode errors are routed to a configurable dead-letter sink as `RS-1003`
 events; this is a connector-tier concern and does not enter the IVM core.
 
+#### 13.3.1 Dead-Letter Queue User Surface
+
+Records routed to the DLQ are stored in a per-source catalog table and exposed
+to users through standard SQL:
+
+```sql
+SELECT * FROM rockstream_catalog.dead_letter_queue
+  WHERE source_name = 'kafka_orders';
+```
+
+Columns: `arrived_at`, `source_name`, `source_offset`, `error_code`,
+`error_message`, `raw_bytes_hex`.
+
+**Proactive alerting:** When a source accumulates 100+ DLQ entries per hour,
+the system emits `RS-1004 connector.dlq_growing` as a proactive warning
+(`NOTICE` level). This surfaces growing decode problems before they affect
+downstream freshness.
+
+**Recovery commands:**
+
+```sql
+-- Replay failed records (re-decode after a schema fix or connector update)
+ALTER SOURCE kafka_orders REPLAY DEAD_LETTER_QUEUE [SINCE <ts> UNTIL <ts>];
+
+-- Dismiss records that are known-bad and should not be retried
+ALTER SOURCE kafka_orders DISMISS DEAD_LETTER_QUEUE WHERE error_code = 'RS-1003';
+```
+
+**Retention:** `DLQ_RETENTION` per source (default 7 days). Expired entries
+are removed by the control-plane GC. Configurable at source creation:
+
+```sql
+CREATE SOURCE kafka_orders FROM KAFKA ...
+  WITH (DLQ_RETENTION = '14 days');
+```
+
 ### 13.4 Connector Catalog and Isolation
 
 The control plane catalogs available connector types and routes connector
@@ -2834,6 +2932,29 @@ Client (psql / JDBC)  ──INSERT──►  Gateway  ──delta──►  Base
 needs no external broker or database. Deploy RockStream, issue SQL `INSERT`
 statements, query IVM views — no Kafka, no Postgres, no infrastructure beyond
 object storage.
+
+#### 13.5.0 Built-in Row Generator Source
+
+For zero-friction first-run experiences and local development, RockStream
+provides a built-in data generator that produces synthetic rows without
+requiring any external system:
+
+```sql
+CREATE SOURCE demo.orders FROM GENERATE ROWS AS (
+  order_id   BIGINT GENERATED,
+  product_id INT    UNIFORM(1, 1000),
+  quantity   INT    UNIFORM(1, 20),
+  price      DECIMAL(10,2) UNIFORM(1.00, 500.00),
+  region     TEXT   PICK('us-east', 'us-west', 'eu-central', 'ap-south')
+) RATE = 100 PER SECOND;
+```
+
+The generator source implements the standard Tier 1 connector contract
+(§13.3) with deterministic output (seeded RNG) for reproducibility in tests.
+All constructs default safely when omitted: `public` schema is assumed if
+unqualified; a system workload is used if none is specified. A developer can
+start RockStream, create this source, and have a working materialized view
+within two minutes.
 
 #### 13.5.1 Optimistic Transaction Protocol
 
@@ -3714,6 +3835,8 @@ rockstream source   {list, show, pause, resume, drop}
 rockstream explain  <view> [--estimate]
 rockstream cluster  {status, workers, quotas}
 rockstream cluster  workers {list, drain, status}
+rockstream resource {usage, usage --workload=<name>, cluster}
+rockstream schema-evolution {status --schema=<name>, history --view=<name>}
 rockstream support  bundle [--view=<name>]        # see §14.12
 rockstream audit    {tail, query}                 # see §14.11
 rockstream debug    arrangement <view> <op_id> <key>  # see §14.7.1
@@ -3802,6 +3925,29 @@ produces a predicted operator tree with:
   dependencies, the view is created in `BLOCKED(RS-4003)` state rather
   than silently missing its SLO.
 
+**Backfill cost prompt.** When a `CREATE MATERIALIZED VIEW` requires
+backfilling a large source (estimated time > 30 seconds or state > 1 GB),
+the system presents the cost estimate interactively and waits for
+confirmation before proceeding. This prevents accidental deployment of
+expensive views:
+
+```
+⚠ Estimated backfill: 12 GB state, ~4 min at current source rate.
+  Proceed? [y/N]
+```
+
+Programmatic clients and CI pipelines can bypass the prompt with
+`WITHOUT CONFIRMATION`:
+
+```sql
+CREATE MATERIALIZED VIEW big_view AS ...
+  WITHOUT CONFIRMATION;
+```
+
+`EXPLAIN INCREMENTAL ESTIMATE CREATE MATERIALIZED VIEW ...` produces the
+same cost information without executing the deployment, allowing scripts
+to check costs before committing.
+
 This is the single biggest operator surprise eliminated: nobody has to
 deploy a view to discover it needs 4 TB of arrangement state.
 
@@ -3889,6 +4035,8 @@ doc URL. Examples (illustrative):
 ```
 RS-1001  connector.authentication_failed
 RS-1002  connector.schema_drift
+RS-1003  connector.decode_error (DLQ routed)
+RS-1004  connector.dlq_growing
 RS-2001  view.unsupported_sql_construct
 RS-2002  view.state_budget_exceeded
 RS-2003  isolation.serializable_not_supported
@@ -3903,7 +4051,17 @@ RS-4001  control.quota_violation
 RS-4002  control.autotune_bounds_exhausted
 RS-5001  storage.format_version_incompatible
 RS-5002  merge.unknown_law
+RS-5018  resource.budget_warning_80pct
+RS-5019  resource.budget_critical_95pct
+RS-6001  schema.incompatible_evolution
 ```
+
+**`next_steps` requirement.** Every `RS-XXXX` error must include a
+`next_steps` field containing actionable remediation guidance. This is
+enforced in CI: the error-code registry test fails if any code lacks a
+non-empty `next_steps` entry. The field is included in structured log
+output, CLI error display, and the published error-code documentation.
+Users should never receive an error without knowing what to do next.
 
 `rockstream` exits non-zero on any RS-coded error and prints a one-line
 remediation pointer. The codebase has a single error-code registry; CI
@@ -4017,6 +4175,41 @@ never values.
 encrypted blob. Active connectors using that secret receive a rotation signal
 and re-acquire a fresh token on their next epoch boundary — no pipeline
 restart required.
+
+### 14.19 Resource Usage Visibility
+
+Operators and applications need to see resource consumption before limits are
+hit. RockStream exposes resource usage at three levels of granularity:
+
+```sql
+-- Per-workload summary: state bytes, memory, SLO health
+SHOW RESOURCE USAGE;
+
+-- Per-view breakdown within a specific workload
+SHOW RESOURCE USAGE FOR WORKLOAD <name>;
+
+-- Cluster-wide aggregate
+SHOW CLUSTER RESOURCE USAGE;
+```
+
+**Catalog tables** for programmatic access:
+
+- `rockstream_catalog.view_resource_usage` — per-view state bytes, memory,
+  rows, SLO compliance, degraded reason.
+- `rockstream_catalog.workload_resource_usage` — per-workload aggregate with
+  budget utilisation percentage.
+
+**Proactive alerting thresholds:**
+
+| Utilisation | Severity | Error code | Action |
+|---|---|---|---|
+| ≥ 80% of any budget | `NOTICE` | `RS-5018 resource.budget_warning_80pct` | Plan capacity addition |
+| ≥ 95% of any budget | `WARNING` | `RS-5019 resource.budget_critical_95pct` | Immediate action required |
+
+Thresholds are configurable per workload via
+`ALTER WORKLOAD ... SET (WARNING_THRESHOLD = 0.75, CRITICAL_THRESHOLD = 0.90)`.
+The NOTICE/WARNING is delivered to active pgwire sessions and recorded in the
+audit log.
 
 ---
 

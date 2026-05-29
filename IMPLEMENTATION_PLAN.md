@@ -263,6 +263,11 @@ connector layers may bypass it.
 - **Single binary surface.** `rockstream` is one binary from day one;
   `rockstream start --storage=./data` is a zero-config developer command.
   Role flags exist but only `--role=all` is wired this phase.
+- **Built-in row generator source** (DESIGN.md §13.5.0): `CREATE SOURCE
+  demo.orders FROM GENERATE ROWS AS (...) RATE = 100 PER SECOND` ships as a
+  first-class connector implementing the Tier 1 contract. Enables a working
+  materialized view in under two minutes with no external dependencies.
+  Deterministic output (seeded RNG) for reproducible tests.
 - **Error-code registry.** Crate `rockstream-errors` defines every error as
   an `RS-XXXX` code with a doc-URL stub; CI fails the build if a returned
   `Error` or logged `error!` has no code. Doc URLs may 404 until Phase 10 but
@@ -403,6 +408,13 @@ join queries written as plain SQL.
   lag. Estimation accuracy is tracked over time on the TPC-H suite.
   Estimates are labelled `confidence=low` when only heuristic fallback stats
   are available (DESIGN.md §4.0).
+- **Backfill cost preview prompt** (DESIGN.md §14.9): when
+  `CREATE MATERIALIZED VIEW` would require backfilling a large source
+  (estimated time > 30 s or state > 1 GB), the gateway presents the cost
+  estimate interactively and waits for confirmation before proceeding.
+  `WITHOUT CONFIRMATION` bypasses the prompt for CI and programmatic use.
+  `EXPLAIN INCREMENTAL ESTIMATE CREATE MATERIALIZED VIEW ...` produces the
+  same cost information without executing the deployment.
 - **Source statistics pipeline**: `discover_stats()` wired for Kafka (commit
   offsets) and Postgres CDC (`pg_class.reltuples`) connectors; stats cached in
   `catalog/table/{id}/stats`; live metrics feed back after 60 s of operation;
@@ -967,6 +979,19 @@ production-ready.
 - **Dead-letter sink routing**: per-record decode errors become `RS-1003`
   events and are routed to a configurable DLQ sink. Implemented as a
   connector-tier concern; the IVM core never sees malformed records.
+- **DLQ user surface** (DESIGN.md §13.3.1):
+  - `rockstream_catalog.dead_letter_queue` catalog table exposes failed records
+    with columns: `arrived_at`, `source_name`, `source_offset`, `error_code`,
+    `error_message`, `raw_bytes_hex`.
+  - `RS-1004 connector.dlq_growing` proactive warning emitted when a source
+    accumulates 100+ DLQ entries per hour.
+  - `ALTER SOURCE <name> REPLAY DEAD_LETTER_QUEUE [SINCE <ts> UNTIL <ts>]`
+    re-decodes failed records after a schema fix or connector update.
+  - `ALTER SOURCE <name> DISMISS DEAD_LETTER_QUEUE WHERE <predicate>` removes
+    known-bad records that should not be retried.
+  - `DLQ_RETENTION` per source (default 7 days); configurable via
+    `CREATE SOURCE ... WITH (DLQ_RETENTION = '<duration>')`.
+  - GC of expired entries by the control-plane background task.
 - **Per-connector source-epoch vector** (DESIGN.md §8.1.1): each connector
   maintains a strictly increasing `source_epoch` and persists
   `control: connector/{id}/epoch_map/{source_epoch} → { partition →
@@ -1107,6 +1132,17 @@ a gateway rewrite.
 - **Subscribe API**: gRPC streaming endpoint that tails view changes (via
   `WalReader` on the relevant shards). Gateway proxies subscriptions; raw
   shard access is never exposed to clients.
+- **Subscribe ergonomics** (DESIGN.md §12.3):
+  - `SUBSCRIBE <view>` opens a live change stream with columns `mz_timestamp`,
+    `mz_diff` (+1/-1), and the projected view columns.
+  - `AS OF NOW WITH SNAPSHOT`: emit current snapshot as insertions then switch
+    to live deltas — single command for bootstrap + live.
+  - `AS OF EPOCH <n>`: resume from a known epoch (within retention).
+  - `WHERE <predicate>`: server-side row filtering to reduce network traffic.
+  - Column projection: `SUBSCRIBE <view> (col1, col2)` limits returned columns.
+  - Updates delivered as retraction/insertion pairs at the same timestamp.
+  - Per-view `CHANGE_RETENTION` (default 1 hour): controls how far back
+    subscribers can resume; beyond retention → `RS-2005`.
 - **Freshness tokens**: query responses return the vector frontier used;
   clients can pass `wait_for=<token>` for read-your-writes semantics with a
   timeout and explicit satisfied/not-satisfied response.
@@ -1129,6 +1165,12 @@ a gateway rewrite.
 
 - Read-your-writes demo passes; `wait_for=<token>` resolves within the SLO.
 - Subscribe stream survives gateway restart with no data loss.
+- `SUBSCRIBE orders_mv AS OF NOW WITH SNAPSHOT` delivers current state then
+  live deltas without gaps.
+- `SUBSCRIBE orders_mv WHERE region = 'us-east'` delivers only matching rows.
+- `SUBSCRIBE orders_mv (order_id, quantity)` projects to requested columns.
+- `CHANGE_RETENTION = '1 hour'` enforced; `AS OF EPOCH` outside window
+  returns `RS-2005`.
 - `SELECT * FROM orders_mv AS OF EPOCH <past>` returns the correct historical
   snapshot; queries beyond retention return `RS-2005`.
 - `AS OF MONOTONE PARTIAL` returns a result whose `complete_through` token
@@ -1218,6 +1260,12 @@ binding.
   emitted as a `NOTICE` when the published frontier is older than the bound.
   `session_staleness_exceeded_total` and `session_frontier_age_ms` metrics
   added. `SHOW rockstream.session_mode` returns `olap` or `oltp`.
+- **Zero-downtime view replacement** (DESIGN.md §4.2):
+  `CREATE REPLACEMENT MATERIALIZED VIEW v2 FOR v1 AS ...` creates a new view
+  that backfills in parallel with the live view. `ALTER MATERIALIZED VIEW v1
+  APPLY REPLACEMENT v2` atomically swaps query routing once the replacement
+  catches up to the live frontier. Subscribers to `v1` see the new definition
+  without reconnecting.
 
 ---
 
@@ -1281,6 +1329,28 @@ binding.
 - **Full error-code documentation**: every `RS-XXXX` in the registry has a
   published doc page with cause, detection signal, and remediation. CI gate
   enforces.
+- **Actionable error messages** (DESIGN.md §14.14): every `RS-XXXX` error
+  includes a `next_steps` field with concrete remediation guidance. CI test
+  fails if any code in the registry has an empty `next_steps` entry. The
+  field is included in structured log output, CLI error display, and the
+  published error-code doc pages.
+- **Resource usage visibility** (DESIGN.md §14.19):
+  - `SHOW RESOURCE USAGE` — per-workload state/memory/SLO health table.
+  - `SHOW RESOURCE USAGE FOR WORKLOAD <name>` — per-view breakdown.
+  - `SHOW CLUSTER RESOURCE USAGE` — cluster-wide summary.
+  - `rockstream_catalog.view_resource_usage` and
+    `rockstream_catalog.workload_resource_usage` catalog tables for
+    programmatic access.
+  - Proactive NOTICE at 80% (`RS-5018 resource.budget_warning_80pct`) and
+    WARNING at 95% (`RS-5019 resource.budget_critical_95pct`) of any
+    workload budget. Thresholds configurable per workload.
+- **Schema evolution visibility** (DESIGN.md §4.2):
+  - `SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA <name>` — surfaces pending
+    incompatible upstream schema changes before they block consumption.
+  - `SHOW SCHEMA_EVOLUTION HISTORY FOR MATERIALIZED VIEW <name>` — full
+    history of schema version transitions for a view.
+  - `RS-6001 schema.incompatible_evolution` proactive NOTICE when a connector
+    detects an incompatible upstream schema that has not yet been applied.
 - **Auto-tuner hardening**: long-running stability tests across diverse
   workload mixes; tune hysteresis defaults; document override patterns.
 - **Support-bundle completeness**: redaction integration test asserts no

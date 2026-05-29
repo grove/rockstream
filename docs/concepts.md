@@ -195,7 +195,10 @@ possible.
 
 The takeaway is that you don't usually think about connectors much. You
 declare a source, point it at the system you want data from, and the engine
-takes care of the rest.
+takes care of the rest. For getting started quickly, RockStream includes a
+built-in data generator (`CREATE SOURCE ... FROM GENERATE ROWS`) that
+produces synthetic rows without any external dependencies — you can have a
+working materialized view in under two minutes.
 
 ### 5. Deltas and Z-sets
 
