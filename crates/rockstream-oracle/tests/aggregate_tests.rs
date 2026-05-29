@@ -165,14 +165,13 @@ mod tests {
             let key_bytes = group_id.to_be_bytes().to_vec();
             let ivm_bytes = ivm_state
                 .get(&key_bytes)
-                .unwrap_or_else(|| panic!("IVM missing group {} in state", group_id));
+                .unwrap_or_else(|| panic!("IVM missing group {group_id} in state"));
             let (ivm_sum, ivm_count) =
                 decode_sum_count(ivm_bytes).expect("IVM state must be valid SumCount bytes");
             assert_eq!(
                 (ivm_sum, ivm_count),
                 (*ref_sum, *ref_count),
-                "IVM aggregate must match reference for group {}",
-                group_id
+                "IVM aggregate must match reference for group {group_id}"
             );
         }
 
@@ -182,8 +181,7 @@ mod tests {
                 let group_id = i64::from_be_bytes(key_bytes[..8].try_into().unwrap());
                 assert!(
                     reference.contains_key(&group_id),
-                    "IVM has extra group {} not in reference",
-                    group_id
+                    "IVM has extra group {group_id} not in reference"
                 );
             }
         }
@@ -272,7 +270,7 @@ mod tests {
         };
 
         for i in 0i64..5 {
-            let key = format!("AG/group_{}", i);
+            let key = format!("AG/group_{i}");
             let value = rockstream_types::laws::sum_count::encode_sum_count(i * 10, i);
             db.put_with_arrangement_header(key.as_bytes(), header, &value)
                 .await
@@ -280,7 +278,7 @@ mod tests {
         }
 
         for i in 0i64..5 {
-            let key = format!("AG/group_{}", i);
+            let key = format!("AG/group_{i}");
             let recovered = db
                 .get_arrangement_header(key.as_bytes())
                 .await
@@ -343,9 +341,7 @@ mod tests {
         // Sanity-check throughput (conservative threshold for slow CI).
         assert!(
             ops_per_sec > 100_000.0,
-            "SumCount/v1 throughput too low: {:.0} ops/sec (elapsed: {:?})",
-            ops_per_sec,
-            elapsed
+            "SumCount/v1 throughput too low: {ops_per_sec:.0} ops/sec (elapsed: {elapsed:?})"
         );
 
         // Verify final accumulator is correct: sum of (val mod pattern) * N/count.
