@@ -1122,6 +1122,15 @@ things to discover at runtime:
   Compaction filters clear Z-set entries whose weight is zero AND whose epoch
   is older than the committed checkpoint frontier — this is safe because no
   reader can observe a zero-weight row at a past epoch.
+- **Write amplification is bounded.** Each shard tracks its logical-to-physical
+  write ratio (`write_amplification_ratio`). The default budget is
+  `target_write_amplification = 10` (10 physical bytes per logical byte
+  including compaction rewrites). Shards exceeding `2 × target` trigger an
+  operator NOTICE (`RS-5022 storage.write_amplification_high`) and a
+  compaction tuning adjustment (larger SST target size to reduce level count).
+  `EXPLAIN INCREMENTAL ESTIMATE` reports predicted write amplification per
+  operator based on its arrangement type (merge-append-heavy workloads predict
+  lower amp; delete-heavy workloads predict higher amp from tombstone rewrites).
 
 ### 5.5 Storage Format Versioning and Rolling Upgrades
 
@@ -1502,6 +1511,35 @@ in [ideas/crdts.md](ideas/crdts.md); the design-level commitments are:
 The reserved `MergeLawId` block and built-in catalog (tag bytes, law
 classes, lands-in versions) are listed in [ideas/crdts.md §6](ideas/crdts.md).
 
+### 6.12 Arrangement Working Set and Memory Pressure
+
+Operators access their arrangements via `ShardDb`. For hot-path performance,
+each operator maintains a bounded in-process **arrangement cache** (LRU by key)
+configurable as `operator_cache_mb` (default: auto-derived from workload
+`MEMORY_LIMIT / operator_count`). Cache misses fall through to SlateDB
+`get()` / `scan()` — correct but slower by the object-store round-trip
+latency amortized by the segment cache (§5.4).
+
+| Signal | Action |
+|---|---|
+| `arrangement_cache_hit_ratio < 0.5` for 5 min | Emit `RS-5021 arrangement.cache_thrashing` NOTICE |
+| Working set estimate > 2× available cache | Emit NOTICE at `CREATE MATERIALIZED VIEW` |
+| Worker RSS > `worker_memory_limit × 0.9` | Evict coldest arrangement caches first |
+
+The auto-tuner redistributes cache budget across operators on the same worker
+proportional to observed access frequency. The working-set estimate is derived
+from the arrangement's key cardinality × average value size, reported by the
+storage layer at each checkpoint.
+
+Metrics: `arrangement_cache_hit_ratio{op_id}`,
+`arrangement_cache_evictions_total{op_id}`,
+`arrangement_cache_bytes_used{op_id}`.
+
+`EXPLAIN INCREMENTAL ESTIMATE` reports estimated working-set size vs available
+cache per operator. Operators whose estimated working set exceeds 2× available
+cache emit `RS-5021` as a NOTICE at deploy time so operators can increase the
+workload memory budget or accept higher read latency.
+
 ---
 
 ## 7. The Exchange (Shuffle) Subsystem
@@ -1572,6 +1610,19 @@ The fast path is used for small low-latency batches; the durable path is used
 when the receiver is unreachable, when batches exceed a threshold, or as the
 backup for fault tolerance. Either way, the canonical record is in object
 storage — direct delivery is an optimization.
+
+**Exchange path selection thresholds:**
+
+| Condition | Path chosen | Rationale |
+|---|---|---|
+| Batch < `exchange_direct_threshold_bytes` (default 64 KiB) AND receiver reachable | gRPC direct delivery | Lowest latency for small deltas. |
+| Batch ≥ `exchange_direct_threshold_bytes` OR receiver unreachable | Durable object path | Bounded memory on sender; guaranteed delivery. |
+| Total epoch shuffle volume > `exchange_spill_threshold_mb` (default 256 MiB) per exchange | Durable object path + back-pressure signal | Prevents OOM from large redistributions. |
+| `exchange_force_durable = true` (pipeline-level config) | Always durable | For correctness testing or compliance. |
+
+The planner annotates each exchange edge with the expected path at `EXPLAIN
+INCREMENTAL` time based on operator cardinality estimates. Actual path
+selection is re-evaluated per batch at runtime.
 
 ### 7.3 Outbox & Inbox Encoding
 
@@ -1935,6 +1986,16 @@ after consuming its quantum, it emits a partial `EpochOutput`, yields via
 heartbeat sender and frontier reporter run as separate tokio tasks with
 higher priority in the scheduler, so they are always serviced between quanta.
 
+**Priority inversion mitigation:** Higher priority alone is insufficient —
+under sustained CPU saturation (all work-stealing threads occupied by
+operator quanta) a higher-priority task that was not yet polled cannot pre-empt
+a running quantum. To guarantee liveness, heartbeat and frontier tasks are
+spawned on a **dedicated single-thread tokio runtime** (`rt_control`) separate
+from the operator runtime (`rt_work`). This runtime is never used for operator
+work, so heartbeat sends complete within their 50 ms deadline even when all
+operator threads are saturated. The cost is one reserved OS thread per worker
+(~8 KiB stack).
+
 The quantum size is tunable per pipeline (`max_rows_per_quantum`, default
 65536). Lowering it increases scheduling responsiveness at the cost of more
 task context switches. Raising it is appropriate for CPU-bound pure aggregation
@@ -1989,6 +2050,28 @@ sample so stalled migrations are observable.
 | `VERIFYING` | A scan compares donor and recipient state at the cutover epoch for the migrated buckets. Any divergence aborts (rolls back to `DUAL_WRITING`); otherwise proceed. Verification is bounded by `verify_sample_rate` (default 1.0 for buckets ≤ 1 GB, sampled above). |
 | `GC_ELIGIBLE` | The migration's consumer frontier — the minimum of every downstream operator's input frontier for the migrating buckets — has passed the cutover epoch. Only now is donor cleanup allowed to start. Cleanup before this state is forbidden; the §11 frontier protocol is the gate. |
 | `DONE` | Donor cleanup complete. Migration record is closed and moved to history. |
+
+**Per-state timeout budget.** Each state has a configurable maximum duration.
+If a state exceeds its timeout, the control plane emits `RS-1030
+migration.state_timeout` and moves to `ABORTED` (except for `GC_ELIGIBLE`
+which is merely logged as slow but not auto-aborted, since it depends on
+downstream frontier advancement).
+
+| State | Default timeout | Notes |
+|---|---:|---|
+| `PLANNED` | 30 s | Purely control-plane bookkeeping. |
+| `SNAPSHOTTING` | 5 min | Checkpoint creation proportional to arrangement size. |
+| `COPYING` | 30 min | Bounded by bucket data volume / network throughput. |
+| `DUAL_WRITING` | unbounded | Cleared by `CATCHING_UP` entry; alarm if > 10 min. |
+| `CATCHING_UP` | 10 min | Must converge within `cutover_lag_budget`. |
+| `FENCING_OLD` | 30 s | Fast shard-map propagation. |
+| `CUTOVER` | 60 s | Waiting for all observers. |
+| `VERIFYING` | 15 min | Full scan for small buckets; sampled for large. |
+| `GC_ELIGIBLE` | unbounded | Alarm if > 30 min (frontier stall). |
+
+Timeouts are configurable via `migration_state_timeout_<state>`. The
+`migration_state_duration_seconds` histogram signals stalls before the hard
+timeout fires.
 
 **Cleanup safety rule.** No bucket-scoped delete, compaction filter, or
 checkpoint discard fires until the migration reaches `GC_ELIGIBLE`. This
@@ -4594,6 +4677,29 @@ observability roll-up: `object_store_request_duration_seconds`,
 `write_batch_bytes`, `compaction_debt_seconds`, `visible_frontier_lag_ms`,
 and `durable_frontier_lag_ms`. The single-binary developer story is not
 acceptable without a way to see why something is slow.
+
+#### 14.15.1 Metric Cardinality Budget
+
+To prevent metric explosion at scale, all RockStream-emitted metrics are
+subject to a **cardinality budget** of **≤ 50 000 active time series per
+worker** under default label configuration. Label dimensions are bounded as
+follows:
+
+| Label | Max distinct values | Notes |
+|---|---:|---|
+| `pipeline_id` | 256 | Hard limit; reject pipeline creation beyond this. |
+| `op_id` | 512 per pipeline | Each operator emits O(1) series. |
+| `shard_id` | 1024 per exchange | Bounded by cluster size. |
+| `migration_id` | 64 concurrent | Active migrations only; closed → dropped. |
+| `connector_id` | 128 | Bounded at connector registration. |
+
+Custom labels (e.g., user-defined pipeline tags) are limited to 8 additional
+labels with ≤ 64 distinct values each. Labels violating these limits are
+silently dropped from emission and logged at WARN level once per hour.
+
+The `metrics_cardinality_total` gauge tracks current active series; if it
+exceeds `metrics_cardinality_warning_threshold` (default 40 000 per worker),
+`RS-1410 metrics.cardinality_high` is emitted as a NOTICE.
 
 ### 14.16 Backpressure and Admission Control
 

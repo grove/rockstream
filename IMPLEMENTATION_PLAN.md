@@ -254,8 +254,11 @@ connector layers may bypass it.
 
 **Exit criteria for Phase 1**
 
-- 1M-row/s throughput for filter on a laptop (single-threaded).
-- 200k-row/s for `GROUP BY SUM`; 100k-row/s for `GROUP BY MIN`.
+- 1M-row/s throughput for filter on a laptop (single-threaded, in-memory
+  arrangement via SlateDB in-memory object store).
+- 200k-row/s for `GROUP BY SUM`; 100k-row/s for `GROUP BY MIN` (in-memory).
+- Same benchmarks on local filesystem object store: ≥ 500k-row/s filter,
+  ≥ 100k-row/s `GROUP BY SUM`, ≥ 50k-row/s `GROUP BY MIN`.
 - Crash mid-epoch (`kill -9` injected mid-`WriteBatch`); on restart, the
   shard reads its persisted frontier and reprocesses the failed epoch —
   output bit-identical to an uninterrupted run.
@@ -264,6 +267,9 @@ connector layers may bypass it.
 - Embedded freshness benchmark records p50/p95 commit-to-query visibility for
   1, 10, and 1000 rows/epoch; the run must show zero gRPC shuffle calls and
   zero durable shuffle objects.
+- Embedded latency class validation: p95 `commit_to_visible_ms` for a 1-row
+  epoch must be < 5 ms (local_visible latency class, DESIGN.md §14.9), confirming
+  that embedded mode achieves sub-ms visibility for trivial workloads.
 - Oracle property test runs green for ≥ 100k randomized scenarios per
   operator combination.
 
@@ -731,9 +737,11 @@ production-ready.
 
 **Exit criteria**
 
-- 16-shard cluster (single host, 16 processes) runs TPC-H with near-linear
-  throughput vs. single shard for partitionable queries, with documented skew
-  and shuffle limits.
+- 16-shard cluster on ≥ 4 hosts (4 hosts × 4 shards minimum, real network
+  between hosts) runs TPC-H with near-linear throughput vs. single shard for
+  partitionable queries, with documented skew and shuffle limits. Single-host
+  multi-process tests are insufficient — they mask network partitions, MTU
+  effects, and real gRPC latency.
 - Same-worker loopback path produces bit-identical output to direct gRPC and
   shows zero worker-to-worker network calls for co-located exchanges.
 - Pre-shuffle combiner benchmark documents bytes avoided for partitioned
@@ -889,7 +897,9 @@ production-ready.
   micro-benchmarks.
 - **Simulation seeds**: ≥ 100k seeded `SimRuntime` runs across the
   coordination suite pass cleanly; any failing seed is checked in as a
-  regression test.
+  regression test. Seed depth must cover: ≥ 3 simultaneous shard failures,
+  ≥ 2 overlapping migrations, ≥ 1 full-cluster restart, and ≥ 1 network
+  partition lasting > heartbeat timeout × 3.
 - **Continuous simulation soak infrastructure starts here**: a scheduled CI
   job runs new seeded `SimRuntime` executions against `main` around the
   clock from v0.36 onward. Failing seeds are minimized using the standard
@@ -1043,11 +1053,12 @@ a gateway rewrite.
   gateway pushes partial aggregation to shards only when the aggregate's
   `MergeLaw` permits regrouping. It merges O(groups) rows rather than O(view
   rows), and `EXPLAIN` names the law used or reports why pushdown is unsafe.
-- **`rockstream` system schema** (DESIGN.md §12.6.1): virtual tables
-  (`rockstream.epochs`, `rockstream.pipelines`, `rockstream.views`,
-  `rockstream.shards`, `rockstream.connectors`, `rockstream.audit_log`,
-  `rockstream.schema_history`) projecting control-plane state through the
-  standard SQL interface. No additional storage required.
+- **`rockstream_catalog` system schema** (DESIGN.md §12.6.1): virtual tables
+  (`rockstream_catalog.epochs`, `rockstream_catalog.pipelines`,
+  `rockstream_catalog.views`, `rockstream_catalog.shards`,
+  `rockstream_catalog.connectors`, `rockstream_catalog.audit_log`,
+  `rockstream_catalog.schema_history`) projecting control-plane state through
+  the standard SQL interface. No additional storage required.
 - **Arrangement segment cache** (DESIGN.md §5.4): per-worker LRU cache
   keyed by `(shard_id, segment_id)`, bounded by `segment_cache_bytes`
   (default 512 MB). Populated on `DbReader` segment fetches for join lookups
@@ -1058,8 +1069,8 @@ a gateway rewrite.
 
 - `SELECT COUNT(*), region FROM mv GROUP BY region` pushes partial agg to
   shards; gateway receives O(groups) rows, not O(view rows).
-- `SELECT * FROM rockstream.epochs WHERE pipeline_id = 'orders'` returns
-  committed epoch history without additional storage writes.
+- `SELECT * FROM rockstream_catalog.epochs WHERE pipeline_id = 'orders'`
+  returns committed epoch history without additional storage writes.
 - Segment cache hit ratio > 80% for a hot-join benchmark with a working set
   that fits within `segment_cache_bytes`.
 

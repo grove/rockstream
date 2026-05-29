@@ -17,6 +17,11 @@ weeks, two people for five weeks, five people for two weeks, or any other mix.
 The version number is not a promise of public release quality. It is a planning
 unit. A version is done only when its proof is done.
 
+Version effort varies. Foundation versions (v0.1–v0.4) are typically
+under-budget; gateway and connector versions (v0.40–v0.50) are typically
+over-budget due to integration surface area. Teams should allocate 1.5× for
+integration-heavy versions and 0.7× for kernel-focused versions.
+
 ---
 
 ## Roadmap Philosophy
@@ -82,6 +87,7 @@ These names are for orientation. They are not calendar commitments.
 | Milestone | Version | Meaning |
 |---|---:|---|
 | Developer Alpha | v0.10 | Local single-shard engine can maintain simple views and survive crash/replay. |
+| Developer Preview | v0.18 | Single-shard SQL engine demo-able to external users. Blog post + feedback loop. |
 | SQL Alpha | v0.18 | Core SQL views, joins, set ops, and `EXPLAIN` work on one shard. |
 | Single-Shard Beta | v0.27 | Advanced IVM is feature-complete enough for serious single-node testing. |
 | Distributed Alpha | v0.36 | Multi-shard execution, frontier protocol, recovery, and exactly-once basics work. |
@@ -229,6 +235,7 @@ These are explicit places to pause, learn, and possibly reshape the roadmap.
 |---|---:|---|
 | Architecture sanity | v0.4 | Do SlateDB, the runtime abstraction, and local developer ergonomics still fit the design? |
 | IVM kernel confidence | v0.10 | Is the core delta engine simple enough to debug, and does replay work cleanly? |
+| Storage operational budget | v0.10 | Do SlateDB operational budgets (write amp, get_merged p99, compaction debt) hold at 5GB+ shard sizes on real object storage? |
 | SQL scope control | v0.18 | Are we still building the right SQL subset first, or have edge cases started to dominate? |
 | Single-shard correctness | v0.27 | Is the IVM engine correct and fast enough to justify distribution work? |
 | Distributed architecture | v0.36 | Does the shard/exchange/frontier/checkpoint model actually hold under simulation and chaos? |
@@ -251,6 +258,12 @@ tracked as GitHub issues and resolved with targeted corrections to the relevant
 section — not as numbered design-revision passes. The test: after v0.10, every
 DESIGN.md commit should be small and targeted ("correct §7.5: exchange
 loopback threshold"), not broad ("v3.X adds Y, Z").
+
+**Enforcement.** The design freeze is enforced by CI: any PR that touches
+DESIGN.md or IVM.md must include a `freeze-exception: <issue-url>` trailer
+linking a GitHub issue that justifies the change. PRs without this trailer
+that modify more than 10 net lines in either document are blocked. Typo fixes
+and cross-reference corrections (≤ 10 net lines) are exempt.
 
 ---
 
