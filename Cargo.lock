@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
  "rockstream-control",
@@ -1942,14 +1942,14 @@ dependencies = [
 
 [[package]]
 name = "rockstream-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rockstream-types",
 ]
 
 [[package]]
 name = "rockstream-connectors"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "rockstream-types",
@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-control"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rockstream-types",
  "serde",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-diff"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rockstream-plan",
  "rockstream-types",
@@ -1978,14 +1978,14 @@ dependencies = [
 
 [[package]]
 name = "rockstream-gateway"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rockstream-types",
 ]
 
 [[package]]
 name = "rockstream-ops"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "rockstream-types",
@@ -1995,22 +1995,23 @@ dependencies = [
 
 [[package]]
 name = "rockstream-oracle"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "proptest",
  "rockstream-types",
+ "serde_json",
 ]
 
 [[package]]
 name = "rockstream-plan"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rockstream-types",
 ]
 
 [[package]]
 name = "rockstream-runtime"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "rockstream-connectors",
@@ -2026,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sim"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2038,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sql"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rockstream-plan",
  "rockstream-types",
@@ -2046,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-storage"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "object_store",
@@ -2059,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-types"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
 ]

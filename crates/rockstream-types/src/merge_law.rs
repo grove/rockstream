@@ -146,7 +146,7 @@ pub trait LawBundle: Send + Sync + 'static {
 }
 
 /// Descriptor for a registered law (used in catalogs and `EXPLAIN` output).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LawDescriptor {
     pub id: MergeLawId,
     pub version: MergeLawVersion,
