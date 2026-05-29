@@ -112,6 +112,12 @@ pub fn reset_all() {
 mod tests {
     use super::*;
     use crate::merge_law::MergeLawId;
+    use std::sync::{LazyLock, Mutex};
+
+    /// Serialise all tests that touch the process-global REGISTRY so that
+    /// concurrent test threads don't corrupt each other's `reset_all` / `inc`
+    /// sequences.
+    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn key() -> LawMetricKey {
         LawMetricKey {
@@ -123,6 +129,7 @@ mod tests {
 
     #[test]
     fn applied_counter_increments() {
+        let _g = TEST_LOCK.lock().unwrap();
         reset_all();
         let k = key();
         assert_eq!(read_applied(&k), 0);
@@ -133,6 +140,7 @@ mod tests {
 
     #[test]
     fn fallback_counter_increments() {
+        let _g = TEST_LOCK.lock().unwrap();
         reset_all();
         let k = key();
         assert_eq!(read_fallback(&k), 0);
@@ -142,6 +150,7 @@ mod tests {
 
     #[test]
     fn independent_counters_per_law() {
+        let _g = TEST_LOCK.lock().unwrap();
         reset_all();
         let k1 = LawMetricKey {
             law_id: MergeLawId(0x0001),
