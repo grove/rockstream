@@ -1,6 +1,6 @@
 # ADR: EXPLAIN INCREMENTAL — Three Output Levels
 
-**Status**: Proposed  
+**Status**: Accepted  
 **Date**: 2026-05-29
 
 ---

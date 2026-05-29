@@ -53,9 +53,9 @@ grows with you, paying object-storage prices.
 
 ### 2. The Mental Model
 
-When you use RockStream, you only ever interact with two kinds of things and
-one verb. The things are **pipelines** and **views**. The verb is **deploy**.
-Everything else — sharding, shuffling, recovery, compaction, garbage
+When you use RockStream, you only ever interact with three kinds of things and
+one verb. The things are **workloads**, **views**, and **sources**. The verb is
+**create**. Everything else — sharding, shuffling, recovery, compaction, garbage
 collection, rebalancing — happens for you, behind a curtain, and you don't
 need to think about it unless something is wrong.
 
@@ -67,24 +67,23 @@ you can run `SELECT * FROM my_view` against it just like you would against
 computed from other data, and RockStream keeps those contents fresh as the
 underlying data changes.
 
-A **pipeline** is a container. It groups together a set of views that belong
-together, along with the sources that feed them and any sinks that publish
-their output. A pipeline is the unit you actually deploy. It is also the unit
-that gets a freshness target ("my views should be at most one second stale"),
-a resource budget ("don't use more than two hundred gigabytes of state"), and
-a priority ("this pipeline matters more than that one when the cluster is
-busy"). When you tell RockStream what you want, you tell it at the pipeline
-level. The system then makes all the small decisions — how many machines to
-use, how big to make each batch, when to flush to disk — to honor what you
-asked for.
+A **workload** is a named resource policy. It groups together a set of related
+views under a shared freshness SLO, memory budget, and priority. It is the
+unit that gets a freshness target ("my views should be at most one second
+stale"), a resource limit ("don't use more than two hundred gigabytes of
+state"), and a priority ("this workload matters more than that one when the
+cluster is busy"). When you tell RockStream what you want, you tell it at the
+workload level. The system then makes all the small decisions — how many
+machines to use, how big to make each batch, when to flush to disk — to honor
+what you asked for.
 
-The verb is **deploy**. You write the SQL for a pipeline, you submit it, and
-the system goes to work. If you want to change something, you redeploy. The
-mental model deliberately stops there. You never have to ask "which shard
-does this row live on?" or "is operator instance number 47 healthy?" Those
-questions exist, but they exist inside diagnostic tools that you only reach
-for when something has gone wrong. In normal life, you have pipelines and
-views, and that's it.
+The verb is **create**. You write `CREATE MATERIALIZED VIEW`, you submit it,
+and the system goes to work. If you want to change something, you replace it
+or use the blue/green replacement path. The mental model deliberately stops
+there. You never have to ask "which shard does this row live on?" or "is
+operator instance number 47 healthy?" Those questions exist, but they exist
+inside diagnostic tools that you only reach for when something has gone wrong.
+In normal life, you have workloads and views, and that's it.
 
 ### 3. A Tour Through a Single View
 
@@ -110,7 +109,7 @@ Kafka. The connector knows it's part of an in-flight batch — what RockStream
 calls an **epoch**. Maybe the epoch has been open for fifty milliseconds.
 The connector decides whether to keep accumulating messages or to close the
 current epoch and start a new one. This decision is driven by a cadence: in
-this case, suppose the pipeline runs at a hundred-millisecond cadence, so
+this case, suppose the workload runs at a hundred-millisecond cadence, so
 the connector waits another fifty milliseconds and then closes the epoch.
 The result is a small batch of rows representing all the changes that
 happened to the orders source during that hundred-millisecond window.
@@ -404,7 +403,7 @@ the rest.
 
 ---
 
-## Part 4 — Views and Pipelines
+## Part 4 — Views and Workloads
 
 ### 10. Materialized Views: The Star of the Show
 
@@ -439,7 +438,7 @@ to remember every row on each side, indexed by the join key, so it can
 look up matches when new rows arrive. A windowed aggregate needs to
 remember rows that haven't yet rolled out of the window. This state is
 the price you pay for incremental maintenance. It is bounded by your
-pipeline's state budget (chapter 15), and the system reports how much
+workload's memory limit (chapter 15), and the system reports how much
 state each view consumes so you can plan.
 
 You can query a materialized view at the latest committed epoch or, in
@@ -485,68 +484,75 @@ VIEW` are very different. One creates a piece of stored, continuously
 maintained data. The other creates a named SQL fragment. Both are useful;
 they solve different problems.
 
-### 12. Pipelines: The Unit of Deployment
+### 12. Workloads: The Unit of Resource Policy
 
-A **pipeline** is a container that groups together a set of sources, a
-set of views built from those sources, optionally a set of sinks where
-output goes, and a single set of operational policies that apply to all
-of them together. The pipeline is what you deploy. The pipeline is what
-gets a freshness SLO, a state budget, an object-store rate limit, and a
-priority. The pipeline is what shows up in monitoring as a single named
-thing whose health you track.
+A **workload** is a named resource policy that groups related views under
+a shared freshness SLO, memory budget, and priority. Workloads are
+declared separately from the views that use them. A view references a
+workload at creation time; the workload is not a container you deploy —
+it is a constraint policy the system enforces.
 
-A simple pipeline might look like this:
+A typical setup looks like this:
 
 ```sql
-CREATE PIPELINE sales WITH (
-    freshness_target_ms = 1000,
-    state_budget_gb     = 100,
-    priority            = normal
-) AS
-    CREATE SOURCE orders FROM kafka (...);
+-- Declare the resource policy once.
+CREATE WORKLOAD sales_analytics WITH (
+    FRESHNESS_SLO  = '1s',
+    MEMORY_LIMIT   = '100GB',
+    PRIORITY       = normal
+);
 
-    CREATE MATERIALIZED VIEW revenue_by_region AS
-        SELECT region, SUM(amount) FROM orders GROUP BY region;
+-- Create sources and views; assign them to the workload.
+CREATE SOURCE orders FROM kafka (...);
 
-    CREATE MATERIALIZED VIEW revenue_by_product AS
-        SELECT product_id, SUM(amount) FROM orders GROUP BY product_id;
+CREATE MATERIALIZED VIEW revenue_by_region
+WITH (WORKLOAD = sales_analytics)
+AS
+    SELECT region, SUM(amount) FROM orders GROUP BY region;
+
+CREATE MATERIALIZED VIEW revenue_by_product
+WITH (WORKLOAD = sales_analytics)
+AS
+    SELECT product_id, SUM(amount) FROM orders GROUP BY product_id;
 ```
 
-Here a single pipeline contains one source and two materialized views.
-Both views read from the same source, so they share a lot of underlying
-machinery — the connector, the initial scan of the orders stream, the
-common epoch infrastructure. The system builds a single shared operator
-graph that fans out to both views, which is more efficient than running
-two independent pipelines.
+Both views are assigned to the `sales_analytics` workload. They share
+the same freshness target and memory budget. The system builds a single
+shared operator graph that fans out to both views, which is more
+efficient than maintaining two independent computation paths.
 
-The pipeline's freshness target — one second, in this example — applies
-to both views. The system tunes its epoch sizing and scheduling so that
-each view's output is at most one second behind the input. The state
-budget of one hundred gigabytes is shared across both views' state. If
-one view is small and the other is large, that's fine, as long as the
-total stays under the budget.
+The workload's freshness SLO — one second, in this example — applies
+to all views in the workload. The system tunes its epoch sizing and
+scheduling so that each view's output is at most one second behind the
+input. The memory limit of one hundred gigabytes is shared across all
+views' operator state. If one view is small and the other is large,
+that's fine, as long as the total stays under the limit.
 
-You create a new pipeline when:
+You create a new workload when:
 
-- You want **independent SLOs**: one workload needs sub-second freshness,
-  another can tolerate five-minute lag, and you don't want the faster
-  one to starve the slower one or vice versa.
+- You want **independent SLOs**: one set of views needs sub-second
+  freshness, another can tolerate five-minute lag, and you don't want
+  the faster one to starve the slower one or vice versa.
 - You want **independent resource budgets**: you don't want a single
-  rogue view to consume all the cluster's state budget at the expense of
-  other workloads.
-- You want **independent lifecycles**: you want to deploy, upgrade, pause,
-  or drop one workload without affecting another.
+  rogue view to consume all the cluster's memory at the expense of
+  other views.
+- You want **independent priorities**: different tenants or different
+  applications should have different priorities under contention.
 - You want **multi-tenant isolation**: different tenants get different
-  pipelines, possibly in different namespaces, with quotas enforced
+  workloads, possibly in different namespaces, with constraints enforced
   independently.
 
-Inside a single pipeline, all the views share fate. They share the
-cadence, the SLO, the budget. They go up together and they come down
-together. This is by design. It would be possible to give every view its
-own SLO, but the gain is small and the operational complexity is high.
-The pipeline-as-unit model encourages you to think about related views
-as a single unit of intent, which usually matches how teams actually
+Views in the same workload share fate with respect to resource
+constraints. They share the SLO, the budget, and the priority. If the
+workload's memory limit is exceeded, all views in the workload are
+affected. This encourages you to group related views with similar
+operational requirements, which usually matches how teams actually
 operate them.
+
+If you omit `WITH WORKLOAD` when creating a view, the view inherits the
+schema's default workload (set with `ALTER SCHEMA ... SET DEFAULT WORKLOAD
+= name`). If no schema default is set, the view uses the system default
+workload, which has generous limits and normal priority.
 
 ### 13. Composing Views Out of Views
 
@@ -605,7 +611,7 @@ consistency.
 
 ### 14. Cadences: How Often Things Update
 
-The **cadence** is how often a pipeline closes epochs and propagates
+The **cadence** is how often a workload closes epochs and propagates
 updates. It is the knob that controls how fresh your views are. Faster
 cadences mean fresher data and more overhead. Slower cadences mean
 staler data and less overhead. RockStream offers four cadence modes,
@@ -616,7 +622,7 @@ frequently — typically every ten to a hundred milliseconds — and the
 engine drains them as fast as the SLO requires. This is what you want
 for dashboards, real-time analytics, and any workload where freshness in
 the sub-second range matters but you don't need synchronous, in-line
-updates. Most pipelines run in this mode.
+updates. Most workloads run in this mode.
 
 **Periodic** mode closes epochs at a fixed wall-clock interval — every
 five seconds, every minute, every hour. This is what you reach for when
@@ -657,56 +663,48 @@ The key idea behind RockStream's operational interface is **intent-based
 configuration**. You don't tell the system how to do its job. You tell
 it what outcome you want, and the system figures out the how. The
 configuration mechanism for this is the **SLO** (service-level
-objective), which lives on the pipeline.
+objective), which lives on the workload.
 
-A pipeline declares its SLO in the `CREATE PIPELINE` statement:
+A workload declares its SLO in the `CREATE WORKLOAD` statement:
 
 ```sql
-CREATE PIPELINE my_pipeline WITH (
-    freshness_target_ms = 1000,
-    state_budget_gb     = 200,
-    object_store_rps    = 5000,
-    priority            = normal
-) AS ...;
+CREATE WORKLOAD my_workload WITH (
+    FRESHNESS_SLO  = '1s',
+    MEMORY_LIMIT   = '200GB',
+    PRIORITY       = normal
+);
 ```
 
-The **freshness target** is the headline number: how stale your views
-are allowed to be. A target of one second means the system commits to
+The **freshness SLO** is the headline number: how stale your views are
+allowed to be. A target of one second means the system commits to
 keeping the views' output within one second of the most recent input,
 under normal conditions. The system tunes its epoch sizing, its
 parallelism, and its scheduling to meet this number. If it can't meet
 the target (because the input rate is too high, or the cluster is too
-small, or there's a transient problem), the pipeline transitions to a
-named degraded state and reports the reason. You always know whether
-your SLO is being honored, and if not, why.
+small, or there's a transient problem), the view transitions to a named
+degraded state and reports the reason. You always know whether your SLO
+is being honored, and if not, why.
 
-The **state budget** caps how much storage the pipeline's operator state
-is allowed to consume. This is not the same as the storage for the view's
-output, which is governed by retention policies; it's the storage for the
-intermediate state operators maintain (the indexed join keys, the
-aggregated subtotals, the windowed buffers). If a query plan requires
-more state than the budget allows, the pipeline is rejected at deploy
-time with a clear error. This protects you from accidentally deploying a
-query that would consume a terabyte of state when you only meant to
-maintain a small running total.
+The **memory limit** is a soft cap on how much arrangement state the
+workload's views are collectively allowed to consume. This is the
+storage for the intermediate state operators maintain (the indexed join
+keys, the aggregated subtotals, the windowed buffers) — not the output
+rows themselves. If a view's plan requires more state than the budget
+allows, it is rejected at deploy time with a clear error. This protects
+you from accidentally deploying a query that would consume a terabyte of
+state when you only meant to maintain a small running total.
 
-The **object-store rate** is a soft cap on PUTs and GETs per second
-against the underlying object storage. This matters because object
-storage has its own rate limits and pricing tiers, and you usually want
-to ensure your pipeline doesn't accidentally spike them. The system
-respects this budget by adjusting batch sizes and flush intervals.
-
-The **priority** decides which pipelines win when the cluster is
-contended. A high-priority pipeline gets preferential access to cluster
-resources; a low-priority pipeline yields. Most pipelines are normal;
+The **priority** decides which workload's views win when the cluster is
+contended. A high-priority workload gets preferential access to cluster
+resources; a low-priority workload yields. Most workloads are normal;
 the priority knob is there for the cases where you really do need to
 guarantee that one workload comes first.
 
 The SLO is enforced; it's not a hope. The system reports a single
-**SLO compliance** metric per pipeline — a number between 0.0 and 1.0
+**SLO compliance** metric per view — a number between 0.0 and 1.0
 representing the fraction of time the SLO was met over a rolling window.
 This is the one number you put on a dashboard to answer "is my
-pipeline healthy?" Drill-down metrics tell you what to look at if it
+view healthy?" Drill-down metrics tell you what to look at if it
 dips, but the headline is always the same shape.
 
 ### 16. Self-Tuning by Default
@@ -739,7 +737,7 @@ manual setting. You might pin parallelism to a specific value if you're
 benchmarking, or set an epoch ceiling lower than the SLO loop would
 choose if you have a strict freshness requirement that's tighter than
 the budget. Overrides survive across restarts and show up in `SHOW
-PIPELINE` output so you remember they're there.
+WORKLOAD` output so you remember they're there.
 
 The philosophy is that tuning is the system's job, not yours, and
 overrides are escape hatches for the cases where you know something the
@@ -1019,14 +1017,14 @@ the engine chose and how many iterations it took.
 
 ### 23. The One Signal: SLO Compliance
 
-If you only look at one metric for your pipeline, it should be **SLO
+If you only look at one metric for your view, it should be **SLO
 compliance**. This is a number between 0.0 and 1.0 that represents the
-fraction of time the pipeline met its freshness target over a rolling
+fraction of time the view met its freshness target over a rolling
 window (by default five minutes). A value of 1.0 means the SLO has
 been met for the entire window. A value of 0.8 means it was missed 20%
 of the time. A value of 0.0 means it was never met.
 
-You put this single number on your dashboard, one per pipeline. If
+You put this single number on your dashboard, one per view. If
 they're all at 1.0, everything is fine and you don't need to look at
 anything else. If one dips, you click into it and the system shows you
 the **degradation reason**: a short, named code like
@@ -1037,7 +1035,7 @@ tells you what's wrong in operator terms.
 
 This is a deliberate operational stance. Most monitoring systems give
 you a thousand metrics and let you figure out which ones matter.
-RockStream gives you one metric per pipeline that summarizes whether
+RockStream gives you one metric per view that summarizes whether
 your intent is being honored, and then drill-downs that tell you what
 to do if it's not. The aim is that an on-call engineer with no specific
 RockStream training should be able to answer "is my workload healthy?"
@@ -1054,7 +1052,7 @@ SlateDB single-writer mechanism prevents split-brain: the old writer's
 manifest is fenced, so even if it comes back online it cannot commit.
 The new writer opens the shard, reads its last committed frontier,
 replays any WAL entries beyond the last checkpoint, and resumes
-processing from there. The pipeline transitions to a `RECOVERING`
+processing from there. The view transitions to a `RECOVERING`
 state during this process and back to `ACTIVE` when the frontier
 catches up. The recovery time is bounded by the cluster's recovery
 SLO, typically under sixty seconds.
@@ -1062,10 +1060,9 @@ SLO, typically under sixty seconds.
 When **object storage is slow**, the system backs off. Operators that
 can't flush their writes accumulate them in local buffers. Connectors
 throttle their input rate so the buffers don't grow unbounded. The
-pipeline reports a degraded state with the reason
-`OBJECT_STORE_SLOW`. When storage recovers, the buffers drain and the
-pipeline returns to normal. No data is lost, but freshness lags during
-the brownout.
+view reports a degraded state with the reason `OBJECT_STORE_SLOW`.
+When storage recovers, the buffers drain and the view returns to
+normal. No data is lost, but freshness lags during the brownout.
 
 When a **network partition** isolates a worker, the partitioned worker
 detects its isolation through missing heartbeats and self-fences,
@@ -1115,7 +1112,7 @@ node-local state. The deployment ladder is purely additive: you add
 machines, you add roles, you don't reconfigure.
 
 This matters because it means you can start small. You don't have to
-design a cluster on day one. You build your pipelines against a laptop
+design a cluster on day one. You build your workloads against a laptop
 deployment, you deploy them to a single production host when you're
 ready, and you scale out to a cluster when the load demands it. The
 mental model and the SQL never change.
@@ -1125,17 +1122,17 @@ mental model and the SQL never change.
 If multiple teams share a cluster, you'll want each team's workloads to
 be isolated from the others. RockStream supports this through
 **namespaces**, which are roughly analogous to PostgreSQL databases:
-each namespace has its own catalog of tables, views, and pipelines, and
+each namespace has its own catalog of tables, views, and workloads, and
 its own set of quotas.
 
-A pipeline lives in a namespace. The pipeline's resource usage counts
+A workload lives in a namespace. The workload's resource usage counts
 against the namespace's quotas, not against any global cluster budget.
 This means one team's runaway workload cannot starve another team's
-pipelines: if team A's namespace exceeds its budget, team A's pipelines
-degrade, but team B's pipelines continue normally.
+views: if team A's namespace exceeds its budget, team A's views
+degrade, but team B's views continue normally.
 
 Access control is also per-namespace. A user with `pipeline_owner`
-rights on namespace A can deploy, alter, and drop pipelines in
+rights on namespace A can deploy, alter, and drop views in
 namespace A, but cannot even see what exists in namespace B. The pgwire
 gateway routes connections to the right namespace based on the
 connection string, exactly like a database in PostgreSQL.
@@ -1160,7 +1157,7 @@ signal upstream that they cannot accept more data, causing upstream to
 slow down. In RockStream, implemented via the credit system on
 connectors.
 
-**Cadence** — How often a pipeline closes epochs. The four modes are
+**Cadence** — How often a workload closes epochs. The four modes are
 deferred low-latency, periodic, calculated, and immediate.
 
 **Connector** — A piece of code that bridges between an external system
@@ -1193,14 +1190,15 @@ Continuously maintained by the engine; queryable like a table. Consumes
 storage proportional to its result size plus operator state.
 
 **Namespace** — An isolation boundary roughly analogous to a PostgreSQL
-database. Catalog objects, pipelines, quotas, and access control are
+database. Catalog objects, workloads, quotas, and access control are
 scoped to a namespace.
 
-**Pipeline** — The unit of deployment and operational policy. Groups
-sources, views, and sinks under a single SLO and quota.
+**Workload** — A named resource policy. Groups related views under a
+shared freshness SLO, memory limit, and priority. The unit of
+operational intent.
 
 **Quota** — A resource cap (state bytes, object-store rate, etc.)
-applied at the pipeline or namespace level.
+applied at the workload or namespace level.
 
 **Shard** — A partition of the cluster's state. Each shard is owned by
 one worker and corresponds to one SlateDB instance.
@@ -1209,11 +1207,11 @@ one worker and corresponds to one SlateDB instance.
 like Kafka, Iceberg, or another database. Optional; views can be
 queried directly without a sink.
 
-**SLO (service-level objective)** — A pipeline-level promise about
-freshness, state budget, object-store rate, or priority. The system
-tunes itself to meet the SLO.
+**SLO (service-level objective)** — A workload-level promise about
+freshness, memory limit, or priority. The system tunes itself to meet
+the SLO.
 
-**Source** — An input to a pipeline. Defined via a connector pointing
+**Source** — An input that feeds views. Defined via a connector pointing
 at an external system or via RockStream's internal write API.
 
 **Watermark** — A piece of event-time metadata emitted by connectors
@@ -1225,10 +1223,10 @@ between operators in RockStream.
 
 ### 28. Decision Trees
 
-**"Should I create a new pipeline?"** Ask yourself: do these views need
-the same freshness target? Should they share a state budget? Should
-they be deployed and upgraded together? If yes to all three, one
-pipeline. If no to any, separate pipelines.
+**"Should I create a new workload?"** Ask yourself: do these views need
+the same freshness target? Should they share a memory budget? Should
+they have the same priority? If yes to all three, one workload. If no
+to any, separate workloads.
 
 **"Which cadence should I pick?"** Start with the default (deferred
 low-latency). Switch to periodic if you want predictable batching and

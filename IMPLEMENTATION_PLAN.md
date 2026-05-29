@@ -407,13 +407,23 @@ join queries written as plain SQL.
   offsets) and Postgres CDC (`pg_class.reltuples`) connectors; stats cached in
   `catalog/table/{id}/stats`; live metrics feed back after 60 s of operation;
   `ANALYZE TABLE` command refreshes on demand (DESIGN.md §4.0).
-- **`CREATE PIPELINE … WITH (…)`** SQL grammar parses `freshness_target_ms`,
-  `state_budget_gb`, `object_store_rps`, `priority`, `max_parallelism`,
-  `max_shards`. Values are stored in catalog; enforcement lands in Phase 3
-  (state budget) and Phase 4 (parallelism/shard caps).
-- **Multi-view pipeline DDL.** `CREATE PIPELINE ... AS (...)` accepts multiple
-  `CREATE SOURCE` and `CREATE VIEW` statements, compiles them into one shared
-  DAG, and stores dependency metadata for `ALTER PIPELINE ... ADD/REPLACE VIEW`.
+- **`CREATE WORKLOAD name WITH (…)`** SQL grammar parses `FRESHNESS_SLO`,
+  `MEMORY_LIMIT`, `PRIORITY`, `MAX_PARALLELISM`. Values are stored in the
+  workload catalog entry; enforcement lands in Phase 3 (state budget) and
+  Phase 4 (parallelism caps).
+- **Workload assignment on `CREATE MATERIALIZED VIEW`.** `CREATE MATERIALIZED
+  VIEW ... WITH (WORKLOAD = name)` associates a view with a workload at
+  creation time. Omitting `WORKLOAD` inherits the schema's default workload
+  (`ALTER SCHEMA ... SET DEFAULT WORKLOAD = name`) or falls back to the
+  system default. `workload_source` (`view | schema_default | system_default`)
+  is stored in the view catalog entry and surfaced in `EXPLAIN INCREMENTAL`.
+- **View dependency metadata.** Inter-view dependency graph stored in catalog;
+  used by `CREATE REPLACEMENT MATERIALIZED VIEW v2 FOR v1` and
+  `ALTER MATERIALIZED VIEW v1 APPLY REPLACEMENT v2` (the blue/green path).
+- **View lifecycle commands.** `PAUSE MATERIALIZED VIEW`, `RESUME MATERIALIZED
+  VIEW`; `SHOW VIEW STATUS FOR SCHEMA <name>` (all views with state/freshness/
+  SLO); `SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>` (progress %,
+  ETA, throughput). Audit events for every state transition.
 
 ---
 
@@ -538,19 +548,20 @@ standard for analytical workloads.
 
 **→ Operability deliverables (Phase 3)**
 
-- **Per-pipeline state-budget enforcement.** The runtime accounts
-  `op_state_bytes` per pipeline; reaching `state_budget_gb` transitions the
-  pipeline to `OVER_BUDGET_RELAXED` (DESIGN.md §14.10), surfaces a named
-  `RS-2002` reason, and records the transition in the audit log. No silent
-  growth past the budget.
+- **Per-workload state-budget enforcement.** The runtime accounts
+  `op_state_bytes` per workload; reaching the workload's `MEMORY_LIMIT`
+  transitions affected views to `OVER_BUDGET_RELAXED` (DESIGN.md §14.10),
+  surfaces a named `RS-2002` reason, and records the transition in the audit
+  log. No silent growth past the budget.
 - **Object-store RPS quota.** Token-bucket admission on the per-shard
   commit path enforces `object_store_rps`; over-limit transitions to
   `RPS_THROTTLED`.
-- **Degraded-state surface.** `pipeline_slo_compliance` and
-  `pipeline_degraded_reason` metrics ship; `SHOW PIPELINE` reports the
-  current state. End-to-end test: a deliberately-too-tight
-  `freshness_target_ms` produces a visible degraded reason within one
-  observation window.
+- **Degraded-state surface.** `view_slo_compliance` and
+  `view_degraded_reason` metrics ship; `SHOW VIEW STATUS FOR SCHEMA` reports
+  current state across all views in a schema; `SHOW WORKLOAD STATUS` aggregates
+  across all views in a workload. End-to-end test: a deliberately-too-tight
+  `FRESHNESS_SLO` produces a visible degraded reason within one observation
+  window.
 
 ---
 
@@ -1248,7 +1259,7 @@ binding.
 - **Chaos testing automation**: Jepsen-style test harness.
 - **`rockstream chaos`**: in-tree fault-injection subcommand (DESIGN.md
   §14.17). Worker kills, object-store latency, shard fence loss, connector
-  stalls; recovery is observable through `pipeline_slo_compliance` and the
+  stalls; recovery is observable through `view_slo_compliance` and the
   audit log.
 - **Simulation-test CI gate** (DESIGN.md §17): every commit runs N seeded
   `SimRuntime` executions across the coordination suite (epoch commit,
@@ -1745,8 +1756,8 @@ These run in parallel with every phase.
 | Shuffle connection/object explosion | Worker-level stream multiplexing; coalesced durable shuffle objects; Phase 4 budget test at 1,000 shards. |
 | Checkpoint barrier alignment buffers grow without bound | Alignment buffers are credit-bounded and propagate backpressure; Phase 6 chaos test injects slow inputs during checkpointing. |
 | Merge-backed arrangements read stale values | All merge-backed reads go through `ShardDb::get_merged()` / `scan_merged()`; Phase 3.5 test forces fallback if the storage profile cannot resolve operands on read. |
-| **Auto-tuner oscillation** | Hysteresis bands on every adaptive loop (scale up after K consecutive over-budget windows, scale down only after 4× K under-budget windows); upper/lower bounds per pipeline; every decision recorded in the audit log so oscillation is visible. Property test: random workload sequence must reach a stable parallelism within bounded time. |
-| **SLO unmet for structural reasons (skew, source slow, downstream sink slow) goes unnoticed** | `pipeline_degraded_reason` is always populated when `pipeline_slo_compliance < 1.0`; ships in Phase 10 alongside the dashboard. Default alerting rule fires on any pipeline with `degraded_reason ≠ HEALTHY` for > 5 min. |
+| **Auto-tuner oscillation** | Hysteresis bands on every adaptive loop (scale up after K consecutive over-budget windows, scale down only after 4× K under-budget windows); upper/lower bounds per workload; every decision recorded in the audit log so oscillation is visible. Property test: random workload sequence must reach a stable parallelism within bounded time. |
+| **SLO unmet for structural reasons (skew, source slow, downstream sink slow) goes unnoticed** | `view_degraded_reason` is always populated when `view_slo_compliance < 1.0`; ships in Phase 10 alongside the dashboard. Default alerting rule fires on any view with `degraded_reason ≠ HEALTHY` for > 5 min. |
 | **Quota enforcement adds hot-path overhead** | Token-bucket admission and state accounting are per-shard, lock-free; benchmark in Phase 3.5 must show < 2% throughput cost. |
 | **Error-code registry rots** | CI gate: any new `tracing::error!` / returned `Error` without a registered `RS-XXXX` fails the build. Doc URL existence is checked. |
 | **Support bundle leaks secrets** | Default redaction is on and not config-overridable; only an explicit CLI flag (`--include-secrets`) can disable it; integration test asserts no credential pattern leaves the bundle by default. |

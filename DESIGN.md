@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), and Risi
 — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.20. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.25. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -20,12 +20,12 @@ object storage.
 >    intent (SLOs, quotas, priorities); the control plane decides
 >    mechanism.
 > 3. **One binary, one CLI, one config.** Every node role is a flag on the
->    same `rockstream` binary. The CLI surface is pipelines and views, never
->    shards or antichains.
+>    same `rockstream` binary. The CLI surface is workloads, schemas, views,
+>    and sources — never shards or antichains.
 > 4. **Unable to surprise you.** Cost preview before deploy
->    (`EXPLAIN INCREMENTAL ESTIMATE`), enforced per-pipeline quotas, an
+>    (`EXPLAIN INCREMENTAL ESTIMATE`), enforced per-workload quotas, an
 >    auditable event log of every control action, a single-command support
->    bundle, and a documented error-code taxonomy. Pipelines that cannot
+>    bundle, and a documented error-code taxonomy. Views that cannot
 >    meet their SLO degrade with a named reason instead of failing
 >    silently.
 >
@@ -177,7 +177,7 @@ object storage.
 > (§14.18); `rockstream.epochs` scalability via pre-aggregated checkpoint
 > summaries with mandatory filters (§12.6.1); `AS OF EPOCH` granularity
 > disclosure — resolution is checkpoint-bounded, not epoch-bounded (§12.4.1);
-> downstream lag inheritance validation at `CREATE PIPELINE` and in
+> downstream lag inheritance validation at `CREATE MATERIALIZED VIEW` and in
 > `EXPLAIN INCREMENTAL ESTIMATE` (§14.9); namespace corrected from "analogous
 > to PostgreSQL schema" to "analogous to PostgreSQL database" with pgwire
 > routing semantics (§5.2); targeted compaction fallback when range-targeted
@@ -227,6 +227,14 @@ object storage.
 > Postgres-standard `CREATE VIEW` semantics and covers ad-hoc query composition,
 > building blocks for materialized views, and schema abstraction. Ships v0.40.
 > Error codes `RS-1010`–`RS-1011` added. §5.7 and §12.1 updated.
+>
+> **v3.25 aligns user-facing terminology with four accepted ADRs** (adrs/workloads.md,
+> adrs/four-knobs.md, adrs/view-lifecycle.md, adrs/explain-levels.md): `CREATE PIPELINE`
+> is removed from all user-visible surfaces and replaced by `CREATE WORKLOAD` (a named
+> resource policy declared separately) plus `CREATE MATERIALIZED VIEW ... WITH (WORKLOAD =
+> name)`. The CLI surface changes from “pipelines and views” to “workloads, schemas, views,
+> and sources”. Metrics rename from `pipeline_slo_compliance` to `view_slo_compliance`.
+> §14.3, §14.4, §14.6–§14.7, §14.9–§14.13, and §14.16 updated throughout.
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -516,7 +524,7 @@ before being admitted into `topology/worker/`.
 ### 3.2 Frontier Aggregator as a Separable Process
 
 In Tier 3, the control-plane Raft group owns the *authoritative* shard map,
-schema catalog, and pipeline lifecycle decisions. It does **not** need to be on
+schema catalog, and view and workload lifecycle decisions. It does **not** need to be on
 the hot path of frontier reporting. As shard count grows past a few hundred,
 per-shard frontier updates (§8.3) at every epoch dominate control-plane traffic.
 
@@ -677,8 +685,8 @@ Schema changes are classified before they reach the runtime:
 |---|---|
 | Add nullable column or add column with default | Compatible. Existing arrangements keep their old row encoding; readers project the new column as NULL/default until rewritten by fresh deltas. |
 | Widen numeric type or compatible string/binary widening | Compatible if DataFusion can cast losslessly; recorded as a schema-version edge. |
-| Rename, drop, narrow, or change join/group/window key type | Breaking. Requires `CREATE PIPELINE ... REPLACE` or `ALTER PIPELINE ... REPLACE VIEW`, producing a blue/green plan clone (§10.5). |
-| Connector reports unexpected incompatible schema | Pipeline transitions to `BLOCKED(RS-1002)` and stops consuming new offsets until the operator approves a migration. |
+| Rename, drop, narrow, or change join/group/window key type | Breaking. Requires `CREATE REPLACEMENT MATERIALIZED VIEW v2 FOR v1` or `ALTER MATERIALIZED VIEW v1 APPLY REPLACEMENT v2`, producing a blue/green plan clone (§10.5). |
+| Connector reports unexpected incompatible schema | View transitions to `BLOCKED(RS-1002)` and stops consuming new offsets until the operator approves a migration. |
 
 Online replacement uses a checkpoint/clone path: create the new plan at a
 published frontier, backfill only state whose encoding changed, run old and new
@@ -821,7 +829,7 @@ A dedicated control SlateDB (one writer, >=2 readers in Tier 3) holds:
 0x05    checkpoints/         Cluster-wide checkpoint references
 0x06    connector/           External-source offsets, sink commit state
 0x07    audit/               Durable event log for every control-plane action
-0x08    state_accounting/    Per-pipeline state bytes, shard count, quota usage
+0x08    state_accounting/    Per-view state bytes, shard count, workload quota usage
 0x09    schema/              Versioned source/view schemas and compatibility data
 0x0A    namespace/           Namespace definitions, quotas, worker-pool affinity
 ```
@@ -2204,12 +2212,12 @@ auth layer:
 | Role | Can do |
 |---|---|
 | `viewer` | `SELECT` from granted views; subscribe to granted views. |
-| `pipeline_owner` | Deploy, alter, pause, resume, drop pipelines they own; all viewer rights on owned pipelines. |
+| `pipeline_owner` | Deploy, alter, pause, resume, drop views they own; all viewer rights on owned views. |
 | `admin` | Everything, including granting roles and viewing all audit-log entries. |
 
-- **Multi-tenancy isolation**: pipelines are namespaced (§5.2). A
+- **Multi-tenancy isolation**: views are namespaced (§5.2). A
   principal with `pipeline_owner` on namespace A cannot see or affect namespace
-  B's pipelines. Quota enforcement (§14.13) is per-pipeline and per-namespace,
+  B's views and workloads. Quota enforcement (§14.13) is per-workload and per-namespace,
   so tenants cannot starve each other by default. Hard isolation is available
   via worker-pool affinity (`CREATE NAMESPACE ... WITH (worker_pool = '...')`).
 - **Audit trail**: every query, subscription, deploy, and alter carries the
@@ -2253,8 +2261,8 @@ guarantee.
   stub responses sufficient for ORM connection probes.
 
 **Postgres wire protocol does NOT imply a Postgres drop-in.** DDL (`CREATE
-TABLE`, `ALTER TABLE`) is handled via `CREATE PIPELINE` / `CREATE VIEW`
-semantics. Write DML goes through the internal source connector (§13.5).
+TABLE`, `ALTER TABLE`) is handled via `CREATE MATERIALIZED VIEW` / `CREATE VIEW` /
+`CREATE WORKLOAD` semantics. Write DML goes through the internal source connector (§13.5).
 Extensions, `COPY`, `LISTEN`/`NOTIFY`, and advisory locks are out of scope.
 
 ### 12.6.1 The `rockstream` System Schema
@@ -2267,8 +2275,8 @@ through the standard SQL interface.
 
 | Table | Source | Purpose |
 |---|---|---|
-| `rockstream.epochs` | `control: checkpoints/` + `shard_meta/0x06` | Per-pipeline committed epoch history: epoch number, commit timestamp, frontier hash, shard count, row delta count. |
-| `rockstream.pipelines` | `control: catalog/pipeline` | Pipeline metadata, current state, SLO target, degraded reason if any. |
+| `rockstream.epochs` | `control: checkpoints/` + `shard_meta/0x06` | Per-view committed epoch history: epoch number, commit timestamp, frontier hash, shard count, row delta count. |
+| `rockstream.workloads` | `control: catalog/workload` | Workload metadata, resource policy, current quota utilisation, priority. |
 | `rockstream.views` | `control: catalog/view` | View definitions, retention policy, arrangement count, state bytes. |
 | `rockstream.shards` | `control: topology/` | Shard placement, worker assignment, frontier position, state size. |
 | `rockstream.connectors` | `control: connector/` | Connector status, latest committed offset, lag. |
@@ -2304,9 +2312,13 @@ FROM   rockstream.schema_history
 WHERE  view_id = 'orders_mv'
 ORDER  BY version DESC;
 
--- Current pipeline health at a glance
-SELECT pipeline_id, state, slo_compliance, degraded_reason
-FROM   rockstream.pipelines;
+-- Current workload health at a glance
+SELECT workload_name, memory_limit, memory_used_gb, priority
+FROM   rockstream.workloads;
+
+-- Per-view SLO compliance
+SELECT view_name, workload_name, state, slo_compliance, degraded_reason
+FROM   rockstream.views;
 ```
 
 These tables are available in all runtime profiles. In `embedded` mode they
@@ -3598,66 +3610,75 @@ migration step because there is no node-local state to migrate.
 The operator declares **what** they want; the control plane decides **how**:
 
 ```sql
-CREATE PIPELINE sales_pipeline
+-- Step 1: define a named resource policy (optional; views fall back to
+--         the schema's default workload, or the system default workload).
+CREATE WORKLOAD analytics
 WITH (
-    freshness_target_ms = 1000,        -- views must be ≤ 1 s stale
-    state_budget_gb     = 200,         -- pipeline may use ≤ 200 GB state
-    object_store_rps    = 5000,        -- soft cap on PUT+GET per second
-    priority            = normal       -- low | normal | high
-)
+    FRESHNESS_SLO  = '1s',        -- views must be ≤ 1 s stale
+    MEMORY_LIMIT   = '200GB',     -- soft cap on total arrangement state
+    PRIORITY       = normal       -- low | normal | high
+);
+
+-- Step 2: create sources and views, assigning them to the workload.
+CREATE SOURCE orders FROM kafka (...);
+
+CREATE MATERIALIZED VIEW sales_by_product
+WITH (WORKLOAD = analytics)
 AS
-    CREATE SOURCE orders FROM kafka (...);
+    SELECT product_id, SUM(quantity) AS qty
+    FROM   orders
+    GROUP BY product_id;
 
-    CREATE VIEW sales_by_product AS
-        SELECT product_id, SUM(quantity) AS qty
-        FROM   orders
-        GROUP BY product_id;
-
-    CREATE VIEW sales_by_region AS
-        SELECT region, SUM(quantity) AS qty
-        FROM   orders
-        GROUP BY region;
+CREATE MATERIALIZED VIEW sales_by_region
+WITH (WORKLOAD = analytics)
+AS
+    SELECT region, SUM(quantity) AS qty
+    FROM   orders
+    GROUP BY region;
 ```
 
-A pipeline may contain many sources and many views. The compiler builds one
-shared operator DAG so common subplans are maintained once and fanned out to
-multiple view sinks. `ALTER PIPELINE ... ADD VIEW` and `ALTER PIPELINE ...
-REPLACE VIEW` use the schema/plan replacement path from §4.2.
+Multiple views can share a workload. The compiler builds one shared operator
+DAG so common subplans are maintained once and fanned out to multiple view
+sinks. Omitting `WITH WORKLOAD` inherits the schema-level default
+(`ALTER SCHEMA ... SET DEFAULT WORKLOAD = name`). `CREATE REPLACEMENT
+MATERIALIZED VIEW v2 FOR v1` and `ALTER MATERIALIZED VIEW v1 APPLY
+REPLACEMENT v2` use the schema/plan replacement path from §4.2.
 
 The control plane auto-tunes the mechanism knobs (§14.6) to satisfy the
-SLO inside the quota. Operators do not normally set those knobs; they set
-intent. If the SLO cannot be met inside the quota, the pipeline transitions
-to a named degraded state (§14.10) instead of silently missing the target.
+SLO inside the workload's constraints. Operators do not normally set those
+knobs; they set intent. If the SLO cannot be met inside the constraints, the
+view transitions to a named degraded state (§14.10) instead of silently
+missing the target.
 
 ### 14.4 The One Signal: SLO Compliance
 
-For every pipeline the control plane reports a single rolling indicator:
+For every view the control plane reports a single rolling indicator:
 
 ```
-pipeline_slo_compliance{pipeline="sales_pipeline"}  =  0.0 .. 1.0
+view_slo_compliance{view="sales_by_product", workload="analytics"}  =  0.0 .. 1.0
 ```
 
 Value `1.0` means the freshness target has been met for the full window
 (default 5 min). Anything below is the fraction of time it was met. A single
-Grafana panel showing this number per pipeline is enough to answer "is the
-platform healthy?" without operator training.
+Grafana panel showing this number per view is enough to answer “is the
+platform healthy?” without operator training.
 
-When SLO compliance dips, the corresponding `pipeline_degraded_reason` label
+When SLO compliance dips, the corresponding `view_degraded_reason` label
 reports a named reason from §14.10. Drill-down metrics break the reason down
 by operator and shard.
 
 ### 14.5 Self-Tuning by Default
 
 Five control loops run continuously in the control plane. All five are on
-by default and can be disabled per pipeline (`autotune.* = off`) for audited
+by default and can be disabled per view (`autotune.* = off`) for audited
 manual control.
 
 | Loop | Adjusts | Trigger | Bounds |
 |---|---|---|---|
-| **Adaptive parallelism** | `operator.*.parallelism` | Operator `epoch_ms` p95 trends above SLO budget for > 30 s | `min_parallelism` ≤ N ≤ `max_parallelism` (per pipeline) |
+| **Adaptive parallelism** | `operator.*.parallelism` | Operator `epoch_ms` p95 trends above SLO budget for > 30 s | `min_parallelism` ≤ N ≤ `max_parallelism` (per workload) |
 | **Adaptive epoch sizing** | `min_epoch_ms`, `max_epoch_ms` | Object-store write rate trends above quota, or SLO compliance < target | Floor: 10 ms; ceiling: 5 s |
 | **Adaptive source throttle** | Per-connector `max_poll_bytes_per_epoch` | `frontier_lag_ms` trends above `freshness_target_ms * 1.5` for > 20 s, indicating ingestion is outpacing processing | Minimum 1 row/epoch; maximum = connector's native batch ceiling |
-| **Adaptive locality** | Operator placement and exchange path (`elided`, `loopback`, `direct`, `durable`) | Exchange serialization/network time is a material fraction of `epoch_ms`, or a small pipeline can fit on fewer workers without missing SLO | Never moves state outside quota; no placement that increases predicted p95 lag above SLO |
+| **Adaptive locality** | Operator placement and exchange path (`elided`, `loopback`, `direct`, `durable`) | Exchange serialization/network time is a material fraction of `epoch_ms`, or a small view can fit on fewer workers without missing SLO | Never moves state outside quota; no placement that increases predicted p95 lag above SLO |
 | **Adaptive skew splitting** | `operator.*.skew_buckets` for hot keys | Worst-shard load exceeds `hot_key_factor × median` for > 30 s | `1 ≤ B ≤ max_skew_buckets`; enabled only for operators with exact partial-state semantics |
 
 Every adjustment is recorded in the audit log (§14.11) with the metric
@@ -3667,17 +3688,17 @@ not opaque magic.
 ### 14.6 Manual Override Knobs
 
 For the cases auto-tuning cannot solve, the same primary knobs remain
-available as per-pipeline or per-operator overrides:
+available as per-view or per-operator overrides:
 
 | Knob | Auto default | When to override |
 |---|---|---|
 | `min_epoch_ms` | adaptive (10 ms–250 ms) | You have a known cost ceiling object storage cannot exceed. |
-| `max_epoch_ms` | = `freshness_target_ms / 2` | You want freshness tighter than what the SLO loop derives. |
+| `max_epoch_ms` | = `FRESHNESS_SLO / 2` | You want freshness tighter than what the SLO loop derives. |
 | `frontier_agg_interval` | 100 ms | Very large clusters (≥ 1000 shards) may relax to 500 ms. |
 | `operator.*.parallelism` | adaptive | `EXPLAIN INCREMENTAL` shows a specific operator stuck ⚠ and you want to pin it. |
 | `operator.*.skew_buckets` | adaptive | One logical key is hot and you want to pre-split it instead of waiting for detection. |
 
-Manual overrides are sticky and visible in `SHOW PIPELINE` output so the
+Manual overrides are sticky and visible in `SHOW VIEW STATUS` output so the
 next operator does not have to guess why a value was set.
 
 ### 14.7 The CLI Surface
@@ -3686,13 +3707,15 @@ Everything is one binary, one CLI:
 
 ```
 rockstream start           --role=all|control|worker|gateway
-rockstream pipeline {list, show, deploy, replace, pause, resume, drop}
-rockstream view     {list, show, query, subscribe}
+rockstream workload {list, show, create, alter, drop}
+rockstream view     {list, show, query, subscribe, pause, resume, status}
+rockstream schema   {list, show, create, drop}
+rockstream source   {list, show, pause, resume, drop}
 rockstream explain  <view> [--estimate]
 rockstream cluster  {status, workers, quotas}
 rockstream cluster  workers {list, drain, status}
-rockstream support  bundle [--pipeline=<name>]   # see §14.12
-rockstream audit    {tail, query}                # see §14.11
+rockstream support  bundle [--view=<name>]        # see §14.12
+rockstream audit    {tail, query}                 # see §14.11
 rockstream debug    arrangement <view> <op_id> <key>  # see §14.7.1
 ```
 
@@ -3725,7 +3748,7 @@ it plays from its `--role` flag and what it can see from its `--storage` URL.
 A single uniform binary makes packaging, image building, and version
 upgrades trivial.
 
-### 14.8 Diagnosing a Slow or Stuck Pipeline
+### 14.8 Diagnosing a Slow or Stuck View
 
 Run `rockstream explain <view>` (equivalently `EXPLAIN INCREMENTAL <view>`)
 to get a human-readable summary of the view's operator graph annotated with
@@ -3764,40 +3787,40 @@ produces a predicted operator tree with:
 - estimated state size per operator (from source-table statistics);
 - estimated steady-state object-store request rate;
 - estimated minimum frontier lag at the requested SLO;
-- whether the pipeline fits within its declared `state_budget_gb` and
-  `object_store_rps` quotas, and if not, by how much.
+- whether the view fits within its workload's declared `MEMORY_LIMIT`, and if
+  not, by how much.
 - **minimum achievable freshness through the DAG** — for views that depend
-  on upstream pipelines, the estimate propagates the upstream pipeline's
-  `freshness_target_ms` (or observed lag if already running) forward through
+  on upstream views, the estimate propagates the upstream view's
+  `FRESHNESS_SLO` (or observed lag if already running) forward through
   the dependency graph and reports the cumulative minimum lag at the leaf
-  view. If `pipeline B.freshness_target_ms = 100` but it depends on
-  `pipeline A` with `freshness_target_ms = 60000`, the estimate reports
+  view. If `view B` has `FRESHNESS_SLO = '100ms'` but it depends on
+  `view A` with `FRESHNESS_SLO = '60s'`, the estimate reports
   `minimum_achievable_lag_ms: 60100` and flags the SLO as **structurally
   unachievable** (`RS-4003 slo.downstream_lag_exceeds_target`). This
-  validation also runs at `CREATE PIPELINE` time: if the declared SLO is
-  below the minimum achievable lag from upstream dependencies, the pipeline
-  is created in `BLOCKED(RS-4003)` state rather than silently missing its
-  SLO.
+  validation also runs at `CREATE MATERIALIZED VIEW` time: if the declared
+  `FRESHNESS_SLO` is below the minimum achievable lag from upstream
+  dependencies, the view is created in `BLOCKED(RS-4003)` state rather
+  than silently missing its SLO.
 
 This is the single biggest operator surprise eliminated: nobody has to
 deploy a view to discover it needs 4 TB of arrangement state.
 
 ### 14.10 Named Degraded States
 
-When a pipeline cannot meet its SLO inside its quotas, it transitions to a
-**named** degraded state. The control plane never fails silently and never
+When a view cannot meet its SLO inside its workload's constraints, it transitions
+to a **named** degraded state. The control plane never fails silently and never
 drops data without an explicit, surfaced reason. States:
 
 | State | Meaning | Operator action |
 |---|---|---|
 | `HEALTHY` | SLO met, quota margin available. | None. |
-| `BACKFILLING` | Pipeline is loading historical source data. SLO compliance is not counted yet; `backfill_progress` is shown separately. | Wait or raise bootstrap parallelism/quota. |
+| `BACKFILLING` | View is loading historical source data. SLO compliance is not counted yet; `backfill_progress` is shown separately. | Wait or raise bootstrap parallelism/quota. |
 | `RECOVERING` | Worker or shard recovery is replaying from a checkpoint. SLO compliance is temporarily excluded from alerting until `recovery_deadline`. | Watch recovery progress; investigate only if deadline expires. |
 | `STRESSED` | SLO met, quota ≥ 80% utilised. | Plan capacity addition. |
-| `OVER_BUDGET_RELAXED` | SLO relaxed by the system because state budget is full. Freshness is degraded but data is correct. | Raise `state_budget_gb` or revise view to reduce state. |
+| `OVER_BUDGET_RELAXED` | SLO relaxed by the system because state budget is full. Freshness is degraded but data is correct. | Raise `MEMORY_LIMIT` on the workload or revise view to reduce state. |
 | `RPS_THROTTLED` | SLO relaxed because object-store quota is the bottleneck. | Raise `object_store_rps` or revise SLO. |
-| `PAUSED` | Pipeline explicitly paused, or paused by admission control to free capacity for higher-priority work. | Resume when ready. |
-| `BLOCKED` | A non-recoverable error (e.g. connector authentication, schema mismatch). | Inspect `pipeline_blocked_reason`; fix; resume. |
+| `PAUSED` | View explicitly paused (`PAUSE MATERIALIZED VIEW`), or paused by admission control to free capacity for higher-priority work. | Resume when ready. |
+| `BLOCKED` | A non-recoverable error (e.g. connector authentication, schema mismatch). | Inspect `view_blocked_reason`; fix; resume. |
 
 Every state transition is in the audit log (§14.11) with the metric or
 event that caused it. SLO compliance §14.4 dips together with the state
@@ -3810,18 +3833,18 @@ the control SlateDB:
 
 ```
 control: audit/{ulid} → {
-  timestamp, actor ("system" | user_id), action, target (pipeline/view),
+  timestamp, actor ("system" | user_id), action, target (workload/view/schema/source),
   before, after, reason, related_metric
 }
 ```
 
-Actions captured: pipeline deploy/replace/pause/resume/drop, autotuner
-parallelism change, autotuner epoch-size change, admission-control pause,
+Actions captured: view deploy/replace/pause/resume/drop, workload create/alter/drop,
+autotuner parallelism change, autotuner epoch-size change, admission-control pause,
 shard add/remove/rebalance, worker join/leave, checkpoint commit, degraded-
 state transition.
 
 `rockstream audit tail` follows the log; `rockstream audit query` supports
-filters by pipeline, time range, action type. The log is the single source
+filters by view, workload, time range, action type. The log is the single source
 of truth for "what changed in the cluster yesterday at 03:00 UTC?".
 
 ### 14.12 Support Bundle
@@ -3830,7 +3853,7 @@ One command collects everything needed to debug an issue without ad-hoc
 requests for logs, metrics, plans, and configs:
 
 ```
-rockstream support bundle --pipeline=sales_pipeline --since=1h --out=bundle.tar.gz
+rockstream support bundle --view=sales_by_product --since=1h --out=bundle.tar.gz
 ```
 
 Includes: pipeline definition, last N compiled plans, last N audit-log
@@ -3843,25 +3866,24 @@ default and cannot be overridden by config (only by an explicit CLI flag).
 
 ### 14.13 Quotas and Multi-Tenancy
 
-Every pipeline declares its resource envelope at creation. The control
-plane enforces these as hard caps:
+Every workload declares its resource policy at creation. The control
+plane enforces these as constraints on the views assigned to the workload:
 
-| Quota | Enforced by |
+| Knob | Enforced by |
 |---|---|
-| `state_budget_gb` | Sum of `op_state_bytes` across the pipeline; over-limit transitions to `OVER_BUDGET_RELAXED`. |
-| `object_store_rps` | Token-bucket admission on the shard commit path. |
-| `max_parallelism` | Upper bound for the adaptive-parallelism loop. |
-| `max_shards` | Upper bound on shards owned by this pipeline. |
-| `priority` | Used by admission control (§14.16) to choose which pipelines to pause first under contention. |
+| `MEMORY_LIMIT` | Sum of `op_state_bytes` across all views in the workload; over-limit transitions affected views to `OVER_BUDGET_RELAXED`. |
+| `MAX_PARALLELISM` | Upper bound for the adaptive-parallelism loop across the workload's views. |
+| `PRIORITY` | Used by admission control (§14.16) to choose which workload's views to pause first under contention. |
+| `FRESHNESS_SLO` | p99 freshness target; auto-tunes epoch sizing, parallelism, and scheduling across the workload's views. |
 
-Quotas are declared in `CREATE PIPELINE` and can be altered with
-`ALTER PIPELINE ... SET (...)`. They are visible in `SHOW PIPELINE` and in
-the audit log when changed.
+Resource policies are declared in `CREATE WORKLOAD` and can be altered with
+`ALTER WORKLOAD ... SET (...)`. They are visible in `SHOW WORKLOAD STATUS`
+and in the audit log when changed.
 
 ### 14.14 Error Code Taxonomy
 
 Every error returned to a user, written to a log, or recorded as a
-`pipeline_blocked_reason` carries a stable `RS-XXXX` code with a published
+`view_blocked_reason` carries a stable `RS-XXXX` code with a published
 doc URL. Examples (illustrative):
 
 ```
@@ -3891,9 +3913,9 @@ without a code is itself a bug.
 ### 14.15 Metrics Reference
 
 Every shard, operator instance, and pipeline reports:
-- `pipeline_slo_compliance` — the primary indicator (§14.4).
-- `pipeline_degraded_reason` — label when below 1.0 (§14.10).
-- `frontier_lag_ms` — raw lag, per pipeline.
+- `view_slo_compliance` — the primary indicator (§14.4).
+- `view_degraded_reason` — label when below 1.0 (§14.10).
+- `frontier_lag_ms` — raw lag, per view.
 - `backfill_progress` — for snapshot-mode connectors: `offsets_consumed / snapshot_end_offset` (both reported by the connector's `discover_stats()`). Undefined (omitted) for live-only connectors with no snapshot boundary.
 - `recovery_progress` — fraction of shards whose recovered epoch frontier ≥ the cluster checkpoint epoch.
 - `rows_in_per_sec`, `rows_out_per_sec` — throughput.
@@ -3907,7 +3929,7 @@ Every shard, operator instance, and pipeline reports:
 - `autotune_decisions_total` — counter labeled by `(loop, direction)`.
 - `segment_cache_hit_ratio` — per-worker hit rate for the arrangement segment cache.
 - `segment_cache_bytes_used` — current memory consumption of the segment cache.
-- `historical_query_count` — counter of `AS OF` queries served, labeled by pipeline.
+- `historical_query_count` — counter of `AS OF` queries served, labeled by view.
 
 Exported via Prometheus / OpenTelemetry. A starter Grafana dashboard ships
 in `deploy/dashboards/rockstream-overview.json` and contains exactly one
@@ -3922,12 +3944,12 @@ on a sibling's progress; only on its own credits and its own input
 frontier. This is the structural reason RockStream does not adopt Feldera's
 `DynamicScheduler` ownership model.
 
-Admission control sits in front of every `CREATE PIPELINE` and every
-autotuner expansion. It refuses requests that would push cluster
-utilisation past configured thresholds, and it pauses lower-priority
-pipelines when higher-priority ones request capacity that is otherwise
-unavailable. Both decisions are recorded in the audit log with the
-relevant metric readings.
+Admission control sits in front of every `CREATE MATERIALIZED VIEW`, every
+`CREATE WORKLOAD`, and every autotuner expansion. It refuses requests that
+would push cluster utilisation past configured thresholds, and it pauses
+lower-priority views (by workload priority) when higher-priority ones request
+capacity that is otherwise unavailable. Both decisions are recorded in the
+audit log with the relevant metric readings.
 
 ### 14.17 Failure Injection (`rockstream chaos`)
 

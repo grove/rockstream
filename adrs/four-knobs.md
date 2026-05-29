@@ -1,6 +1,6 @@
 # ADR: The Four Knobs — User-Facing Intent Declaration
 
-**Status**: Proposed  
+**Status**: Accepted  
 **Date**: 2026-05-29
 
 ---

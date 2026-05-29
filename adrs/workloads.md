@@ -1,6 +1,6 @@
 # ADR: Drop `CREATE PIPELINE` as a User-Facing Construct; Introduce Workloads
 
-**Status**: Proposed  
+**Status**: Accepted  
 **Date**: 2026-05-29
 
 ---

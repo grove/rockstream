@@ -1,6 +1,6 @@
 # ADR: View Lifecycle States and Backfill Visibility
 
-**Status**: Proposed  
+**Status**: Accepted  
 **Date**: 2026-05-29
 
 ---
