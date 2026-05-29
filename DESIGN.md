@@ -337,9 +337,14 @@ attempting them would compromise the rest of the design:
 
 - **Distributed IMMEDIATE / synchronous IVM.** pg_trickle's IMMEDIATE mode
   takes table-level locks and runs inside one PostgreSQL transaction; it does
-  not generalize to a sharded cluster. RockStream's default is deferred,
-  low-latency epochs. A restricted IMMEDIATE mode may exist for single-shard
-  scan chains, but cluster-wide synchronous IVM is not a goal.
+  not generalize to a sharded cluster. RockStream does not support IMMEDIATE
+  mode at any scope. The architecture has no write-transaction hook, no trigger
+  layer, and no global write-sequence number; there is no path to holding an
+  INSERT open across the connector, operator graph, and view commit without
+  compromising the async-scheduling (P14) and causal-time frontier (P13) model
+  the rest of the design depends on. A tight freshness SLO (50–200 ms) and
+  frontier-based diamond consistency cover the same practical requirements
+  without synchronous coupling.
 - **Global linearizable snapshots across all shards in the hot path.** Reads
   see a causally consistent vector frontier, not a single global LSN. Queries
   that demand global linearizability must opt in to a cluster checkpoint and

@@ -1840,7 +1840,7 @@ These run in parallel with every phase.
 | Frontier aggregator becomes a bottleneck | Async aggregation with bounded staleness budget; Phase 5 throughput test at thousands of shards × hundreds of operators. |
 | SQL incrementalization gaps | Use Feldera's compiler as semantic reference; use pg_trickle as oracle for edge cases; build a comprehensive SQL test corpus. |
 | pg_trickle semantics diverge from native runtime | Side-by-side oracle tests; store planner metadata explicitly; favor DBSP derivations where pg_trickle is PostgreSQL-specific. |
-| Distributed IMMEDIATE mode fights scale | Keep IMMEDIATE restricted to simple/single-shard cases; default to deferred low-latency epochs. |
+| Distributed IMMEDIATE / synchronous IVM | Not supported. Architecture has no write-transaction hook, trigger layer, or global write-sequence number; synchronous coupling would conflict with async scheduling (P14) and causal-time frontiers (P13). Use a tight freshness SLO (50–200 ms) instead. |
 | Feldera-style synchronous ownership scheduling rejects valid topologies | Use async, ownership-free per-worker scheduler; multi-consumer streams are normal; `DbReader` is the multi-reader path. |
 | Distributed recursion stalls or diverges | Per-iteration inner frontier, max-iteration cap, inner-frontier stall timeout, per-shard recompute fallback. |
 | Operator skew | Adaptive re-sharding in Phase 7; sub-key partitioning for extreme skew. |

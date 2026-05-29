@@ -134,7 +134,7 @@ Key observations from source:
   with documented EC-01 correctness fix.
 - **Delta source abstraction** (`DeltaSource`): `ChangeBuffer` (CDC tables
   filtered by LSN range) or `TransitionTable` (statement-trigger ephemeral
-  named relations for IMMEDIATE mode).
+  named relations used by pg_trickle's synchronous refresh path).
 - **DAG** (`src/dag.rs`): tracks dependencies between stream tables, supports
   nested ST-on-ST, includes scheduling (EDF, demand-driven cadence
   propagation) and diamond consistency groups.
@@ -185,8 +185,10 @@ scaling, recursion has stack-depth caveats.
   pattern-match against than a generic optimizer's plan node.
 - **Delta-source abstraction** (`DeltaSource::ChangeBuffer` vs
   `TransitionTable`). RockStream generalizes this to source deltas, view-output
-  deltas, and arrangement snapshots. Immediate transition-table semantics are
-  not a v1 distributed feature; deferred low-latency epochs are the default.
+  deltas, and arrangement snapshots. The `TransitionTable` variant is reference
+  material for understanding pg_trickle's correctness model; RockStream does not
+  expose synchronous transition-table semantics because there is no
+  write-transaction hook in the distributed architecture.
 - **Caching the *plan* with parameterized inputs**. pg_trickle's
   `__PGS_PREV_LSN_{oid}__` placeholders show how to compile-once-execute-many.
   We do the analogous thing with our physical plan: compile a query into a
@@ -402,9 +404,8 @@ pub enum PlanNode {
   the parent's required key.
 - Stateful nodes carry **semantic annotations** computed once by the compiler:
   monotonicity, whether they are inside SemiJoin/AntiJoin context, join depth,
-  whether an update changes key columns or only aggregate arguments, whether a
-  recursive term is non-monotone, and whether an operator is safe for immediate
-  row-exclusive maintenance. These annotations prevent every worker from
+  whether an update changes key columns or only aggregate arguments, and whether
+  a recursive term is non-monotone. These annotations prevent every worker from
   re-deriving subtle pg_trickle-style context locally.
 
 ---
@@ -907,21 +908,24 @@ non-question.
 ### 10.2 Stream-Level Cadence (Inspired by pg_trickle's DAG)
 
 pg_trickle exposes per-stream-table schedules (`1s`, `100ms`, `IMMEDIATE`,
-`CALCULATED`). RockStream keeps the cadence idea but changes the defaults:
+`CALCULATED`). RockStream keeps the cadence concept but uses three modes
+(IMMEDIATE is not supported — see below):
 
 - **DEFERRED LOW-LATENCY** (default): source connectors close frequent epochs
   (for example 10-100 ms) and the runtime drains them through the circuit.
   This preserves scale without distributed source-transaction coupling.
-- **IMMEDIATE** (restricted): supported only for simple, single-shard scan
-  chains unless a future distributed lock manager is added. pg_trickle's
-  transition-table mode and lock inference are valuable references, but a
-  cluster-wide transactional immediate mode would fight RockStream's scaling
-  goal.
 - **PERIODIC(d)**: produce one epoch per `d` ms; batches incoming data into
   that window for higher throughput.
 - **CALCULATED**: a downstream's cadence is the min of its consumer-facing
   views' cadences. This preserves pg_trickle's demand-driven scheduling idea
   while using RockStream frontiers for distributed consistency.
+
+IMMEDIATE mode is not supported. pg_trickle's IMMEDIATE relies on
+statement-level triggers that fire inside the write transaction — a mechanism
+that does not exist in RockStream's distributed architecture (no
+write-transaction hook, no trigger layer, no global write-sequence number).
+A tight freshness SLO (50–200 ms) and frontier-based diamond consistency
+cover the same practical requirements without synchronous coupling.
 
 The cadence is enforced by the source connector (it decides when to close an
 epoch and emit the deltas).
@@ -1265,8 +1269,7 @@ Adapt pg_trickle's TPC-H test suite (22 queries, 3 modes in the reference suite
 at SF=0.01). Required to pass:
 - 22 / 22 queries produce identical results to DataFusion batch.
 - All produce identical results across deferred differential mode and snapshot
-  bootstrap. Restricted IMMEDIATE mode is tested separately only for eligible
-  single-shard plans.
+  bootstrap.
 - ≥ 10× speedup over batch at 1% change rate.
 
 ### 14.4 Determinism Tests (DST-style)

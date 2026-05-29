@@ -735,18 +735,6 @@ seconds, the upstream runs at ten seconds. This avoids the situation
 where you over-maintain an upstream view "just in case" — the system
 figures out what's needed based on actual consumer requirements.
 
-**Immediate** mode is the strictest: the view updates synchronously
-within the writing transaction. This is what pg-trickle calls IMMEDIATE
-mode. RockStream supports it in a restricted form for views that fit on
-a single shard and have simple defining queries (scans, filters,
-projections — no joins or aggregates that span shards). The reason it's
-restricted is that true cluster-wide synchronous maintenance would
-require distributed locking, which would conflict with the scaling
-properties that make RockStream useful in the first place. For most
-workloads where you think you want IMMEDIATE, what you actually want is
-the diamond consistency guarantee that the default cadence already
-provides — covered in chapter 20.
-
 You usually don't set cadence directly. You set a freshness SLO and the
 system picks a cadence that meets it. The cadence shows up in
 diagnostics and `EXPLAIN INCREMENTAL` output, so you can see what the
@@ -944,24 +932,25 @@ coordination on every write. RockStream is built specifically to avoid
 those things, because they are what makes systems hard to scale beyond
 a single machine.
 
-RockStream therefore supports IMMEDIATE in a restricted form: views
-that fit on a single shard, with simple defining queries (no
-multi-shard joins, no global aggregates, nothing that requires shuffle).
-For these, the engine can offer synchronous freshness with single-shard
-locking. The query analyzer detects whether a view is eligible at
-`CREATE` time and refuses to mark it IMMEDIATE if it isn't.
+RockStream does not support IMMEDIATE mode. Unlike pg-trickle, there is no
+write-transaction hook in the distributed architecture — writes arrive through
+source connectors polling CDC logs, not through triggers that fire inside an
+open transaction. Holding an INSERT open across a connector process boundary,
+an async operator graph, and a view commit would require a write-transaction
+hook, a trigger layer, and a global write-sequence number: none of those exist,
+and adding them would be incompatible with the async scheduling and causal-time
+frontier model that the rest of the design depends on.
 
-For everything else, the right answer is not IMMEDIATE but the
-combination of a tight freshness SLO and the diamond consistency
-guarantee. If you set your SLO to a hundred milliseconds, the system
-delivers updates within a hundred milliseconds. If you use coordination
-groups (the diamond pattern), you get cross-view consistency. The
-practical difference between "synchronous immediate" and "asynchronous
-within 100 ms with cross-view consistency" is small for most workloads,
-and the scalability cost of the former is large. RockStream picks the
-trade-off that lets you scale; pg-trickle picks the trade-off that
-gives you the strongest single-machine semantics. Both are right for
-their use case.
+The right answer for workloads where you think you want IMMEDIATE is the
+combination of a tight freshness SLO and the diamond consistency guarantee. If
+you set your SLO to a hundred milliseconds, the system delivers updates within
+a hundred milliseconds. If you use coordination groups (the diamond pattern),
+you get cross-view consistency. The practical difference between "synchronous
+immediate" and "asynchronous within 100 ms with cross-view consistency" is
+small for most workloads, and the scalability cost of the former is large.
+RockStream picks the trade-off that lets you scale; pg-trickle picks the
+trade-off that gives you the strongest single-machine semantics. Both are right
+for their use case.
 
 ### 21. Bulk Loads and Source Gating
 
@@ -1517,14 +1506,13 @@ a slightly lower observed input rate when the engine is under pressure
 results to storage. Cadence is the knob between freshness and cost: more
 frequent commits mean fresher data but more per-row overhead; less
 frequent commits mean staler data but more work coalesced per commit.
-RockStream offers four modes. *Deferred low-latency* (the default)
+RockStream offers three modes. *Deferred low-latency* (the default)
 closes epochs as fast as the SLO requires, typically every ten to a few
 hundred milliseconds. *Periodic* closes epochs at a fixed wall-clock
 interval regardless of load. *Calculated* derives the cadence from what
 downstream consumers actually need, so you don't over-maintain an
-upstream view. *Immediate* commits synchronously within the writing
-transaction, available only for simple single-shard views. In practice
-you set a freshness SLO and let the system choose its cadence.
+upstream view. In practice you set a freshness SLO and let the system
+choose its cadence.
 
 **Change retention** — How long a view's change history is kept
 available for subscribers to resume from after a disconnect. When a
@@ -1818,29 +1806,26 @@ your data arrives in predictable bursts (nightly ETL loads, hourly
 batch jobs) and you'd rather amortize processing into one large commit
 than many tiny ones. Use *calculated* when you have a chain of views at
 different freshness levels — the upstream view runs at the cadence the
-strictest downstream consumer actually needs, not faster. Only reach for
-*immediate* if you have a strict read-your-writes requirement, your view
-definition is a simple single-shard query, and you've verified the
-planner accepts it as IMMEDIATE-eligible. For every other case, deferred
-low-latency plus a freshness SLO is the answer.
+strictest downstream consumer actually needs, not faster. For every
+other case, deferred low-latency plus a freshness SLO is the answer.
 
-**"Do I need IMMEDIATE mode?"**
+**"Does RockStream support IMMEDIATE mode?"**
 
-Probably not, and it's worth understanding why before reaching for it.
-IMMEDIATE mode commits a view update synchronously within the same
-transaction as the source write — the write doesn't return until the
-view is updated. This is only possible for views that fit entirely on
-one shard, with no cross-shard joins or global aggregates, because a
-true cluster-wide synchronous update would require distributed locking
-that would collapse throughput. If your reason for wanting IMMEDIATE is
-"I want fresh data fast," set a tight SLO of 50–200 ms instead; the
-asynchronous path delivers this without any restrictions on the query.
-If your reason is "I need cross-view consistency," coordination groups
-(the diamond pattern) give you that for free across any number of views.
-The genuine use case for IMMEDIATE is narrow: a single-shard view where
-the writing application must see its own write reflected in the view
-before the `INSERT` returns, with no tolerance for even a sub-second
-delay.
+No. IMMEDIATE mode (committing a view update synchronously within the
+same transaction as the source write) does not generalize to a
+distributed cluster. RockStream has no write-transaction hook — writes
+arrive through source connectors polling CDC logs, not through triggers
+that fire inside an open transaction. Adding that hook would require a
+global write-sequence number and synchronous coupling across the
+connector, operator graph, and view commit, which conflicts with the
+async-scheduling and causal-time frontier model the system is built on.
+See chapter 20 for the full explanation.
+
+If your reason for wanting IMMEDIATE is "I want fresh data fast," set a
+tight SLO of 50–200 ms instead; the asynchronous path delivers this
+without any restrictions on the query. If your reason is "I need
+cross-view consistency," coordination groups (the diamond pattern) give
+you that for free across any number of views.
 
 **"Should I use a materialized view or an inline view?"**
 
