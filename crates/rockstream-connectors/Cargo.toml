@@ -9,6 +9,7 @@ description = "Source and sink connector implementations for RockStream"
 [dependencies]
 rockstream-types = { workspace = true }
 async-trait = { workspace = true }
+rand = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

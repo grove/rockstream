@@ -2,6 +2,9 @@ use clap::{Parser, ValueEnum};
 use std::path::Path;
 use tracing_subscriber::EnvFilter;
 
+use rockstream_plan::{AggregateExpr, AggregateFunc, Expr, PlanNode};
+use rockstream_runtime::explain::render_explain;
+
 /// RockStream: Massively-parallel incremental view maintenance on SlateDB.
 #[derive(Parser, Debug)]
 #[command(name = "rockstream", version, about, long_about = None)]
@@ -37,6 +40,15 @@ enum Command {
         /// Role to run as.
         #[arg(long, default_value = "all", value_enum)]
         role: Role,
+    },
+    /// Print the operator graph with merge-law annotations for a view.
+    ///
+    /// Equivalent to `EXPLAIN INCREMENTAL <view>` (DESIGN.md §14.8).
+    /// Prints the merge law (`WeightAdd/v1`, `MaxRegister/v1`, etc.) or the
+    /// `not_merge_safe_reason` for every operator in the plan.
+    Explain {
+        /// View name to explain (e.g. `sales_by_product`).
+        view: String,
     },
     /// Print version information.
     Version,
@@ -105,6 +117,22 @@ async fn main() {
 
             println!("RockStream completed: {result:?}");
         }
+        Some(Command::Explain { view }) => {
+            // Build a representative demo plan that covers the merge-law
+            // annotations for SUM/COUNT/AVG/MIN/MAX.
+            // In a future version this will look up the view from the catalog.
+            let plan = PlanNode::Aggregate {
+                input: Box::new(PlanNode::Source { name: view.clone() }),
+                group_by: vec![Expr::Column(0)],
+                aggregates: vec![AggregateExpr {
+                    func: AggregateFunc::Sum,
+                    input: Expr::Column(1),
+                    distinct: false,
+                }],
+            };
+            let output = render_explain(&view, &plan);
+            print!("{output}");
+        }
         Some(Command::Version) => {
             println!("rockstream {}", env!("CARGO_PKG_VERSION"));
         }
@@ -147,5 +175,14 @@ mod tests {
     fn cli_no_args_succeeds() {
         let cli = Cli::try_parse_from(["rockstream"]).unwrap();
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn cli_parses_explain_subcommand() {
+        let cli = Cli::try_parse_from(["rockstream", "explain", "sales_by_product"]).unwrap();
+        match cli.command {
+            Some(Command::Explain { view }) => assert_eq!(view, "sales_by_product"),
+            _ => panic!("expected Explain command"),
+        }
     }
 }
