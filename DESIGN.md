@@ -5,7 +5,7 @@ system inspired by Feldera (DBSP), Materialize (Differential Dataflow), and Risi
 — built on a mesh of SlateDB instances backed by
 object storage.
 
-> **Status**: Design v3.26. v3 reframed the engine around DBSP-native operators
+> **Status**: Design v3.27. v3 reframed the engine around DBSP-native operators
 > with pg_trickle as a correctness oracle and SlateDB's real API surface as a
 > hard constraint. v3.1 added causal time, async scheduling, and explicit
 > SlateDB operational budgets. v3.2 added the operability foundation
@@ -228,8 +228,8 @@ object storage.
 > building blocks for materialized views, and schema abstraction. Ships v0.40.
 > Error codes `RS-1010`–`RS-1011` added. §5.7 and §12.1 updated.
 >
-> **v3.25 aligns user-facing terminology with four accepted ADRs** (adrs/workloads.md,
-> adrs/four-knobs.md, adrs/view-lifecycle.md, adrs/explain-levels.md): `CREATE PIPELINE`
+> **v3.25 aligns user-facing terminology with four accepted ADRs** (workloads,
+> four-knobs, view-lifecycle, explain-levels — now incorporated): `CREATE PIPELINE`
 > is removed from all user-visible surfaces and replaced by `CREATE WORKLOAD` (a named
 > resource policy declared separately) plus `CREATE MATERIALIZED VIEW ... WITH (WORKLOAD =
 > name)`. The CLI surface changes from “pipelines and views” to “workloads, schemas, views,
@@ -237,9 +237,9 @@ object storage.
 > §14.3, §14.4, §14.6–§14.7, §14.9–§14.13, and §14.16 updated throughout.
 >
 > **v3.26 integrates six accepted ergonomics and observability ADRs**
-> (adrs/first-run-ergonomics.md, adrs/observability-ergonomics.md,
-> adrs/subscribe-ergonomics.md, adrs/application-ergonomics.md,
-> adrs/dead-letter-queue.md, adrs/resource-usage-visibility.md):
+> (first-run-ergonomics, observability-ergonomics,
+> subscribe-ergonomics, application-ergonomics,
+> dead-letter-queue, resource-usage-visibility — now incorporated):
 > built-in `GENERATE ROWS` data source for zero-friction first run (§13.5.0);
 > backfill cost preview prompt before long DDL with `WITHOUT CONFIRMATION`
 > escape hatch (§14.9); subscribe API gains `CHANGE_RETENTION`, `AS OF NOW
@@ -253,6 +253,17 @@ object storage.
 > detection (§4.2); every `RS-XXXX` error must include a `next_steps` field
 > enforced in CI (§14.14); proactive NOTICE at 80% (`RS-5018`) and WARNING at
 > 95% (`RS-5019`) resource utilisation thresholds (§14.19).
+>
+> **v3.27 completes ADR coverage** with remaining gaps filled:
+> `EXPLAIN INCREMENTAL VERBOSE` and `ANALYZE` output levels (§14.8);
+> `BUILDING` and `REPLACING` lifecycle states in §14.10; `SHOW BACKFILL STATUS`,
+> `SHOW VIEW STATUS`, `SHOW REPLACEMENT STATUS` commands; `WAIT FOR
+> MATERIALIZED VIEW ... TO BE READY TIMEOUT` and `SET BACKGROUND_DDL = ON`
+> (§14.10); `ALTER SCHEMA ... PAUSE/RESUME`; `rockstream.write_fence()` cross-
+> session token and `/*+ ALLOW_STALE */` per-query hint (§12.8.1);
+> `ALTER ... DISCARD REPLACEMENT` (§4.2); `replay_attempt` counter and
+> `dlq_warn_threshold` configuration in DLQ surface (§13.3.1);
+> `workload_source` column in `rockstream.views` catalog.
 >
 > **Companion documents**:
 > - [IVM.md](IVM.md) — deep design of the incremental-view-maintenance engine
@@ -711,6 +722,29 @@ published frontier, backfill only state whose encoding changed, run old and new
 plans in parallel until the new plan reaches the old frontier, then flip query
 routing atomically in the catalog. This is the default mechanism for `ALTER
 VIEW`, join-key changes, and breaking source-schema updates.
+
+**Replacement lifecycle commands:**
+
+```sql
+-- Create a replacement that hydrates in the background
+CREATE REPLACEMENT MATERIALIZED VIEW v2 FOR reporting.daily_summary AS
+  SELECT ...;
+
+-- Monitor replacement progress
+SHOW REPLACEMENT STATUS FOR MATERIALIZED VIEW reporting.daily_summary;
+-- Columns: replacement_name, state, backfill_progress_pct, frontier_lag,
+--          estimated_ready_at
+
+-- Apply replacement atomically when ready
+ALTER MATERIALIZED VIEW reporting.daily_summary APPLY REPLACEMENT v2;
+
+-- Abandon a replacement (drops the shadow plan and its state)
+ALTER MATERIALIZED VIEW reporting.daily_summary DISCARD REPLACEMENT v2;
+```
+
+During replacement the original view continues serving queries at full SLO.
+The system transitions the view state to `REPLACING` (§14.10) and back to
+`HEALTHY` once `APPLY REPLACEMENT` completes.
 
 **Proactive schema evolution detection.** Operators can inspect upcoming
 incompatibilities before they block consumption:
@@ -2339,7 +2373,7 @@ through the standard SQL interface.
 |---|---|---|
 | `rockstream.epochs` | `control: checkpoints/` + `shard_meta/0x06` | Per-view committed epoch history: epoch number, commit timestamp, frontier hash, shard count, row delta count. |
 | `rockstream.workloads` | `control: catalog/workload` | Workload metadata, resource policy, current quota utilisation, priority. |
-| `rockstream.views` | `control: catalog/view` | View definitions, retention policy, arrangement count, state bytes. |
+| `rockstream.views` | `control: catalog/view` | View definitions, retention policy, arrangement count, state bytes, lifecycle state, `workload_source` (`view` \| `schema_default` \| `system_default`) indicating how the workload assignment was resolved. |
 | `rockstream.shards` | `control: topology/` | Shard placement, worker assignment, frontier position, state size. |
 | `rockstream.connectors` | `control: connector/` | Connector status, latest committed offset, lag. |
 | `rockstream.audit_log` | `control: audit/` | Recent audit events (bounded by a configurable window, default 7 days). |
@@ -2586,9 +2620,29 @@ vector frontier — exactly as if the client had passed the token explicitly.
   COMMITTED` / `REPEATABLE READ` or on connection close.
 
 **Opt-out.** A session can disable automatic wait-for with
-`SET rockstream.session_wait_for = off`. This is useful for analytical
+`SET rockstream.session_wait_for = off` (equivalently
+`SET session_read_after_write = OFF`). This is useful for analytical
 sessions that perform bulk reads after streaming ingestion and do not need
-read-your-writes.
+read-your-writes. A per-query escape hatch is also available:
+
+```sql
+SELECT /*+ ALLOW_STALE */ * FROM order_summary WHERE order_id = 42;
+```
+
+**Cross-session write fence.** For applications that need to pass a write
+token to a different session or service (e.g. a microservice that writes and
+then notifies a reader service):
+
+```sql
+-- Writer session: obtain a fence token after a write
+SELECT rockstream.write_fence() AS fence;
+
+-- Reader session: wait for that specific write to be visible
+SELECT * FROM order_summary WHERE rockstream.after_fence(:fence);
+```
+
+The manual token API remains available for cross-session consistency. Session-
+scoped read-after-write is the default experience for the common case.
 
 **No new distributed machinery.** Automatic session wait-for is purely
 gateway session bookkeeping. It reuses the existing `wait_for` code path;
@@ -2862,12 +2916,22 @@ SELECT * FROM rockstream_catalog.dead_letter_queue
 ```
 
 Columns: `arrived_at`, `source_name`, `source_offset`, `error_code`,
-`error_message`, `raw_bytes_hex`.
+`error_message`, `raw_bytes_hex`, `replay_attempt`.
 
-**Proactive alerting:** When a source accumulates 100+ DLQ entries per hour,
-the system emits `RS-1004 connector.dlq_growing` as a proactive warning
-(`NOTICE` level). This surfaces growing decode problems before they affect
-downstream freshness.
+The `replay_attempt` counter starts at 0 and increments each time a record
+is replayed via `ALTER SOURCE ... REPLAY DEAD_LETTER_QUEUE`. This lets
+operators distinguish fresh decode failures from records that have been
+retried multiple times.
+
+**Proactive alerting:** When a source accumulates DLQ entries exceeding
+`dlq_warn_threshold` per hour (default 100), the system emits
+`RS-1004 connector.dlq_growing` as a proactive warning (`NOTICE` level).
+This surfaces growing decode problems before they affect downstream freshness.
+
+```sql
+-- Configure per-source DLQ warning threshold
+ALTER SOURCE kafka_orders SET (dlq_warn_threshold = 50);
+```
 
 **Recovery commands:**
 
@@ -3873,6 +3937,10 @@ upgrades trivial.
 
 ### 14.8 Diagnosing a Slow or Stuck View
 
+`EXPLAIN INCREMENTAL` has three output levels plus a cost-preview mode:
+
+#### Level 1 — Default (human-readable summary)
+
 Run `rockstream explain <view>` (equivalently `EXPLAIN INCREMENTAL <view>`)
 to get a human-readable summary of the view's operator graph annotated with
 the latest per-operator statistics:
@@ -3892,6 +3960,32 @@ The `⚠` flags draw attention to operators whose `avg_epoch_ms` or
 shows the adaptive-parallelism loop is already responding. Operators almost
 never need to touch these manually; the value of the tree is *understanding
 what the system is doing*, not driving it.
+
+**Default output rules**: no internal IDs, no antichain notation, no raw byte
+counts. Human-readable units (GB, MB), ✓/⚠/✗ visual indicators for SLO
+compliance.
+
+#### Level 2 — VERBOSE (full plan with resource detail)
+
+```sql
+EXPLAIN INCREMENTAL VERBOSE reporting.daily_summary;
+```
+
+Adds merge-law annotations, combiner status, per-operator shard counts,
+parallelism utilisation, workload detail (memory used vs. limit), and frontier
+timestamps. This level is for operators diagnosing resource or performance
+issues who need to see law IDs, shard allocation, and workload attribution.
+
+#### Level 3 — ANALYZE (live runtime statistics)
+
+```sql
+EXPLAIN INCREMENTAL ANALYZE reporting.daily_summary;
+```
+
+Adds live per-operator statistics collected over the last 60 seconds: rows
+processed, state reads, RMW-avoidance ratio, hot groups, p99 latency, decode
+errors, and DLQ entries. This level requires a live round-trip to workers and
+may take slightly longer than other levels.
 
 ### 14.9 Cost Preview Before Deploy
 
@@ -3960,17 +4054,57 @@ drops data without an explicit, surfaced reason. States:
 | State | Meaning | Operator action |
 |---|---|---|
 | `HEALTHY` | SLO met, quota margin available. | None. |
+| `BUILDING` | View is performing initial backfill. Queryable (returns backfilled rows so far; may be incomplete). SLO compliance is not counted yet. | Wait; monitor with `SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>`. |
 | `BACKFILLING` | View is loading historical source data. SLO compliance is not counted yet; `backfill_progress` is shown separately. | Wait or raise bootstrap parallelism/quota. |
 | `RECOVERING` | Worker or shard recovery is replaying from a checkpoint. SLO compliance is temporarily excluded from alerting until `recovery_deadline`. | Watch recovery progress; investigate only if deadline expires. |
 | `STRESSED` | SLO met, quota ≥ 80% utilised. | Plan capacity addition. |
 | `OVER_BUDGET_RELAXED` | SLO relaxed by the system because state budget is full. Freshness is degraded but data is correct. | Raise `MEMORY_LIMIT` on the workload or revise view to reduce state. |
 | `RPS_THROTTLED` | SLO relaxed because object-store quota is the bottleneck. | Raise `object_store_rps` or revise SLO. |
 | `PAUSED` | View explicitly paused (`PAUSE MATERIALIZED VIEW`), or paused by admission control to free capacity for higher-priority work. | Resume when ready. |
+| `REPLACING` | A replacement view is hydrating via `CREATE REPLACEMENT MATERIALIZED VIEW`. The original continues serving. | Monitor with `SHOW REPLACEMENT STATUS FOR MATERIALIZED VIEW <name>`; apply with `ALTER ... APPLY REPLACEMENT` when ready; discard with `ALTER ... DISCARD REPLACEMENT`. |
 | `BLOCKED` | A non-recoverable error (e.g. connector authentication, schema mismatch). | Inspect `view_blocked_reason`; fix; resume. |
 
 Every state transition is in the audit log (§14.11) with the metric or
 event that caused it. SLO compliance §14.4 dips together with the state
 transition so the dashboard tells the same story.
+
+**View status commands:**
+
+```sql
+-- Status for one view (backfill progress, freshness, SLO, state)
+SHOW BACKFILL STATUS FOR MATERIALIZED VIEW reporting.daily_summary;
+
+-- Status for all views in a schema (shows state, SLO, workload, workload_source)
+SHOW VIEW STATUS FOR SCHEMA reporting;
+-- workload_source column: 'view' | 'schema_default' | 'system_default'
+-- indicating how the view's workload assignment was resolved.
+
+-- Status for all views in the cluster
+SHOW VIEW STATUS;
+
+-- Replacement readiness
+SHOW REPLACEMENT STATUS FOR MATERIALIZED VIEW reporting.daily_summary;
+```
+
+**Background DDL and waiting.** `CREATE MATERIALIZED VIEW` runs backfill in
+the background by default; the issuing session does not need to stay open.
+For sessions that want explicit background signalling:
+
+```sql
+SET BACKGROUND_DDL = ON;
+CREATE MATERIALIZED VIEW reporting.large_view AS SELECT ...;
+-- Returns immediately with an INFO message and job_id.
+
+-- Optionally wait for completion:
+WAIT FOR MATERIALIZED VIEW reporting.large_view TO BE READY TIMEOUT '1 hour';
+```
+
+**Schema-level lifecycle.** Pause or resume all views in a schema atomically:
+
+```sql
+ALTER SCHEMA reporting PAUSE;
+ALTER SCHEMA reporting RESUME;
+```
 
 ### 14.11 Audit Log
 

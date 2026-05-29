@@ -190,7 +190,7 @@ than dropping data or running out of memory, the engine asks the connector
 to slow down. The connector exposes a "credits available" signal: when
 credits are at zero, the connector stops fetching. When the downstream
 clears its backlog, credits replenish and the connector resumes. This same
-mechanism is what makes features like source gating (covered in chapter 20)
+mechanism is what makes features like source gating (covered in chapter 21)
 possible.
 
 The takeaway is that you don't usually think about connectors much. You
@@ -199,6 +199,35 @@ takes care of the rest. For getting started quickly, RockStream includes a
 built-in data generator (`CREATE SOURCE ... FROM GENERATE ROWS`) that
 produces synthetic rows without any external dependencies — you can have a
 working materialized view in under two minutes.
+
+**Dead-letter queue.** When a connector encounters a record it cannot
+decode — a malformed message, a schema mismatch, a corrupt payload — it
+doesn't crash or skip the record silently. The record is routed to a
+per-source **dead-letter queue** (DLQ), a catalog table you can query
+with regular SQL:
+
+```sql
+SELECT * FROM rockstream_catalog.dead_letter_queue
+  WHERE source_name = 'kafka_orders';
+```
+
+Each entry records the arrival time, source offset, error code, error
+message, the raw bytes (as hex), and a `replay_attempt` counter. You can
+replay failed records after fixing the underlying issue:
+
+```sql
+ALTER SOURCE kafka_orders REPLAY DEAD_LETTER_QUEUE SINCE '2026-05-01';
+```
+
+Or dismiss records you've confirmed are unrecoverable:
+
+```sql
+ALTER SOURCE kafka_orders DISMISS DEAD_LETTER_QUEUE WHERE error_code = 'RS-1003';
+```
+
+The system proactively warns you when DLQ entries accumulate beyond a
+configurable threshold (`dlq_warn_threshold`, default 100 per hour).
+This surfaces decode problems before they affect downstream freshness.
 
 ### 5. Deltas and Z-sets
 
@@ -441,14 +470,14 @@ to remember every row on each side, indexed by the join key, so it can
 look up matches when new rows arrive. A windowed aggregate needs to
 remember rows that haven't yet rolled out of the window. This state is
 the price you pay for incremental maintenance. It is bounded by your
-workload's memory limit (chapter 15), and the system reports how much
+workload's memory limit (chapter 16), and the system reports how much
 state each view consumes so you can plan.
 
 You can query a materialized view at the latest committed epoch or, in
 some cases, at a historical epoch using `AS OF EPOCH` syntax (covered in
-chapter 21). You can also subscribe to a view's output to receive a
-stream of changes as they happen, which is useful when you want to
-forward updates to external systems.
+chapter 22). You can also subscribe to a view's output to receive a
+stream of changes as they happen (chapter 14), which is useful when you
+want to forward updates to external systems.
 
 ### 11. Inline Views: Just Named Queries
 
@@ -608,11 +637,74 @@ automatically tracks the dependency graph and ensures the downstream
 sees a consistent snapshot. You write the SQL; the engine handles the
 consistency.
 
+### 14. Subscribing to View Changes
+
+A materialized view is not just something you query on demand. You can
+also **subscribe** to its output and receive a continuous stream of
+changes as they happen. This is useful when you want to forward updates
+to an external system (push notifications, a cache invalidation layer,
+a downstream Kafka topic) or when you want to build an application that
+reacts to data changes in real time.
+
+The interface uses standard SQL over the PostgreSQL wire protocol:
+
+```sql
+SUBSCRIBE revenue_by_region;
+```
+
+This opens a long-lived connection that streams rows to the client as the
+view updates. Each row includes the view's projected columns plus two
+metadata columns: `mz_timestamp` (the epoch at which the change was
+committed) and `mz_diff` (+1 for an insertion, -1 for a deletion).
+
+**Starting with a snapshot.** If you want the current state of the view
+followed by live updates, use:
+
+```sql
+SUBSCRIBE revenue_by_region AS OF NOW WITH SNAPSHOT;
+```
+
+This delivers the full current contents (as a batch of +1 rows) and then
+continues with live deltas. It's the subscribe equivalent of "give me
+everything, then keep me updated."
+
+**Resuming from a position.** If your subscriber disconnects and
+reconnects, it can resume from where it left off:
+
+```sql
+SUBSCRIBE revenue_by_region AS OF EPOCH 12345;
+```
+
+This skips everything before epoch 12345 and streams changes from there
+forward. How far back you can resume is controlled by the view's
+**change retention** (`CHANGE_RETENTION`, default 1 hour). If you try
+to resume from a position older than the retention window, you get an
+error (`RS-2005`) explaining that the data has been garbage-collected.
+
+**Server-side filtering.** You can push filtering to the server so you
+only receive the changes you care about:
+
+```sql
+SUBSCRIBE revenue_by_region WHERE region = 'NORTH';
+```
+
+Column projection works too — only named columns are sent over the wire.
+This reduces network traffic and client-side processing for subscribers
+that only need a subset of the view's output.
+
+**Retention configuration.** Set per-view at creation time:
+
+```sql
+CREATE MATERIALIZED VIEW revenue_by_region
+WITH (CHANGE_RETENTION = '4 hours')
+AS SELECT region, SUM(amount) FROM orders GROUP BY region;
+```
+
 ---
 
 ## Part 5 — Freshness and Cost
 
-### 14. Cadences: How Often Things Update
+### 15. Cadences: How Often Things Update
 
 The **cadence** is how often a workload closes epochs and propagates
 updates. It is the knob that controls how fresh your views are. Faster
@@ -653,14 +745,14 @@ require distributed locking, which would conflict with the scaling
 properties that make RockStream useful in the first place. For most
 workloads where you think you want IMMEDIATE, what you actually want is
 the diamond consistency guarantee that the default cadence already
-provides — covered in chapter 19.
+provides — covered in chapter 20.
 
 You usually don't set cadence directly. You set a freshness SLO and the
 system picks a cadence that meets it. The cadence shows up in
 diagnostics and `EXPLAIN INCREMENTAL` output, so you can see what the
 system chose, but you only override it when you have a specific reason.
 
-### 15. SLOs: Telling the System What You Want
+### 16. SLOs: Telling the System What You Want
 
 The key idea behind RockStream's operational interface is **intent-based
 configuration**. You don't tell the system how to do its job. You tell
@@ -710,7 +802,7 @@ This is the one number you put on a dashboard to answer "is my
 view healthy?" Drill-down metrics tell you what to look at if it
 dips, but the headline is always the same shape.
 
-### 16. Self-Tuning by Default
+### 17. Self-Tuning by Default
 
 Inside the SLO envelope, RockStream tunes itself. The mechanisms it
 adjusts include:
@@ -746,7 +838,7 @@ The philosophy is that tuning is the system's job, not yours, and
 overrides are escape hatches for the cases where you know something the
 system doesn't. In ordinary operation, you set an SLO and walk away.
 
-### 17. The Trade-Offs Triangle
+### 18. The Trade-Offs Triangle
 
 There are three things you can ask for in a streaming system: low
 latency, high throughput, and low cost. You can have any two, but not
@@ -769,7 +861,7 @@ If you want **high throughput and low cost**, you accept higher latency:
 a loose freshness SLO (say, one minute instead of one second) lets the
 system batch much more aggressively, amortize commits across larger
 units, and skip work that would otherwise be wasted. This is what
-periodic cadence (chapter 14) is for.
+periodic cadence (chapter 15) is for.
 
 RockStream's intent-based interface helps you make this trade-off
 consciously. You write down what you want — freshness target, state
@@ -780,9 +872,9 @@ they're not, you adjust your expectations, not the system's internals.
 
 ## Part 6 — When Things Get Interesting
 
-### 18. Diamond Consistency Without 2PC
+### 19. Diamond Consistency Without 2PC
 
-The diamond pattern came up briefly in chapter 8 and chapter 13. It
+The diamond pattern came up briefly in chapter 8 and chapter 14. It
 deserves its own chapter because it is one of the cases where RockStream
 quietly does something hard.
 
@@ -827,7 +919,7 @@ diamond — wherever two paths from a common source rejoin — RockStream
 quietly enforces consistency through frontiers. You don't write
 anything special. You just write the SQL and the engine handles it.
 
-### 19. IMMEDIATE Mode and What It Means in a Distributed World
+### 20. IMMEDIATE Mode and What It Means in a Distributed World
 
 Pg-trickle has an IMMEDIATE refresh mode that maintains a view
 synchronously within the same transaction as the source DML. When you
@@ -871,7 +963,7 @@ trade-off that lets you scale; pg-trickle picks the trade-off that
 gives you the strongest single-machine semantics. Both are right for
 their use case.
 
-### 20. Bulk Loads and Source Gating
+### 21. Bulk Loads and Source Gating
 
 A common operational problem: you need to load ten million historical
 rows into a base table. If your view is being maintained at a
@@ -919,7 +1011,7 @@ operational features like gating. The user-facing API is small and the
 underlying mechanism is the same one that handles backpressure in
 ordinary operation.
 
-### 21. Reading Historical Data
+### 22. Reading Historical Data
 
 A materialized view is a moving target. Most of the time you want the
 latest committed state, and that's what `SELECT * FROM my_view`
@@ -969,7 +1061,7 @@ optimized for analytical scans; it serves ad-hoc SQL over weeks or
 months of data. You usually want both: live for dashboards, cold for
 exploration.
 
-### 22. Recursive Queries and Graphs
+### 23. Recursive Queries and Graphs
 
 Some queries don't fit the straightforward "scan, filter, join,
 aggregate" mold. Transitive closure of a graph. Hierarchical roll-ups
@@ -1018,7 +1110,7 @@ the engine chose and how many iterations it took.
 
 ## Part 7 — Operations Without Drama
 
-### 23. The One Signal: SLO Compliance
+### 24. The One Signal: SLO Compliance
 
 If you only look at one metric for your view, it should be **SLO
 compliance**. This is a number between 0.0 and 1.0 that represents the
@@ -1044,7 +1136,7 @@ to do if it's not. The aim is that an on-call engineer with no specific
 RockStream training should be able to answer "is my workload healthy?"
 within ten seconds and "what's wrong?" within a minute.
 
-### 24. Failure and Recovery
+### 25. Failure and Recovery
 
 Things break. Workers crash. Networks partition. Object storage has
 brownouts. RockStream is designed to recover from all of these without
@@ -1082,7 +1174,7 @@ don't have to do anything; the system handles it. When you do need to
 intervene — say, to add capacity if a workload has outgrown the cluster
 — the documentation tells you exactly what action each reason calls for.
 
-### 25. Scaling Up, Scaling Down, Scaling Out
+### 26. Scaling Up, Scaling Down, Scaling Out
 
 The same RockStream binary serves three deployment tiers, and you can
 move between them additively without rewriting your configuration or
@@ -1120,7 +1212,7 @@ deployment, you deploy them to a single production host when you're
 ready, and you scale out to a cluster when the load demands it. The
 mental model and the SQL never change.
 
-### 26. Multi-Tenancy: Namespaces and Quotas
+### 27. Multi-Tenancy: Namespaces and Quotas
 
 If multiple teams share a cluster, you'll want each team's workloads to
 be isolated from the others. RockStream supports this through
@@ -1144,11 +1236,257 @@ For most single-team deployments, you don't need to think about
 namespaces; there's a default namespace and everything goes there. For
 multi-tenant deployments, namespaces are the boundary you administer.
 
+### 28. Schema Evolution and View Replacement
+
+Source schemas change over time. Columns get added, types get widened,
+fields get renamed. RockStream classifies each schema change and handles
+it accordingly:
+
+- **Compatible changes** (adding a nullable column, widening a numeric
+  type) are applied automatically. Existing arrangements keep their old
+  encoding; reads project the new column as NULL or a default until fresh
+  deltas rewrite the rows.
+- **Breaking changes** (rename, drop, narrow, change a join key type)
+  require explicit action. The view transitions to `BLOCKED(RS-1002)` and
+  stops consuming new offsets until the operator resolves the mismatch.
+
+For planned breaking changes, RockStream offers **zero-downtime view
+replacement**:
+
+```sql
+-- Create a replacement that hydrates in the background
+CREATE REPLACEMENT MATERIALIZED VIEW v2 FOR revenue_by_region AS
+  SELECT region, SUM(amount), COUNT(*) AS order_count
+  FROM   orders
+  GROUP  BY region;
+
+-- Monitor progress
+SHOW REPLACEMENT STATUS FOR MATERIALIZED VIEW revenue_by_region;
+
+-- Apply atomically when the replacement has caught up
+ALTER MATERIALIZED VIEW revenue_by_region APPLY REPLACEMENT v2;
+```
+
+During replacement, the original view continues serving queries at full
+SLO. The new view backfills in the background, running in parallel with
+the live version. Once the replacement's frontier catches up to the
+original's frontier, `APPLY REPLACEMENT` atomically swaps query routing.
+Subscribers see the new definition without reconnecting. If you change
+your mind, `ALTER MATERIALIZED VIEW ... DISCARD REPLACEMENT v2` abandons
+the shadow plan and frees its resources.
+
+**Proactive detection.** You can inspect upcoming incompatibilities before
+they block consumption:
+
+```sql
+SHOW SCHEMA_EVOLUTION STATUS FOR SCHEMA reporting;
+```
+
+When a connector detects an incompatible upstream schema change that hasn't
+yet been applied, the system emits a proactive `NOTICE` giving you time to
+prepare a replacement before consumption blocks.
+
+### 29. View Lifecycle States
+
+A materialized view isn't just "running" or "stopped." It has a rich
+lifecycle with named states that tell you exactly what's happening and
+what, if anything, you need to do. The system never fails silently;
+every transition has a name and a reason.
+
+| State | What it means | What to do |
+|---|---|---|
+| `HEALTHY` | SLO met, resources within budget. | Nothing. |
+| `BUILDING` | Initial backfill in progress. View is queryable but may be incomplete. | Wait; monitor with `SHOW BACKFILL STATUS`. |
+| `BACKFILLING` | Loading historical source data. SLO compliance not counted yet. | Wait or raise bootstrap parallelism. |
+| `RECOVERING` | Replaying from checkpoint after a worker restart. | Watch recovery progress. |
+| `STRESSED` | SLO met but quota ≥ 80% utilised. | Plan capacity addition. |
+| `OVER_BUDGET_RELAXED` | State budget full; freshness degraded to stay within limits. | Raise `MEMORY_LIMIT` or revise query. |
+| `RPS_THROTTLED` | Object-store quota is the bottleneck. | Raise `object_store_rps` or revise SLO. |
+| `PAUSED` | Explicitly paused by operator or by admission control. | Resume when ready. |
+| `REPLACING` | A replacement view is hydrating in the background. | Monitor with `SHOW REPLACEMENT STATUS`. |
+| `BLOCKED` | Non-recoverable error (auth failure, schema mismatch). | Inspect reason; fix; resume. |
+
+Every state transition is recorded in the audit log with the metric or
+event that caused it. The SLO compliance number dips together with the
+state transition so your dashboard tells the same story.
+
+You can query view lifecycle status at multiple levels:
+
+```sql
+SHOW VIEW STATUS;                              -- all views
+SHOW VIEW STATUS FOR SCHEMA reporting;         -- one schema
+SHOW BACKFILL STATUS FOR MATERIALIZED VIEW reporting.daily_summary;
+```
+
+The output includes the view's lifecycle state, freshness, SLO compliance,
+workload assignment, and how the workload was resolved (`workload_source`:
+`view`, `schema_default`, or `system_default`).
+
+### 30. Diagnosing Your Views
+
+When a view isn't performing as expected, `EXPLAIN INCREMENTAL` is your
+primary diagnostic tool. It has three output levels:
+
+**Level 1 — Default summary.** Shows the operator tree with per-operator
+statistics: epoch time, shuffle depth, merge law used, parallelism. Uses
+human-readable units (GB, MB) and visual indicators (✓/⚠/✗) for SLO
+compliance. No internal IDs or antichain notation.
+
+```sql
+EXPLAIN INCREMENTAL revenue_by_region;
+```
+
+**Level 2 — VERBOSE.** Adds merge-law annotations, combiner status,
+per-operator shard counts, parallelism utilisation, workload detail
+(memory used vs. limit), and frontier timestamps. For operators
+diagnosing resource or performance issues.
+
+```sql
+EXPLAIN INCREMENTAL VERBOSE revenue_by_region;
+```
+
+**Level 3 — ANALYZE.** Adds live per-operator runtime statistics
+collected over the last 60 seconds: rows processed, state reads,
+RMW-avoidance ratio, hot groups, p99 latency, decode errors, and DLQ
+entries. Requires a live round-trip to workers.
+
+```sql
+EXPLAIN INCREMENTAL ANALYZE revenue_by_region;
+```
+
+**Cost preview.** Before deploying a new view, you can estimate its cost
+without executing:
+
+```sql
+EXPLAIN INCREMENTAL ESTIMATE CREATE MATERIALIZED VIEW ...;
+```
+
+This reports predicted state size, per-operator epoch latency,
+object-store request rate, and minimum achievable frontier lag. When
+`CREATE MATERIALIZED VIEW` would require an expensive backfill, the
+system presents the cost estimate interactively and waits for
+confirmation. Add `WITHOUT CONFIRMATION` for CI/programmatic use.
+
+### 31. Session Ergonomics: Read-After-Write and Staleness
+
+RockStream is an eventually-consistent streaming system, but it defaults
+to **read-your-writes consistency** for the common OLTP case. When a
+session writes a row (via the internal source connector) and then
+queries a view that depends on that source, the system automatically
+waits for the view's frontier to advance past the written epoch before
+returning the query result. No application-level coordination needed.
+
+This is the default behavior. You write a row, you query the view, and
+your own write is visible. The system tracks this per-session via
+`session_wait_for`.
+
+**Opting out.** Analytical sessions that don't need read-your-writes can
+disable it:
+
+```sql
+SET rockstream.session_wait_for = off;
+```
+
+Or use a per-query hint for a single read:
+
+```sql
+SELECT /*+ ALLOW_STALE */ * FROM order_summary WHERE order_id = 42;
+```
+
+**Cross-session coordination.** When one service writes and a different
+service reads, use a write fence token:
+
+```sql
+-- Writer session: get a fence after writing
+SELECT rockstream.write_fence() AS fence;
+
+-- Pass 'fence' to the reader service via your application protocol
+
+-- Reader session: wait for that specific write
+SELECT * FROM order_summary WHERE rockstream.after_fence(:fence);
+```
+
+**Bounded staleness for analytics.** Sessions that accept a bounded-stale
+snapshot without blocking:
+
+```sql
+SET rockstream.max_staleness = '5s';
+```
+
+This disables implicit `wait_for` and accepts any snapshot within the
+given age. Useful for dashboards and analytical queries where "close
+enough" is fine and you don't want to block on frontier advancement.
+
+### 32. Resource Visibility and Alerts
+
+You can always see what your cluster's resources are doing. The system
+exposes resource usage through standard SQL:
+
+```sql
+-- Cluster-wide summary
+SHOW CLUSTER RESOURCE USAGE;
+
+-- Per-view detail
+SELECT * FROM rockstream_catalog.view_resource_usage
+  WHERE schema_name = 'reporting';
+
+-- Per-workload detail
+SELECT * FROM rockstream_catalog.workload_resource_usage;
+```
+
+**Proactive thresholds.** The system doesn't wait for you to check
+dashboards. When resource utilisation crosses warning or critical
+thresholds, it emits actionable notices:
+
+- At **80% utilisation**: `RS-5018` proactive `NOTICE` with the resource
+  that's approaching limits and suggested actions.
+- At **95% utilisation**: `RS-5019` `WARNING` indicating imminent
+  degradation.
+
+These fire automatically and appear in the SQL session, the audit log,
+and any configured alerting integration.
+
+**Actionable errors.** Every RockStream error code (`RS-XXXX`) includes a
+structured `next_steps` field — a human-readable description of what to
+do. You never get a raw error without guidance. The error tells you what
+happened, why it happened, and what to try next.
+
+### 33. Background DDL and Schema-Level Lifecycle
+
+`CREATE MATERIALIZED VIEW` runs backfill in the background by default.
+The session that issues the DDL does not need to stay open while the
+view hydrates. For explicit control:
+
+```sql
+SET BACKGROUND_DDL = ON;
+CREATE MATERIALIZED VIEW reporting.large_view AS SELECT ...;
+-- Returns immediately with an INFO message and job_id.
+```
+
+If you want to wait for a view to become ready (for example, in a
+migration script):
+
+```sql
+WAIT FOR MATERIALIZED VIEW reporting.large_view TO BE READY TIMEOUT '1 hour';
+```
+
+**Schema-level operations.** Pause or resume all views in a schema
+atomically:
+
+```sql
+ALTER SCHEMA reporting PAUSE;
+-- ... maintenance window, schema changes, bulk loads ...
+ALTER SCHEMA reporting RESUME;
+```
+
+This is more convenient than pausing views individually when you need to
+perform coordinated maintenance across a group of related views.
+
 ---
 
 ## Part 8 — Reference Material
 
-### 27. Glossary
+### 34. Glossary
 
 **Arrangement** — Indexed operator state, typically a key-value map of
 the data an operator needs to support incremental updates. The state of
@@ -1224,7 +1562,31 @@ Separate from frontiers, which track processing progress.
 **Z-set** — A multiset with integer weights. The data type that flows
 between operators in RockStream.
 
-### 28. Decision Trees
+**Change retention** — How long a view keeps its change history
+available for subscribers to resume from. Default 1 hour; configurable
+per view via `CHANGE_RETENTION`.
+
+**Dead-letter queue (DLQ)** — A per-source catalog table holding
+records that failed to decode. Queryable, replayable, dismissable.
+
+**Lifecycle state** — A named state (HEALTHY, BUILDING, BACKFILLING,
+RECOVERING, STRESSED, OVER_BUDGET_RELAXED, RPS_THROTTLED, PAUSED,
+REPLACING, BLOCKED) indicating what a view is doing and whether
+action is needed.
+
+**Subscribe** — A long-lived SQL connection that streams view changes
+to the client as they commit. Supports filtering, projection, and
+resumption from a past epoch.
+
+**View replacement** — Zero-downtime upgrade of a view's definition via
+`CREATE REPLACEMENT MATERIALIZED VIEW ... FOR ...`, followed by
+`APPLY REPLACEMENT` (or `DISCARD REPLACEMENT` to abandon).
+
+**Write fence** — A cross-session token obtained via
+`rockstream.write_fence()` that lets a reader wait for a specific
+write made by a different session.
+
+### 35. Decision Trees
 
 **"Should I create a new workload?"** Ask yourself: do these views need
 the same freshness target? Should they share a memory budget? Should
@@ -1259,7 +1621,29 @@ Pick the loosest SLO that meets your business requirement. "Dashboard
 that refreshes every 5 seconds" doesn't need a 100-ms SLO; one or two
 seconds is plenty.
 
-### 29. Further Reading
+**"Do I need a write fence?"** Only if you have cross-service
+coordination where service A writes and service B reads. For reads in
+the same session as the write, the default read-after-write behavior
+handles it automatically.
+
+**"Should I use SUBSCRIBE or poll with SELECT?"** Use SUBSCRIBE when
+you need push-based real-time updates (event-driven architecture, cache
+invalidation, streaming to Kafka). Use SELECT when you need point-in-time
+reads (dashboards, API responses, ad-hoc queries).
+
+**"When should I use view replacement vs. DROP + CREATE?"** Use
+replacement when you need zero-downtime schema changes and don't want
+subscribers to miss updates during the transition. Use DROP + CREATE
+when the view is non-critical and a brief gap in freshness is
+acceptable.
+
+**"How do I know if a view needs attention?"** Check `SHOW VIEW STATUS`.
+If the state is anything other than HEALTHY, the status output tells
+you what to do. For deeper diagnosis, run `EXPLAIN INCREMENTAL` at the
+appropriate level (default → VERBOSE → ANALYZE) depending on how much
+detail you need.
+
+### 36. Further Reading
 
 For the architectural deep dive, see [DESIGN.md](../DESIGN.md) — the
 authoritative description of the system, its principles, and the

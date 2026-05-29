@@ -402,6 +402,13 @@ join queries written as plain SQL.
   each operator's merge law, combiner eligibility, duplicate policy, compaction
   policy, and `not_merge_safe_reason` when the planner must use explicit
   arrangements.
+- **`EXPLAIN INCREMENTAL VERBOSE`** adds merge-law annotations, combiner
+  status, per-operator shard counts, parallelism utilisation, workload
+  detail (memory used vs. limit), and frontier timestamps.
+- **`EXPLAIN INCREMENTAL ANALYZE`** adds live per-operator statistics
+  collected over the last 60 seconds: rows processed, state reads, RMW-
+  avoidance ratio, hot groups, p99 latency, decode errors, and DLQ entries.
+  Requires a live round-trip to workers.
 - **`EXPLAIN INCREMENTAL ESTIMATE`** runs the planner and cost model
   *without* deploying; reports predicted state size, per-operator
   `epoch_ms`, object-store request rate, and minimum achievable frontier
@@ -982,9 +989,12 @@ production-ready.
 - **DLQ user surface** (DESIGN.md §13.3.1):
   - `rockstream_catalog.dead_letter_queue` catalog table exposes failed records
     with columns: `arrived_at`, `source_name`, `source_offset`, `error_code`,
-    `error_message`, `raw_bytes_hex`.
+    `error_message`, `raw_bytes_hex`, `replay_attempt`.
+  - `replay_attempt` starts at 0, increments on each `REPLAY` invocation.
   - `RS-1004 connector.dlq_growing` proactive warning emitted when a source
-    accumulates 100+ DLQ entries per hour.
+    accumulates entries exceeding `dlq_warn_threshold` per hour (default 100).
+  - `ALTER SOURCE <name> SET (dlq_warn_threshold = <n>)` configures per-source
+    threshold.
   - `ALTER SOURCE <name> REPLAY DEAD_LETTER_QUEUE [SINCE <ts> UNTIL <ts>]`
     re-decodes failed records after a schema fix or connector update.
   - `ALTER SOURCE <name> DISMISS DEAD_LETTER_QUEUE WHERE <predicate>` removes
@@ -1264,8 +1274,21 @@ binding.
   `CREATE REPLACEMENT MATERIALIZED VIEW v2 FOR v1 AS ...` creates a new view
   that backfills in parallel with the live view. `ALTER MATERIALIZED VIEW v1
   APPLY REPLACEMENT v2` atomically swaps query routing once the replacement
-  catches up to the live frontier. Subscribers to `v1` see the new definition
-  without reconnecting.
+  catches up to the live frontier. `ALTER MATERIALIZED VIEW v1 DISCARD
+  REPLACEMENT v2` abandons the shadow plan. `SHOW REPLACEMENT STATUS FOR
+  MATERIALIZED VIEW v1` reports progress. Subscribers to `v1` see the new
+  definition without reconnecting.
+- **Write fence and staleness hints** (DESIGN.md §12.8.1):
+  `rockstream.write_fence()` returns a cross-session fence token for
+  producer→consumer coordination. `SELECT /*+ ALLOW_STALE */ ...` opts out
+  of read-after-write for a single query without changing session settings.
+- **Background DDL and waiting** (DESIGN.md §14.10):
+  `SET BACKGROUND_DDL = ON` makes `CREATE MATERIALIZED VIEW` return
+  immediately. `WAIT FOR MATERIALIZED VIEW ... TO BE READY TIMEOUT '...'`
+  blocks until the view reaches HEALTHY or the timeout expires.
+- **Schema-level lifecycle** (DESIGN.md §14.10):
+  `ALTER SCHEMA ... PAUSE` / `ALTER SCHEMA ... RESUME` pause or resume all
+  views in a schema atomically.
 
 ---
 
