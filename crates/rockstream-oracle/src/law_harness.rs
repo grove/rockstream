@@ -38,16 +38,14 @@ pub fn check_law_properties(law: &dyn LawBundle, values: &[Vec<u8>]) {
             let left = law.merge(&id, v).expect("merge(identity, v) failed");
             assert_eq!(
                 &left, v,
-                "Left identity violated: merge(id, v) != v for {:?}",
-                v
+                "Left identity violated: merge(id, v) != v for {v:?}"
             );
 
             // Right identity: merge(v, identity) == v
             let right = law.merge(v, &id).expect("merge(v, identity) failed");
             assert_eq!(
                 &right, v,
-                "Right identity violated: merge(v, id) != v for {:?}",
-                v
+                "Right identity violated: merge(v, id) != v for {v:?}"
             );
         }
     }
@@ -64,8 +62,7 @@ pub fn check_law_properties(law: &dyn LawBundle, values: &[Vec<u8>]) {
                     .expect("merge(b, a) failed");
                 assert_eq!(
                     ab, ba,
-                    "Commutativity violated for values[{}] and values[{}]",
-                    i, j
+                    "Commutativity violated for values[{i}] and values[{j}]"
                 );
             }
         }
@@ -87,8 +84,7 @@ pub fn check_law_properties(law: &dyn LawBundle, values: &[Vec<u8>]) {
             assert_eq!(
                 ab_c,
                 a_bc,
-                "Associativity violated for values[{}..={}]",
-                i,
+                "Associativity violated for values[{i}..={}]",
                 i + 2
             );
         }
@@ -100,8 +96,7 @@ pub fn check_law_properties(law: &dyn LawBundle, values: &[Vec<u8>]) {
             let merged = law.merge(v, v).expect("merge(a, a) failed");
             assert_eq!(
                 &merged, v,
-                "Idempotence violated: merge(a, a) != a for {:?}",
-                v
+                "Idempotence violated: merge(a, a) != a for {v:?}"
             );
         }
     }
@@ -127,8 +122,7 @@ pub fn check_identity_discrimination(law: &dyn LawBundle, non_identity_values: &
     for v in non_identity_values {
         assert!(
             !law.is_identity(v),
-            "is_identity incorrectly returned true for {:?}",
-            v
+            "is_identity incorrectly returned true for {v:?}"
         );
     }
 }
