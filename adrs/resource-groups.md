@@ -1,6 +1,6 @@
 # ADR: Drop `CREATE PIPELINE` as a User-Facing Construct; Introduce Resource Groups
 
-**Status**: Accepted  
+**Status**: Proposed  
 **Date**: 2026-05-29
 
 ---
