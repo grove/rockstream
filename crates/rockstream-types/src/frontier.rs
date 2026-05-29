@@ -55,7 +55,7 @@ impl<T: Ord + Clone> Antichain<T> {
     /// Insert an element, maintaining the antichain invariant.
     pub fn insert(&mut self, elem: T) {
         // Remove any elements that are >= the new element.
-        self.elements.retain(|e| !(elem <= *e));
+        self.elements.retain(|e| elem > *e);
         // Only insert if no existing element is <= the new one.
         if !self.elements.iter().any(|e| *e <= elem) {
             self.elements.push(elem);

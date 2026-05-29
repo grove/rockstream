@@ -8,3 +8,6 @@ description = "Batch reference engine and property-test harness for RockStream c
 
 [dependencies]
 rockstream-types = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
