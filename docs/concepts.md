@@ -944,10 +944,12 @@ frontier model that the rest of the design depends on.
 The right answer for workloads where you think you want IMMEDIATE is the
 combination of a tight freshness SLO and the diamond consistency guarantee. If
 you set your SLO to a hundred milliseconds, the system delivers updates within
-a hundred milliseconds. If you use coordination groups (the diamond pattern),
-you get cross-view consistency. The practical difference between "synchronous
-immediate" and "asynchronous within 100 ms with cross-view consistency" is
-small for most workloads, and the scalability cost of the former is large.
+a hundred milliseconds. Because every multi-input operator enforces frontier
+alignment automatically, you get cross-view consistency for free wherever your
+view graph joins two branches that share a common upstream. The practical
+difference between "synchronous immediate" and "asynchronous within 100 ms with
+cross-view consistency" is small for most workloads, and the scalability cost
+of the former is large.
 RockStream picks the trade-off that lets you scale; pg-trickle picks the
 trade-off that gives you the strongest single-machine semantics. Both are right
 for their use case.
@@ -1538,18 +1540,20 @@ what's on the other end. RockStream ships built-in connectors for Kafka,
 PostgreSQL CDC, S3, Iceberg, and an internal direct-write path.
 Third-party connectors can be built against the published SDK.
 
-**Coordination group** — A set of views that the engine treats as a
-single consistency unit, ensuring that a query joining them always sees
-all of them at the same epoch. The classic case is the diamond pattern:
-two views both read from the same upstream source, and a third view
-joins those two. Without coordination, the third view could see the
-first intermediate view at epoch 42 and the second at epoch 41, mixing
-data from different instants. With a coordination group, the third view
-waits until both intermediates have published a frontier of at least 42
-before processing epoch 42. This is enforced automatically by the
-frontier protocol — the engine detects the diamond in the view
-dependency graph and enforces the invariant without any user
-configuration.
+**Coordination group** — The structural consistency guarantee the engine
+enforces when a downstream view joins two or more views that share a
+common upstream source (the diamond pattern). The classic case: two
+views both read from the same upstream source, and a third view joins
+those two. Without coordination, the third view could see one
+intermediate at epoch 42 and the other at epoch 41, mixing data from
+different instants. RockStream enforces the invariant automatically
+through the frontier protocol: a multi-input operator computes the meet
+(minimum) of all its input frontiers and will not process epoch 42
+until every input has published a frontier of at least 42. This is a
+structural property of every multi-input operator, not a user-declared
+API or configuration option. There is no `CREATE COORDINATION GROUP`
+syntax; you write the SQL and the guarantee follows from the operator
+graph.
 
 **Dead-letter queue (DLQ)** — A per-source safety net for records that
 failed to decode. When a connector encounters a message it can't parse
@@ -1822,10 +1826,11 @@ async-scheduling and causal-time frontier model the system is built on.
 See chapter 20 for the full explanation.
 
 If your reason for wanting IMMEDIATE is "I want fresh data fast," set a
-tight SLO of 50–200 ms instead; the asynchronous path delivers this
+tight SLO of 50–200 ms instead; the asynchronous path delivers this
 without any restrictions on the query. If your reason is "I need
-cross-view consistency," coordination groups (the diamond pattern) give
-you that for free across any number of views.
+cross-view consistency," the diamond consistency guarantee (structural
+frontier alignment) gives you that for free across any number of views
+without any user configuration.
 
 **"Should I use a materialized view or an inline view?"**
 

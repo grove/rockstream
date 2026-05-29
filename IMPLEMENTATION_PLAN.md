@@ -521,10 +521,10 @@ standard for analytical workloads.
 
 - Add `ViewRef` PlanNode that subscribes to an upstream view's CDC stream
   (the upstream view's `view_output/` namespace via SlateDB `WalReader`).
-- Model pg_trickle's `dag.rs` semantics: per-stream-table cadence inheritance,
-  diamond-consistency groups (`atomic` mode where all members of a diamond
-  refresh together at the same epoch boundary, enforced by the frontier
-  protocol).
+- Model pg_trickle's `dag.rs` semantics: per-stream-table cadence inheritance.
+  Diamond consistency requires no additional mechanism — it is structural:
+  every multi-input operator's frontier meet enforces it automatically.
+  There is no explicit group API to implement.
 - Cycle detection during plan compilation (Kahn's algorithm).
 - Test: 5-level chain of views; each one is delta-driven by its parent.
   Verify cadence propagation matches pg_trickle reference behaviour.

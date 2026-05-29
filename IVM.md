@@ -194,8 +194,10 @@ scaling, recursion has stack-depth caveats.
   We do the analogous thing with our physical plan: compile a query into a
   fixed circuit; each epoch only changes the input batches.
 - **DAG with cascade scheduling**. pg_trickle's `dag.rs` cleanly models stream
-  tables depending on stream tables with diamond consistency. Our cluster
-  scheduler imports the same model.
+  tables depending on stream tables with diamond consistency via explicit
+  `DiamondConsistency::Atomic` groups. RockStream achieves the same guarantee
+  structurally: every multi-input operator's frontier meet enforces it
+  automatically, with no explicit group concept or user API.
 
 ### From Feldera DBSP — the *runtime*
 
@@ -930,14 +932,18 @@ cover the same practical requirements without synchronous coupling.
 The cadence is enforced by the source connector (it decides when to close an
 epoch and emit the deltas).
 
-### 10.3 Diamond Consistency Groups (also from pg_trickle)
+### 10.3 Diamond Consistency via the Frontier Protocol
 
 When two views share an upstream base table and a third view joins those two
 views, the third view sees a *consistent snapshot* only if both upstream
-refreshes finish before the join is computed. pg_trickle's `DiamondConsistency::Atomic`
-groups them in a SAVEPOINT. We achieve the same via the frontier protocol:
-the join operator waits for both inputs' frontiers to reach the same epoch
-before processing.
+refreshes finish before the join is computed. pg_trickle solves this by having
+users declare a `DiamondConsistency::Atomic` group, which wraps the refreshes
+in a shared SAVEPOINT. RockStream has no equivalent API. Instead, diamond
+consistency is a structural property: the join operator computes the meet of
+all its input frontiers and will not process epoch *N* until every input has
+published a frontier of *N* or higher. This is unconditional — it applies to
+every multi-input operator regardless of whether its inputs share ancestry. No
+explicit group needs to be declared; you write the SQL and the invariant holds.
 
 ### 10.4 Per-Shard Adaptive Cost Model
 
@@ -1195,7 +1201,8 @@ This expands [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) Phases 2 and 3
 
 - Implement `ViewRef` PlanNode that subscribes to an upstream view's CDC.
 - Model pg_trickle's DAG semantics with native frontier coordination: cadence
-  propagation, diamond consistency groups, and cycle rejection.
+  propagation, diamond consistency (structural via frontier meet — no explicit
+  group API), and cycle rejection.
 - Test: 5-level chain of views; each one is delta-driven by its parent.
 
 ### Milestone IVM-12: Lateral / Set-Returning Functions
