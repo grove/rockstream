@@ -2,6 +2,14 @@
 //!
 //! Implements the DBSP soundness theorem assertion:
 //! `incremental(query, deltas) == batch(query, accumulated)`
+//!
+//! Also provides the **law property-test harness**: a generic test suite that
+//! every `LawBundle` implementation must pass to be considered correct. The
+//! harness verifies associativity, commutativity, identity, idempotence
+//! (where declared), serialization round-trip, and fail-closed malformed
+//! operand handling.
+
+pub mod law_harness;
 
 #[cfg(test)]
 mod tests {

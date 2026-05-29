@@ -3,8 +3,8 @@
 //! Consumes and discards all batches. Used in the no-op pipeline to prove
 //! the system starts, runs, and shuts down cleanly.
 
-use async_trait::async_trait;
 use crate::sink::{Sink, SinkBatch};
+use async_trait::async_trait;
 use rockstream_types::timestamp::Epoch;
 
 /// A sink that discards all records.
@@ -72,11 +72,13 @@ mod tests {
         sink.write_batch(&SinkBatch {
             record_count: 0,
             epoch: 0,
-        }).await;
+        })
+        .await;
         sink.write_batch(&SinkBatch {
             record_count: 0,
             epoch: 1,
-        }).await;
+        })
+        .await;
         assert_eq!(sink.batches_written(), 2);
     }
 

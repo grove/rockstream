@@ -1,7 +1,10 @@
 //! Merge law types for the IVM arrangement layer.
 //!
-//! Defines the `MergeLawId`, `MergeLawVersion`, and `LawProperties` types
-//! that every arrangement operator and stored value must reference.
+//! Defines the `MergeLawId`, `MergeLawVersion`, `LawProperties`, and the
+//! `LawBundle` trait that every registered law must implement. The trait
+//! encodes algebraic properties (associativity, commutativity, idempotence)
+//! and provides the merge/identity operations used by the storage layer,
+//! exchange combiners, and compaction.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -61,6 +64,96 @@ pub enum DuplicatePolicy {
     Reject,
     /// Last writer wins (only for non-associative fallback).
     LastWriterWins,
+}
+
+/// Compaction policy for arrangement state managed by a law.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactionPolicy {
+    /// Standard merge-on-compaction (applies the law's merge function).
+    MergeOnCompact,
+    /// Tombstone GC: remove entries that reach the identity element.
+    TombstoneGc,
+    /// Retain all versions (no compaction reduction).
+    RetainAll,
+}
+
+/// The core trait that all registered merge laws must implement.
+///
+/// A `LawBundle` encapsulates the algebraic operations and metadata for a
+/// merge law. It is the single source of truth consumed by the storage merge
+/// operator, exchange combiners, the planner, `EXPLAIN INCREMENTAL`, and
+/// compaction filters.
+pub trait LawBundle: Send + Sync + 'static {
+    /// Unique identifier for this law in the catalog.
+    fn id(&self) -> MergeLawId;
+
+    /// Current version of this law implementation.
+    fn version(&self) -> MergeLawVersion;
+
+    /// Human-readable name (e.g. "WeightAdd", "SumCount", "MaxRegister").
+    fn name(&self) -> &'static str;
+
+    /// Algebraic properties of the merge function.
+    fn properties(&self) -> LawProperties;
+
+    /// Classification of this law.
+    fn class(&self) -> MergeLawClass;
+
+    /// Duplicate handling policy.
+    fn duplicate_policy(&self) -> DuplicatePolicy;
+
+    /// Compaction policy.
+    fn compaction_policy(&self) -> CompactionPolicy;
+
+    /// The identity element serialized to bytes.
+    /// Returns `None` if no identity exists (rare — most laws have one).
+    fn identity(&self) -> Option<Vec<u8>>;
+
+    /// Merge two operands. Both `left` and `right` are raw value bytes
+    /// (without the arrangement header). Returns the merged result.
+    ///
+    /// # Errors
+    /// Returns an error string if the operands are malformed.
+    fn merge(&self, left: &[u8], right: &[u8]) -> Result<Vec<u8>, String>;
+
+    /// Returns true if the given value equals the identity element.
+    /// Used by `TombstoneGc` compaction to reclaim space.
+    fn is_identity(&self, value: &[u8]) -> bool;
+
+    /// A short reason string if this law does NOT support merge-safe reads
+    /// (i.e., read-modify-write can be avoided). Returns `None` if it does.
+    fn not_merge_safe_reason(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// Descriptor for a registered law (used in catalogs and `EXPLAIN` output).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LawDescriptor {
+    pub id: MergeLawId,
+    pub version: MergeLawVersion,
+    pub name: String,
+    pub class: MergeLawClass,
+    pub properties: LawProperties,
+    pub duplicate_policy: DuplicatePolicy,
+    pub compaction_policy: CompactionPolicy,
+    pub idempotent: bool,
+}
+
+impl LawDescriptor {
+    /// Build a descriptor from a `LawBundle` implementation.
+    pub fn from_bundle(bundle: &dyn LawBundle) -> Self {
+        Self {
+            id: bundle.id(),
+            version: bundle.version(),
+            name: bundle.name().to_owned(),
+            class: bundle.class(),
+            properties: bundle.properties(),
+            duplicate_policy: bundle.duplicate_policy(),
+            compaction_policy: bundle.compaction_policy(),
+            idempotent: bundle.properties().idempotent,
+        }
+    }
 }
 
 /// Header prepended to stored arrangement values.

@@ -2,8 +2,8 @@
 //!
 //! Passes batches through without transformation. Used in the no-op pipeline.
 
-use async_trait::async_trait;
 use crate::operator::Operator;
+use async_trait::async_trait;
 use rockstream_types::batch::{SinkBatch, SourceBatch};
 use rockstream_types::timestamp::Epoch;
 

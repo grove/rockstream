@@ -2,13 +2,14 @@
 //!
 //! This crate defines core types used across the RockStream system:
 //! timestamps, frontiers, Z-set rows, schema definitions, identity types,
-//! batch types, merge-law descriptors, and audit events.
+//! batch types, merge-law descriptors, law implementations, and audit events.
 
 pub mod audit;
 pub mod batch;
 pub mod error_code;
 pub mod frontier;
 pub mod ids;
+pub mod laws;
 pub mod merge_law;
 
 /// Timestamp types.
