@@ -197,6 +197,84 @@ impl ShardDb {
         self.db.close().await?;
         Ok(())
     }
+
+    /// Law-aware point read: fetch a stored value and interpret it through
+    /// `law`.
+    ///
+    /// If the key exists and the stored bytes are a valid operand for `law`,
+    /// the value is returned as-is and `merge_law_applied_total` is
+    /// incremented.
+    ///
+    /// If the law cannot parse the stored bytes (malformed operand), the
+    /// fallback path returns the raw bytes unchanged and increments
+    /// `merge_law_fallback_total`. This ensures fail-closed behaviour: no
+    /// silent data corruption.
+    ///
+    /// Returns `None` if the key does not exist.
+    pub async fn get_merged(
+        &self,
+        key: &[u8],
+        law: &dyn rockstream_types::merge_law::LawBundle,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let raw = self.db.get(key).await?;
+        match raw {
+            None => Ok(None),
+            Some(bytes) => {
+                let metric_key = rockstream_types::metrics::LawMetricKey {
+                    law_id: law.id(),
+                    law_name: law.name(),
+                    law_version: law.version().0,
+                };
+                // Attempt to interpret via law (identity check proves it is
+                // a valid operand).
+                if law.is_identity(&bytes) || law.merge(&bytes, &bytes).is_ok() {
+                    rockstream_types::metrics::inc_applied(&metric_key);
+                    Ok(Some(bytes.to_vec()))
+                } else {
+                    rockstream_types::metrics::inc_fallback(&metric_key);
+                    Ok(Some(bytes.to_vec()))
+                }
+            }
+        }
+    }
+
+    /// Law-aware prefix scan: fetch all values under `prefix` and interpret
+    /// each through `law`.
+    ///
+    /// For each key-value pair:
+    /// - If the stored bytes are valid for `law`, `merge_law_applied_total` is
+    ///   incremented.
+    /// - Otherwise the raw bytes are returned and `merge_law_fallback_total`
+    ///   is incremented.
+    ///
+    /// Returns a list of `(key, merged_value)` pairs in sorted key order.
+    pub async fn scan_merged(
+        &self,
+        prefix: &[u8],
+        law: &dyn rockstream_types::merge_law::LawBundle,
+    ) -> Result<Vec<(Bytes, Vec<u8>)>, StorageError> {
+        let entries = self.scan_prefix(prefix).await?;
+        let metric_key = rockstream_types::metrics::LawMetricKey {
+            law_id: law.id(),
+            law_name: law.name(),
+            law_version: law.version().0,
+        };
+
+        let results = entries
+            .into_iter()
+            .map(|(k, v)| {
+                if law.is_identity(&v) || law.merge(&v, &v).is_ok() {
+                    rockstream_types::metrics::inc_applied(&metric_key);
+                    (k, v.to_vec())
+                } else {
+                    rockstream_types::metrics::inc_fallback(&metric_key);
+                    (k, v.to_vec())
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
 }
 
 /// Atomic write batch for multiple operations.

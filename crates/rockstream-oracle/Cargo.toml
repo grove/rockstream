@@ -7,8 +7,11 @@ license.workspace = true
 description = "Batch reference engine and property-test harness for RockStream correctness"
 
 [dependencies]
+arrow = { workspace = true }
+datafusion = { workspace = true }
 rockstream-types = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+tokio = { workspace = true }

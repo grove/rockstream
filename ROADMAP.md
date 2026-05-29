@@ -67,6 +67,7 @@ complete:
   reporting current fill level, and a backpressure or error path when the
   bound is reached. Unbounded in-memory accumulation is never acceptable.
 - Main remains runnable through the single `rockstream` binary.
+- A sign-off file `sign-offs/vX.Y.md` exists with all checklist items marked, confirming the Proof criteria were verified. Run `make approve VERSION=X.Y` to generate the template; CI blocks merging a `✅ Done` marker if the sign-off is missing or has unchecked items.
 
 Long soaks are gates, not loopholes. If a version needs a 24-hour or 30-day run,
 the engineering work still fits the version budget, but the version is not

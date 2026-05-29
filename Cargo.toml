@@ -26,9 +26,11 @@ repository = "https://github.com/trickle-labs/rockstream"
 
 [workspace.dependencies]
 # Shared workspace dependencies
+arrow = "54"
 async-trait = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+datafusion = "53"
 object_store = "0.12"
 parking_lot = "0.12"
 proptest = "1"
