@@ -7,10 +7,11 @@
 //! - **Commutativity**: `merge(a, b) == merge(b, a)`
 //! - **Identity**: `merge(a, identity) == a` and `merge(identity, a) == a`
 //! - **Idempotence** (where declared): `merge(a, a) == a`
-//! - **Serialization round-trip**: `identity` encodes/decodes consistently
+//! - **Serialization round-trip**: `LawDescriptor` round-trips through JSON;
+//!   identity bytes are stable across multiple calls.
 //! - **Fail-closed**: malformed input returns `Err`, never panics
 
-use rockstream_types::merge_law::LawBundle;
+use rockstream_types::merge_law::{LawBundle, LawDescriptor};
 
 /// Run all algebraic property checks against a law with the given test values.
 ///
@@ -107,6 +108,53 @@ pub fn check_law_properties(law: &dyn LawBundle, values: &[Vec<u8>]) {
         // We expect Err OR Ok (if the law handles arbitrary sizes).
         // The key invariant: it must NOT panic.
         let _ = law.merge(bad, bad);
+    }
+
+    // Serialization round-trip: LawDescriptor must serde round-trip correctly,
+    // and identity bytes must be stable.
+    check_serialization_round_trip(law);
+}
+
+/// Verify that a law's `LawDescriptor` survives a JSON serialization round-trip
+/// and that the identity bytes are stable across multiple calls.
+///
+/// This ensures that the law's metadata can be persisted, replicated, and
+/// reconstructed without loss — a requirement for catalog storage and
+/// `EXPLAIN INCREMENTAL` output.
+pub fn check_serialization_round_trip(law: &dyn LawBundle) {
+    // LawDescriptor serde round-trip
+    let desc = LawDescriptor::from_bundle(law);
+    let json = serde_json::to_string(&desc).expect("LawDescriptor must serialize to JSON");
+    let decoded: LawDescriptor =
+        serde_json::from_str(&json).expect("LawDescriptor must deserialize from JSON");
+    assert_eq!(
+        desc,
+        decoded,
+        "LawDescriptor serde round-trip failed for law '{}'",
+        law.name()
+    );
+
+    // Identity bytes are stable across multiple calls
+    if law.properties().has_identity {
+        let id1 = law
+            .identity()
+            .expect("has_identity=true but identity() returned None (first call)");
+        let id2 = law
+            .identity()
+            .expect("has_identity=true but identity() returned None (second call)");
+        assert_eq!(
+            id1, id2,
+            "identity() must return the same bytes on every call"
+        );
+
+        // Identity bytes themselves serde round-trip as Vec<u8>
+        let id_json = serde_json::to_string(&id1).expect("identity bytes must serialize to JSON");
+        let id_rt: Vec<u8> =
+            serde_json::from_str(&id_json).expect("identity bytes must deserialize from JSON");
+        assert_eq!(
+            id1, id_rt,
+            "identity bytes must survive a serde JSON round-trip"
+        );
     }
 }
 
