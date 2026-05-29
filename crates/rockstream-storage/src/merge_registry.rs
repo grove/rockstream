@@ -14,6 +14,10 @@ pub enum MergeTag {
     Sum = 0x01,
     /// Associative count: values are u64 (big-endian).
     Count = 0x02,
+    /// Semilattice MAX: values are i64 (big-endian), merged by `max(a, b)`.
+    MaxRegister = 0x03,
+    /// Semilattice MIN: values are i64 (big-endian), merged by `min(a, b)`.
+    MinRegister = 0x04,
 }
 
 /// A merge operator that performs associative sum and count operations.
@@ -75,6 +79,24 @@ impl MergeOperator for SumCountMergeOperator {
                 out.extend_from_slice(&result.to_be_bytes());
                 Ok(Bytes::from(out))
             }
+            t if t == MergeTag::MaxRegister as u8 => {
+                let a = i64::from_be_bytes(existing[1..9].try_into().unwrap());
+                let b = i64::from_be_bytes(value[1..9].try_into().unwrap());
+                let result = a.max(b);
+                let mut out = Vec::with_capacity(9);
+                out.push(MergeTag::MaxRegister as u8);
+                out.extend_from_slice(&result.to_be_bytes());
+                Ok(Bytes::from(out))
+            }
+            t if t == MergeTag::MinRegister as u8 => {
+                let a = i64::from_be_bytes(existing[1..9].try_into().unwrap());
+                let b = i64::from_be_bytes(value[1..9].try_into().unwrap());
+                let result = a.min(b);
+                let mut out = Vec::with_capacity(9);
+                out.push(MergeTag::MinRegister as u8);
+                out.extend_from_slice(&result.to_be_bytes());
+                Ok(Bytes::from(out))
+            }
             _ => {
                 // Fail-closed: unknown tag (RS-3009).
                 Err(MergeOperatorError::Callback {
@@ -122,6 +144,38 @@ impl MergeOperatorRegistry {
             return None;
         }
         Some(u64::from_be_bytes(data[1..9].try_into().ok()?))
+    }
+
+    /// Encode a max-register value for merge operations.
+    pub fn encode_max(value: i64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(9);
+        out.push(MergeTag::MaxRegister as u8);
+        out.extend_from_slice(&value.to_be_bytes());
+        out
+    }
+
+    /// Decode a max-register value from merged bytes.
+    pub fn decode_max(data: &[u8]) -> Option<i64> {
+        if data.len() < 9 || data[0] != MergeTag::MaxRegister as u8 {
+            return None;
+        }
+        Some(i64::from_be_bytes(data[1..9].try_into().ok()?))
+    }
+
+    /// Encode a min-register value for merge operations.
+    pub fn encode_min(value: i64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(9);
+        out.push(MergeTag::MinRegister as u8);
+        out.extend_from_slice(&value.to_be_bytes());
+        out
+    }
+
+    /// Decode a min-register value from merged bytes.
+    pub fn decode_min(data: &[u8]) -> Option<i64> {
+        if data.len() < 9 || data[0] != MergeTag::MinRegister as u8 {
+            return None;
+        }
+        Some(i64::from_be_bytes(data[1..9].try_into().ok()?))
     }
 }
 
