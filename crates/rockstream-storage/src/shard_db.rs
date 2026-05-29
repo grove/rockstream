@@ -215,6 +215,45 @@ impl ShardDb {
         Ok(())
     }
 
+    /// Write a value with a prepended 4-byte `ArrangementHeader`.
+    ///
+    /// The stored format is: `[header:4][value_bytes]`.
+    /// This enables `get_arrangement_header` to recover `(law_id, law_version)`
+    /// from any arrangement key without loading the full value.
+    ///
+    /// Used by aggregate arrangements (`0xAG` key prefix) to record which
+    /// law governs the stored state.
+    pub async fn put_with_arrangement_header(
+        &self,
+        key: &[u8],
+        header: ArrangementHeader,
+        value: &[u8],
+    ) -> Result<(), StorageError> {
+        let mut stored = Vec::with_capacity(ArrangementHeader::WIRE_SIZE + value.len());
+        stored.extend_from_slice(&header.encode());
+        stored.extend_from_slice(value);
+        self.put(key, &stored).await
+    }
+
+    /// Read back the `ArrangementHeader` stored with `put_with_arrangement_header`.
+    ///
+    /// Returns `None` if the key does not exist or the stored value is shorter
+    /// than the 4-byte header.
+    pub async fn get_arrangement_header(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<ArrangementHeader>, StorageError> {
+        let raw = self.db.get(key).await?;
+        match raw {
+            None => Ok(None),
+            Some(bytes) if bytes.len() < ArrangementHeader::WIRE_SIZE => Ok(None),
+            Some(bytes) => {
+                let buf: [u8; 4] = bytes[..4].try_into().unwrap();
+                Ok(Some(ArrangementHeader::decode(&buf)))
+            }
+        }
+    }
+
     /// Law-aware point read: fetch a stored value and interpret it through
     /// `law`.
     ///

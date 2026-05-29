@@ -9,6 +9,7 @@
 //! (where declared), serialization round-trip, and fail-closed malformed
 //! operand handling.
 
+pub mod aggregate_oracle;
 pub mod batch_oracle;
 pub mod law_harness;
 

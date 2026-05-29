@@ -684,3 +684,48 @@ async fn scan_merged_fallback_increments_fallback_metric() {
 
     db.close().await.unwrap();
 }
+
+// === Arrangement Header Tests ===
+
+/// Verifies that `put_with_arrangement_header` stores the header prefix and
+/// `get_arrangement_header` reads it back correctly.
+#[tokio::test]
+async fn arrangement_header_stored_and_read_back() {
+    use rockstream_types::laws::sum_count::{encode_sum_count, SUM_COUNT_ID, SUM_COUNT_VERSION};
+    use rockstream_types::merge_law::ArrangementHeader;
+
+    let (db, _) = test_shard_db("test/arr_header_stored").await;
+    let key = b"AG/group_42";
+    let header = ArrangementHeader {
+        law_id: SUM_COUNT_ID,
+        law_version: SUM_COUNT_VERSION,
+    };
+    let value = encode_sum_count(100, 5);
+
+    db.put_with_arrangement_header(key, header, &value)
+        .await
+        .unwrap();
+
+    let recovered = db.get_arrangement_header(key).await.unwrap();
+    assert!(recovered.is_some(), "header must be present after write");
+    let h = recovered.unwrap();
+    assert_eq!(h.law_id, SUM_COUNT_ID, "law_id must match SumCount ID");
+    assert_eq!(
+        h.law_version, SUM_COUNT_VERSION,
+        "law_version must match SumCount version"
+    );
+
+    db.close().await.unwrap();
+}
+
+/// Verifies that `get_arrangement_header` returns `None` for a missing key.
+#[tokio::test]
+async fn arrangement_header_missing_key_returns_none() {
+    let (db, _) = test_shard_db("test/arr_header_none").await;
+    let result = db
+        .get_arrangement_header(b"AG/nonexistent_key")
+        .await
+        .unwrap();
+    assert!(result.is_none(), "missing key must return None");
+    db.close().await.unwrap();
+}
