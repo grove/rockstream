@@ -346,9 +346,7 @@ async fn scheduler_yield_ratio_nonzero_for_oversized_epoch() {
     assert_eq!(yield_counter.epoch_count(), 1, "one epoch was processed");
     assert!(
         yield_counter.yield_epoch_count() > 0,
-        "epoch with {} rows (quantum {}) must record a yield",
-        batch_row_count,
-        quantum
+        "epoch with {batch_row_count} rows (quantum {quantum}) must record a yield",
     );
     assert!(
         yield_counter.yield_ratio() > 0.0,
