@@ -108,7 +108,7 @@ pub fn reset_all() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::merge_law::{MergeLawId, MergeLawVersion};
+    use crate::merge_law::MergeLawId;
 
     fn key() -> LawMetricKey {
         LawMetricKey {
