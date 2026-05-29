@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -29,3 +30,22 @@ jobs:
         run: cargo test --workspace
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
+
+  release-version-check:
+    name: Version / tag alignment
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Cargo.toml version matches git tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "Git tag version : $TAG"
+          echo "Cargo.toml version: $CARGO_VERSION"
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "ERROR: git tag v$TAG does not match Cargo.toml version $CARGO_VERSION"
+            echo "Run: make release VERSION=$TAG"
+            exit 1
+          fi
+          echo "OK: versions match"

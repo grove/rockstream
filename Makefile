@@ -46,6 +46,19 @@ e2e: build
 	@echo "=== e2e PASSED ==="
 	@rm -rf /tmp/rockstream-e2e-test
 
+# Bump the workspace version, commit, tag, and push.
+# Usage: make release VERSION=0.5.0
+release:
+	@test -n "$(VERSION)" || (echo "ERROR: VERSION is required. Usage: make release VERSION=0.5.0" && exit 1)
+	@echo "=== Releasing v$(VERSION) ==="
+	@sed -i '' 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml
+	@cargo check --workspace -q
+	@git add Cargo.toml Cargo.lock
+	@git commit -m "Release v$(VERSION)"
+	@git tag -a "v$(VERSION)" -m "Release v$(VERSION)"
+	@git push && git push --tags
+	@echo "=== Released v$(VERSION) ==="
+
 # Clean build artifacts
 clean:
 	cargo clean
