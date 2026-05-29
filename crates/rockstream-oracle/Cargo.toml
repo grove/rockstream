@@ -15,3 +15,6 @@ serde_json = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 tokio = { workspace = true }
+rockstream-ops = { workspace = true }
+rockstream-storage = { workspace = true }
+object_store = { workspace = true }

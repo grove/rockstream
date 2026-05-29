@@ -3,6 +3,7 @@
 //! Each IVM operator (filter, project, aggregate, join, etc.) implements
 //! the `Operator` trait defined here.
 
+pub mod aggregate;
 pub mod epoch_output;
 pub mod filter;
 pub mod map;
