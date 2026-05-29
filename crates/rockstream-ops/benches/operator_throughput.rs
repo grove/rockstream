@@ -23,10 +23,9 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 
 use rockstream_ops::aggregate::{AggregateMergeOp, GroupFn, MeasureFn};
 use rockstream_ops::filter::FilterOperator;
-use rockstream_ops::min_max::MinMaxOp;
+use rockstream_ops::min_max::{GroupFn as MinMaxGroupFn, MinMaxKind, MinMaxOp, ScalarFn};
 use rockstream_ops::operator::Operator;
 use rockstream_types::batch::{ZSet, ZSetBatch};
-use rockstream_types::ids::OperatorId;
 
 // ---------------------------------------------------------------------------
 // Row generation helpers
@@ -70,9 +69,7 @@ fn bench_filter_1m_in_memory(c: &mut Criterion) {
         b.iter(|| {
             let mut op = FilterOperator::new("bench_filter", predicate.clone());
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                black_box(op.process_delta(black_box(&batch)).await)
-            })
+            rt.block_on(async { black_box(op.process_delta(black_box(&batch)).await) })
         })
     });
 
@@ -91,9 +88,8 @@ fn bench_group_by_sum_200k_in_memory(c: &mut Criterion) {
     group.throughput(Throughput::Elements(row_count));
 
     // Group key: first 4 bytes of the key (gives ~256 groups for 200k rows).
-    let group_fn: GroupFn = Arc::new(|key: &[u8], _value: &[u8]| {
-        key.get(..4).unwrap_or(key).to_vec()
-    });
+    let group_fn: GroupFn =
+        Arc::new(|key: &[u8], _value: &[u8]| key.get(..4).unwrap_or(key).to_vec());
     // Measure: value as i64.
     let measure_fn: MeasureFn = Arc::new(|_key: &[u8], value: &[u8]| {
         let v = if value.len() >= 8 {
@@ -106,15 +102,9 @@ fn bench_group_by_sum_200k_in_memory(c: &mut Criterion) {
 
     group.bench_function("200k rows", |b| {
         b.iter(|| {
-            let mut op = AggregateMergeOp::new(
-                "bench_sum",
-                group_fn.clone(),
-                measure_fn.clone(),
-            );
+            let mut op = AggregateMergeOp::new("bench_sum", group_fn.clone(), measure_fn.clone());
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                black_box(op.process_delta(black_box(&batch)).await)
-            })
+            rt.block_on(async { black_box(op.process_delta(black_box(&batch)).await) })
         })
     });
 
@@ -134,11 +124,18 @@ fn bench_group_by_min_100k_in_memory(c: &mut Criterion) {
 
     group.bench_function("100k rows", |b| {
         b.iter(|| {
-            let mut op = MinMaxOp::new_min("bench_min", OperatorId(0));
+            let group_fn: MinMaxGroupFn =
+                Arc::new(|key: &[u8], _value: &[u8]| key.get(..4).unwrap_or(key).to_vec());
+            let scalar_fn: ScalarFn = Arc::new(|_key: &[u8], value: &[u8]| {
+                if value.len() >= 8 {
+                    i64::from_be_bytes(value[..8].try_into().unwrap_or([0u8; 8]))
+                } else {
+                    0
+                }
+            });
+            let mut op = MinMaxOp::new("bench_min", MinMaxKind::Min, group_fn, scalar_fn);
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                black_box(op.process_delta(black_box(&batch)).await)
-            })
+            rt.block_on(async { black_box(op.process_delta(black_box(&batch)).await) })
         })
     });
 
