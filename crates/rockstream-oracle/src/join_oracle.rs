@@ -210,7 +210,322 @@ impl JoinOracle {
     }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
+// ─── OuterJoinOracle ──────────────────────────────────────────────────────────
+
+/// Produce an output `(key, value)` from an unmatched row (null-padded).
+pub type NullCombineFn = Arc<dyn Fn(&[u8], &[u8]) -> (Vec<u8>, Vec<u8>) + Send + Sync + 'static>;
+
+/// Internal index type: join_key → [(row_key, row_value, weight)].
+type JoinIdx<'a> = HashMap<Vec<u8>, Vec<(&'a Vec<u8>, &'a Vec<u8>, i64)>>;
+
+/// Batch reference oracle for outer-join, semi-join, and anti-join correctness.
+///
+/// Computes the ground-truth materialized result for a given join type by
+/// scanning all accumulated left and right state. Used in property tests.
+pub struct OuterJoinOracle {
+    /// Left accumulated state: (key, value) → cumulative weight.
+    left_state: HashMap<(Vec<u8>, Vec<u8>), i64>,
+    /// Right accumulated state: (key, value) → cumulative weight.
+    right_state: HashMap<(Vec<u8>, Vec<u8>), i64>,
+    left_key_fn: JoinKeyFn,
+    right_key_fn: JoinKeyFn,
+    combine_fn: CombineFn,
+    /// For LEFT/FULL: produces null-padded output for unmatched left rows.
+    null_right_fn: Option<NullCombineFn>,
+    /// For RIGHT/FULL: produces null-padded output for unmatched right rows.
+    null_left_fn: Option<NullCombineFn>,
+}
+
+impl OuterJoinOracle {
+    /// Create a new `OuterJoinOracle`.
+    pub fn new(
+        left_key_fn: JoinKeyFn,
+        right_key_fn: JoinKeyFn,
+        combine_fn: CombineFn,
+        null_right_fn: Option<NullCombineFn>,
+        null_left_fn: Option<NullCombineFn>,
+    ) -> Self {
+        Self {
+            left_state: HashMap::new(),
+            right_state: HashMap::new(),
+            left_key_fn,
+            right_key_fn,
+            combine_fn,
+            null_right_fn,
+            null_left_fn,
+        }
+    }
+
+    /// Apply a left-side delta.
+    pub fn apply_left_delta(&mut self, delta: &ZSet) {
+        for row in delta.iter() {
+            *self
+                .left_state
+                .entry((row.key.clone(), row.value.clone()))
+                .or_insert(0) += row.weight;
+        }
+    }
+
+    /// Apply a right-side delta.
+    pub fn apply_right_delta(&mut self, delta: &ZSet) {
+        for row in delta.iter() {
+            *self
+                .right_state
+                .entry((row.key.clone(), row.value.clone()))
+                .or_insert(0) += row.weight;
+        }
+    }
+
+    /// Build right-side index: join_key → [(row_key, row_value, weight)].
+    fn right_index(&self) -> JoinIdx<'_> {
+        let mut idx: JoinIdx<'_> = HashMap::new();
+        for ((rk, rv), rw) in &self.right_state {
+            if *rw == 0 {
+                continue;
+            }
+            let jk = (self.right_key_fn)(rk, rv);
+            idx.entry(jk).or_default().push((rk, rv, *rw));
+        }
+        idx
+    }
+
+    /// Build left-side index: join_key → [(row_key, row_value, weight)].
+    fn left_index(&self) -> JoinIdx<'_> {
+        let mut idx: JoinIdx<'_> = HashMap::new();
+        for ((lk, lv), lw) in &self.left_state {
+            if *lw == 0 {
+                continue;
+            }
+            let jk = (self.left_key_fn)(lk, lv);
+            idx.entry(jk).or_default().push((lk, lv, *lw));
+        }
+        idx
+    }
+
+    /// Compute the materialized LEFT OUTER JOIN result.
+    pub fn compute_left_outer_join(&self) -> ZSet {
+        let right_idx = self.right_index();
+        let mut result = ZSet::new();
+
+        for ((lk, lv), lw) in &self.left_state {
+            if *lw == 0 {
+                continue;
+            }
+            let jk = (self.left_key_fn)(lk, lv);
+            let right_rows = right_idx.get(&jk);
+            let right_total: i64 = right_rows
+                .map(|rows| rows.iter().map(|(_, _, rw)| rw).sum())
+                .unwrap_or(0);
+
+            // Always emit inner join products for all nonzero-weight right rows
+            // (bilinear algebraic formula — same as DBSP inner join).
+            if let Some(rows) = right_rows {
+                for (rk, rv, rw) in rows {
+                    let w = lw * rw;
+                    if w != 0 {
+                        let (ok, ov) = (self.combine_fn)(lk, lv, rk, rv);
+                        result.insert(ok, ov, w);
+                    }
+                }
+            }
+
+            // If the total right weight is zero, the left row is "unmatched":
+            // emit null-padded output.
+            if right_total == 0 {
+                if let Some(ref null_fn) = self.null_right_fn {
+                    let (ok, ov) = null_fn(lk, lv);
+                    result.insert(ok, ov, *lw);
+                }
+            }
+        }
+        result
+    }
+
+    /// Compute the materialized RIGHT OUTER JOIN result.
+    pub fn compute_right_outer_join(&self) -> ZSet {
+        let left_idx = self.left_index();
+        let mut result = ZSet::new();
+
+        for ((rk, rv), rw) in &self.right_state {
+            if *rw == 0 {
+                continue;
+            }
+            let jk = (self.right_key_fn)(rk, rv);
+            let left_rows = left_idx.get(&jk);
+            let left_total: i64 = left_rows
+                .map(|rows| rows.iter().map(|(_, _, lw)| lw).sum())
+                .unwrap_or(0);
+
+            // Always emit inner join products for all nonzero-weight left rows.
+            if let Some(rows) = left_rows {
+                for (lk, lv, lw) in rows {
+                    let w = lw * rw;
+                    if w != 0 {
+                        let (ok, ov) = (self.combine_fn)(lk, lv, rk, rv);
+                        result.insert(ok, ov, w);
+                    }
+                }
+            }
+
+            // If the total left weight is zero, the right row is "unmatched".
+            if left_total == 0 {
+                if let Some(ref null_fn) = self.null_left_fn {
+                    let (ok, ov) = null_fn(rk, rv);
+                    result.insert(ok, ov, *rw);
+                }
+            }
+        }
+        result
+    }
+
+    /// Compute the materialized FULL OUTER JOIN result.
+    pub fn compute_full_outer_join(&self) -> ZSet {
+        let right_idx = self.right_index();
+        let left_idx = self.left_index();
+        let mut result = ZSet::new();
+
+        // Left side: inner join products + null-right for unmatched left rows.
+        for ((lk, lv), lw) in &self.left_state {
+            if *lw == 0 {
+                continue;
+            }
+            let jk = (self.left_key_fn)(lk, lv);
+            let right_rows = right_idx.get(&jk);
+            let right_total: i64 = right_rows
+                .map(|rows| rows.iter().map(|(_, _, rw)| rw).sum())
+                .unwrap_or(0);
+
+            if let Some(rows) = right_rows {
+                for (rk, rv, rw) in rows {
+                    let w = lw * rw;
+                    if w != 0 {
+                        let (ok, ov) = (self.combine_fn)(lk, lv, rk, rv);
+                        result.insert(ok, ov, w);
+                    }
+                }
+            }
+
+            if right_total == 0 {
+                if let Some(ref null_fn) = self.null_right_fn {
+                    let (ok, ov) = null_fn(lk, lv);
+                    result.insert(ok, ov, *lw);
+                }
+            }
+        }
+
+        // Right side: null-left for unmatched right rows only.
+        // (Inner join products are already included from the left side iteration.)
+        for ((rk, rv), rw) in &self.right_state {
+            if *rw == 0 {
+                continue;
+            }
+            let jk = (self.right_key_fn)(rk, rv);
+            let left_total: i64 = left_idx
+                .get(&jk)
+                .map(|rows| rows.iter().map(|(_, _, lw)| lw).sum())
+                .unwrap_or(0);
+
+            if left_total == 0 {
+                if let Some(ref null_fn) = self.null_left_fn {
+                    let (ok, ov) = null_fn(rk, rv);
+                    result.insert(ok, ov, *rw);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Compute the materialized LEFT SEMI JOIN result.
+    ///
+    /// Emits left rows that have at least one matching right row.
+    pub fn compute_left_semi_join(&self) -> ZSet {
+        let right_idx = self.right_index();
+        let mut result = ZSet::new();
+
+        for ((lk, lv), lw) in &self.left_state {
+            if *lw == 0 {
+                continue;
+            }
+            let jk = (self.left_key_fn)(lk, lv);
+            let right_total: i64 = right_idx
+                .get(&jk)
+                .map(|rows| rows.iter().map(|(_, _, rw)| rw).sum())
+                .unwrap_or(0);
+            if right_total != 0 {
+                result.insert(lk.clone(), lv.clone(), *lw);
+            }
+        }
+        result
+    }
+
+    /// Compute the materialized LEFT ANTI JOIN result.
+    ///
+    /// Emits left rows that have NO matching right rows.
+    pub fn compute_left_anti_join(&self) -> ZSet {
+        let right_idx = self.right_index();
+        let mut result = ZSet::new();
+
+        for ((lk, lv), lw) in &self.left_state {
+            if *lw == 0 {
+                continue;
+            }
+            let jk = (self.left_key_fn)(lk, lv);
+            let right_total: i64 = right_idx
+                .get(&jk)
+                .map(|rows| rows.iter().map(|(_, _, rw)| rw).sum())
+                .unwrap_or(0);
+            if right_total == 0 {
+                result.insert(lk.clone(), lv.clone(), *lw);
+            }
+        }
+        result
+    }
+
+    /// Compute the materialized RIGHT SEMI JOIN result.
+    pub fn compute_right_semi_join(&self) -> ZSet {
+        let left_idx = self.left_index();
+        let mut result = ZSet::new();
+
+        for ((rk, rv), rw) in &self.right_state {
+            if *rw == 0 {
+                continue;
+            }
+            let jk = (self.right_key_fn)(rk, rv);
+            let left_total: i64 = left_idx
+                .get(&jk)
+                .map(|rows| rows.iter().map(|(_, _, lw)| lw).sum())
+                .unwrap_or(0);
+            if left_total != 0 {
+                result.insert(rk.clone(), rv.clone(), *rw);
+            }
+        }
+        result
+    }
+
+    /// Compute the materialized RIGHT ANTI JOIN result.
+    pub fn compute_right_anti_join(&self) -> ZSet {
+        let left_idx = self.left_index();
+        let mut result = ZSet::new();
+
+        for ((rk, rv), rw) in &self.right_state {
+            if *rw == 0 {
+                continue;
+            }
+            let jk = (self.right_key_fn)(rk, rv);
+            let left_total: i64 = left_idx
+                .get(&jk)
+                .map(|rows| rows.iter().map(|(_, _, lw)| lw).sum())
+                .unwrap_or(0);
+            if left_total == 0 {
+                result.insert(rk.clone(), rv.clone(), *rw);
+            }
+        }
+        result
+    }
+}
+
+// ─── Tests (JoinOracle) ───────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

@@ -11,6 +11,7 @@ pub mod map;
 pub mod min_max;
 pub mod noop;
 pub mod operator;
+pub mod outer_join;
 pub mod project;
 pub mod row_codec;
 pub mod scheduler;
