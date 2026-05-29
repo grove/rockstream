@@ -4,6 +4,7 @@
 //! the `Operator` trait defined here.
 
 pub mod aggregate;
+pub mod distinct;
 pub mod epoch_output;
 pub mod filter;
 pub mod join;
@@ -15,6 +16,7 @@ pub mod outer_join;
 pub mod project;
 pub mod row_codec;
 pub mod scheduler;
+pub mod set_ops;
 pub mod task;
 
 #[cfg(test)]
