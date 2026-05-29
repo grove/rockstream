@@ -7,6 +7,7 @@ pub mod aggregate;
 pub mod epoch_output;
 pub mod filter;
 pub mod map;
+pub mod min_max;
 pub mod noop;
 pub mod operator;
 pub mod project;

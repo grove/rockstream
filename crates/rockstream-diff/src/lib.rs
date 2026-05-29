@@ -7,6 +7,8 @@
 
 use rockstream_plan::{AggregateFunc, NotMergeSafeReason, OpKind, OpNode, PlanNode};
 use rockstream_types::ids::OperatorId;
+use rockstream_types::laws::max_register::MAX_REGISTER_ID;
+use rockstream_types::laws::min_register::MIN_REGISTER_ID;
 use rockstream_types::laws::weight_add::WEIGHT_ADD_ID;
 use rockstream_types::merge_law::MergeLawId;
 
@@ -132,19 +134,43 @@ impl DiffCtx {
     }
 
     /// Determine the merge law for an aggregate node based on its functions.
+    ///
+    /// For SUM/COUNT/AVG, the `WeightAdd/v1` abelian-group law applies.
+    ///
+    /// For MIN/MAX, the operator uses an indexed multiset (BTreeMap) for
+    /// retraction-aware correctness, but reports the cached-slot law for
+    /// `EXPLAIN INCREMENTAL`:
+    /// - MAX → `MaxRegister/v1` (semilattice: `merge = max`)
+    /// - MIN → `MinRegister/v1` (semilattice: `merge = min`)
+    ///
+    /// Both extremum variants also carry `ExtremumRequiresRmw` because
+    /// `get_merged()` on the storage arrangement alone is insufficient after
+    /// retractions — the operator's prefix-scan rescan is required.
     fn law_for_aggregate(
         &self,
         aggregates: &[rockstream_plan::AggregateExpr],
     ) -> (Option<MergeLawId>, Option<NotMergeSafeReason>) {
-        // If all aggregates are SUM/COUNT/AVG, WeightAdd applies.
-        // If any is MIN/MAX, we need read-modify-write (not merge-safe).
-        let has_extremum = aggregates
+        let has_max = aggregates
             .iter()
-            .any(|a| matches!(a.func, AggregateFunc::Min | AggregateFunc::Max));
+            .any(|a| matches!(a.func, AggregateFunc::Max));
+        let has_min = aggregates
+            .iter()
+            .any(|a| matches!(a.func, AggregateFunc::Min));
 
-        if has_extremum {
-            (None, Some(NotMergeSafeReason::ExtremumRequiresRmw))
+        if has_max {
+            // MAX aggregate: cached slot uses MaxRegister/v1.
+            (
+                Some(MAX_REGISTER_ID),
+                Some(NotMergeSafeReason::ExtremumRequiresRmw),
+            )
+        } else if has_min {
+            // MIN aggregate: cached slot uses MinRegister/v1.
+            (
+                Some(MIN_REGISTER_ID),
+                Some(NotMergeSafeReason::ExtremumRequiresRmw),
+            )
         } else {
+            // SUM / COUNT / AVG: fully invertible via WeightAdd/v1.
             (Some(WEIGHT_ADD_ID), None)
         }
     }
@@ -209,6 +235,8 @@ mod tests {
 
     #[test]
     fn diff_min_aggregate_not_merge_safe() {
+        use rockstream_types::laws::min_register::MIN_REGISTER_ID;
+
         let plan = PlanNode::Aggregate {
             input: Box::new(PlanNode::Source {
                 name: "temps".into(),
@@ -227,7 +255,38 @@ mod tests {
             .iter()
             .find(|n| matches!(n.kind, OpKind::Aggregate))
             .unwrap();
-        assert!(agg.merge_law.is_none());
+        // v0.8: MIN uses MinRegister/v1 as the cached-slot law (EXPLAIN INCREMENTAL).
+        assert_eq!(agg.merge_law, Some(MIN_REGISTER_ID));
+        assert_eq!(
+            agg.not_merge_safe_reason,
+            Some(NotMergeSafeReason::ExtremumRequiresRmw)
+        );
+    }
+
+    #[test]
+    fn diff_max_aggregate_uses_max_register() {
+        use rockstream_types::laws::max_register::MAX_REGISTER_ID;
+
+        let plan = PlanNode::Aggregate {
+            input: Box::new(PlanNode::Source {
+                name: "prices".into(),
+            }),
+            group_by: vec![Expr::Column(0)],
+            aggregates: vec![AggregateExpr {
+                func: AggregateFunc::Max,
+                input: Expr::Column(1),
+                distinct: false,
+            }],
+        };
+
+        let mut ctx = DiffCtx::new();
+        let nodes = ctx.differentiate(&plan);
+        let agg = nodes
+            .iter()
+            .find(|n| matches!(n.kind, OpKind::Aggregate))
+            .unwrap();
+        // v0.8: MAX uses MaxRegister/v1 as the cached-slot law (EXPLAIN INCREMENTAL).
+        assert_eq!(agg.merge_law, Some(MAX_REGISTER_ID));
         assert_eq!(
             agg.not_merge_safe_reason,
             Some(NotMergeSafeReason::ExtremumRequiresRmw)
