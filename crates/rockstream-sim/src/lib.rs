@@ -16,6 +16,7 @@
 pub mod buggify;
 pub mod clock;
 pub mod fault_model;
+pub mod law_faults;
 pub mod network;
 pub mod object_store;
 pub mod paired_assert;
@@ -26,6 +27,7 @@ pub mod tokio_rt;
 pub use buggify::buggify_enabled;
 pub use clock::{Clock, SimClock, TokioClock};
 pub use fault_model::{FaultEntry, FaultModel};
+pub use law_faults::{register_law_faults, LAW_FAULT_IDS};
 pub use network::{SimNetwork, SimNetworkHandle};
 pub use object_store::{SimObjectStore, SimObjectStoreHandle};
 pub use paired_assert::paired_assert;

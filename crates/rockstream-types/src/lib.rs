@@ -11,6 +11,7 @@ pub mod frontier;
 pub mod ids;
 pub mod laws;
 pub mod merge_law;
+pub mod metrics;
 
 /// Timestamp types.
 pub mod timestamp {

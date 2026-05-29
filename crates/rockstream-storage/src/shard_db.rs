@@ -4,14 +4,17 @@
 //! support for write batches, merge operations, and prefix scanning.
 //! Does NOT use range deletion.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::ObjectStore;
+use rockstream_types::merge_law::{ArrangementHeader, MergeLawId};
 use slatedb::config::Settings;
 use slatedb::Db;
 
 use crate::error::StorageError;
+use crate::keys::ShardKeyEncoder;
 use crate::merge_registry::SumCountMergeOperator;
 
 /// A per-shard database backed by SlateDB.
@@ -147,6 +150,46 @@ impl ShardDb {
     pub async fn flush(&self) -> Result<(), StorageError> {
         self.db.flush().await?;
         Ok(())
+    }
+
+    /// Validate that all merge laws referenced in arrangement headers stored
+    /// in this shard are present in the given set of known law IDs.
+    ///
+    /// Reads the `shard_meta/law_catalog/` prefix and checks each entry.
+    /// Returns `StorageError::UnknownMergeLaw` (RS-5002) if any stored law
+    /// is not in `known_law_ids`. Call this immediately after opening the DB
+    /// before performing any reads or writes.
+    pub async fn validate_law_catalog(
+        &self,
+        known_law_ids: &HashSet<MergeLawId>,
+    ) -> Result<(), StorageError> {
+        let prefix = ShardKeyEncoder::meta_key(b"law_catalog/");
+        let entries = self.scan_prefix(&prefix).await?;
+        for (_, value) in entries {
+            if value.len() < ArrangementHeader::WIRE_SIZE {
+                continue; // malformed entry — skip (not a law catalog entry)
+            }
+            let buf: [u8; 4] = value[..4].try_into().unwrap();
+            let header = ArrangementHeader::decode(&buf);
+            if !known_law_ids.contains(&header.law_id) {
+                return Err(StorageError::UnknownMergeLaw {
+                    law_id: header.law_id.0,
+                    law_version: header.law_version.0,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Record that a merge law is used in this shard's arrangements.
+    ///
+    /// Writes a `shard_meta/law_catalog/{law_id:04x}` key so that
+    /// `validate_law_catalog` can verify it on the next attach.
+    pub async fn record_law_usage(&self, header: ArrangementHeader) -> Result<(), StorageError> {
+        let key_suffix = format!("law_catalog/{:04x}", header.law_id.0);
+        let key = ShardKeyEncoder::meta_key(key_suffix.as_bytes());
+        let value = header.encode();
+        self.put(&key, &value).await
     }
 
     /// Close the database, flushing any pending writes.
