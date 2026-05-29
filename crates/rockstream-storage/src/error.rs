@@ -16,4 +16,12 @@ pub enum StorageError {
 
     #[error("unsupported operation: {0}")]
     Unsupported(String),
+
+    /// RS-5002: arrangement header references a merge law that is not
+    /// registered in the catalog. The shard refuses to attach until the law
+    /// is either registered or the arrangement is migrated.
+    #[error(
+        "RS-5002: unknown merge law id={law_id} version={law_version} in shard arrangement header"
+    )]
+    UnknownMergeLaw { law_id: u16, law_version: u16 },
 }

@@ -7,8 +7,8 @@
 //! Wire format: 8 bytes, big-endian i64.
 
 use crate::merge_law::{
-    CompactionPolicy, DuplicatePolicy, LawBundle, LawProperties, MergeLawClass, MergeLawId,
-    MergeLawVersion,
+    CompactionPolicy, DuplicatePolicy, FrontierPolicy, LawBundle, LawProperties, MergeLawClass,
+    MergeLawId, MergeLawVersion,
 };
 
 /// Well-known ID for `WeightAdd/v1`.
@@ -54,6 +54,12 @@ impl LawBundle for WeightAddV1 {
 
     fn compaction_policy(&self) -> CompactionPolicy {
         CompactionPolicy::TombstoneGc
+    }
+
+    fn frontier_policy(&self) -> FrontierPolicy {
+        // WeightAdd is an abelian group: partial results are always valid,
+        // so any frontier advancement may trigger output.
+        FrontierPolicy::AnyAdvancement
     }
 
     fn identity(&self) -> Option<Vec<u8>> {

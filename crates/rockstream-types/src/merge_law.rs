@@ -77,6 +77,21 @@ pub enum CompactionPolicy {
     RetainAll,
 }
 
+/// Frontier advancement policy: what progress guarantees are needed before
+/// emitting output for this law.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrontierPolicy {
+    /// Any frontier advancement may trigger output (suitable for abelian groups
+    /// and commutative monoids where partial results are still correct).
+    AnyAdvancement,
+    /// Output may only be emitted when the frontier is exact (no in-flight
+    /// retractions). Required for non-idempotent laws such as `SumCount/v1`.
+    ExactOnly,
+    /// The law produces no aggregate state — output is a direct delta passthrough
+    /// (suitable for stateless linear operators: Filter, Project, Map).
+    Stateless,
+}
+
 /// The core trait that all registered merge laws must implement.
 ///
 /// A `LawBundle` encapsulates the algebraic operations and metadata for a
@@ -104,6 +119,9 @@ pub trait LawBundle: Send + Sync + 'static {
 
     /// Compaction policy.
     fn compaction_policy(&self) -> CompactionPolicy;
+
+    /// Frontier advancement policy for this law.
+    fn frontier_policy(&self) -> FrontierPolicy;
 
     /// The identity element serialized to bytes.
     /// Returns `None` if no identity exists (rare — most laws have one).
@@ -137,6 +155,7 @@ pub struct LawDescriptor {
     pub properties: LawProperties,
     pub duplicate_policy: DuplicatePolicy,
     pub compaction_policy: CompactionPolicy,
+    pub frontier_policy: FrontierPolicy,
     pub idempotent: bool,
 }
 
@@ -151,6 +170,7 @@ impl LawDescriptor {
             properties: bundle.properties(),
             duplicate_policy: bundle.duplicate_policy(),
             compaction_policy: bundle.compaction_policy(),
+            frontier_policy: bundle.frontier_policy(),
             idempotent: bundle.properties().idempotent,
         }
     }
