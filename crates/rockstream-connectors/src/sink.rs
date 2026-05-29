@@ -1,23 +1,19 @@
 //! Sink trait for RockStream connectors.
 
+use async_trait::async_trait;
 use rockstream_types::timestamp::Epoch;
 
-/// A batch of records to be written by a sink.
-#[derive(Debug, Clone, Default)]
-pub struct SinkBatch {
-    /// Number of records in this batch.
-    pub record_count: usize,
-    /// Epoch this batch belongs to.
-    pub epoch: Epoch,
-}
+// Re-export SinkBatch from the canonical location in rockstream-types.
+pub use rockstream_types::batch::SinkBatch;
 
 /// Trait that all sinks must implement.
+#[async_trait]
 pub trait Sink: Send {
     /// Write a batch of records.
-    fn write_batch(&mut self, batch: &SinkBatch);
+    async fn write_batch(&mut self, batch: &SinkBatch);
 
     /// Commit the current epoch (flush).
-    fn commit(&mut self, epoch: Epoch);
+    async fn commit(&mut self, epoch: Epoch);
 
     /// Name of this sink for diagnostics.
     fn name(&self) -> &str;

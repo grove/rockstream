@@ -102,6 +102,9 @@ impl ShardDb {
     /// Scan all key-value pairs with the given prefix.
     ///
     /// Returns key-value pairs in sorted order.
+    ///
+    /// **Warning:** This materializes the entire result into memory. For large
+    /// arrangements, prefer `scan_prefix_bounded` with an explicit byte budget.
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>, StorageError> {
         let mut results = Vec::new();
         let mut iter = self.db.scan_prefix(prefix).await?;
@@ -109,6 +112,35 @@ impl ShardDb {
             results.push((entry.key, entry.value));
         }
         Ok(results)
+    }
+
+    /// Scan key-value pairs with the given prefix, up to a byte budget.
+    ///
+    /// Stops reading once the cumulative size of returned keys and values
+    /// exceeds `max_bytes`. This prevents unbounded memory usage when scanning
+    /// large arrangements.
+    ///
+    /// Returns `(results, truncated)` where `truncated` is true if the scan
+    /// was stopped early due to the budget.
+    pub async fn scan_prefix_bounded(
+        &self,
+        prefix: &[u8],
+        max_bytes: usize,
+    ) -> Result<(Vec<(Bytes, Bytes)>, bool), StorageError> {
+        let mut results = Vec::new();
+        let mut total_bytes: usize = 0;
+        let mut iter = self.db.scan_prefix(prefix).await?;
+        while let Some(entry) = iter.next().await? {
+            total_bytes += entry.key.len() + entry.value.len();
+            if total_bytes > max_bytes && !results.is_empty() {
+                return Ok((results, true));
+            }
+            results.push((entry.key, entry.value));
+            if total_bytes > max_bytes {
+                return Ok((results, true));
+            }
+        }
+        Ok((results, false))
     }
 
     /// Flush the WAL to durable storage.

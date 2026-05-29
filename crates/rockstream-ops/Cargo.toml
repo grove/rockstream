@@ -8,5 +8,8 @@ description = "Operator trait and per-operator implementations for RockStream"
 
 [dependencies]
 rockstream-types = { workspace = true }
-rockstream-connectors = { workspace = true }
+async-trait = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -3,6 +3,7 @@
 //! Produces empty batches for testing and validation. Used in the no-op
 //! pipeline to prove the system starts, runs, and shuts down cleanly.
 
+use async_trait::async_trait;
 use crate::source::{Source, SourceBatch};
 use rockstream_types::timestamp::Epoch;
 
@@ -21,8 +22,9 @@ impl NoopSource {
     }
 }
 
+#[async_trait]
 impl Source for NoopSource {
-    fn poll_batch(&mut self, epoch: Epoch) -> Option<SourceBatch> {
+    async fn poll_batch(&mut self, epoch: Epoch) -> Option<SourceBatch> {
         if let Some(max) = self.max_epochs {
             if epoch >= max {
                 tracing::info!(epoch, "noop source exhausted");
@@ -45,21 +47,21 @@ impl Source for NoopSource {
 mod tests {
     use super::*;
 
-    #[test]
-    fn noop_source_produces_batches() {
+    #[tokio::test]
+    async fn noop_source_produces_batches() {
         let mut src = NoopSource::new(3);
-        assert!(src.poll_batch(0).is_some());
-        assert!(src.poll_batch(1).is_some());
-        assert!(src.poll_batch(2).is_some());
+        assert!(src.poll_batch(0).await.is_some());
+        assert!(src.poll_batch(1).await.is_some());
+        assert!(src.poll_batch(2).await.is_some());
         // Epoch 3 is past max_epochs
     }
 
-    #[test]
-    fn noop_source_exhausts_at_max() {
+    #[tokio::test]
+    async fn noop_source_exhausts_at_max() {
         let mut src = NoopSource::new(2);
-        assert!(src.poll_batch(0).is_some());
-        assert!(src.poll_batch(1).is_some());
-        assert!(src.poll_batch(2).is_none());
+        assert!(src.poll_batch(0).await.is_some());
+        assert!(src.poll_batch(1).await.is_some());
+        assert!(src.poll_batch(2).await.is_none());
     }
 
     #[test]
@@ -68,10 +70,10 @@ mod tests {
         assert_eq!(src.name(), "noop-source");
     }
 
-    #[test]
-    fn noop_source_batch_is_empty() {
+    #[tokio::test]
+    async fn noop_source_batch_is_empty() {
         let mut src = NoopSource::new(10);
-        let batch = src.poll_batch(0).unwrap();
+        let batch = src.poll_batch(0).await.unwrap();
         assert_eq!(batch.record_count, 0);
         assert_eq!(batch.epoch, 0);
     }

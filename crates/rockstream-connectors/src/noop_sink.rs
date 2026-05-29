@@ -3,6 +3,7 @@
 //! Consumes and discards all batches. Used in the no-op pipeline to prove
 //! the system starts, runs, and shuts down cleanly.
 
+use async_trait::async_trait;
 use crate::sink::{Sink, SinkBatch};
 use rockstream_types::timestamp::Epoch;
 
@@ -40,8 +41,9 @@ impl Default for NoopSink {
     }
 }
 
+#[async_trait]
 impl Sink for NoopSink {
-    fn write_batch(&mut self, batch: &SinkBatch) {
+    async fn write_batch(&mut self, batch: &SinkBatch) {
         self.batches_written += 1;
         tracing::trace!(
             epoch = batch.epoch,
@@ -50,7 +52,7 @@ impl Sink for NoopSink {
         );
     }
 
-    fn commit(&mut self, epoch: Epoch) {
+    async fn commit(&mut self, epoch: Epoch) {
         self.epochs_committed += 1;
         tracing::trace!(epoch, "noop sink committed epoch");
     }
@@ -64,25 +66,25 @@ impl Sink for NoopSink {
 mod tests {
     use super::*;
 
-    #[test]
-    fn noop_sink_accepts_batches() {
+    #[tokio::test]
+    async fn noop_sink_accepts_batches() {
         let mut sink = NoopSink::new();
         sink.write_batch(&SinkBatch {
             record_count: 0,
             epoch: 0,
-        });
+        }).await;
         sink.write_batch(&SinkBatch {
             record_count: 0,
             epoch: 1,
-        });
+        }).await;
         assert_eq!(sink.batches_written(), 2);
     }
 
-    #[test]
-    fn noop_sink_commits() {
+    #[tokio::test]
+    async fn noop_sink_commits() {
         let mut sink = NoopSink::new();
-        sink.commit(0);
-        sink.commit(1);
+        sink.commit(0).await;
+        sink.commit(1).await;
         assert_eq!(sink.epochs_committed(), 2);
     }
 

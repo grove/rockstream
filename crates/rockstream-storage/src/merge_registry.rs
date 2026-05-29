@@ -22,8 +22,8 @@ pub enum MergeTag {
 /// - Sum tag: payload is i64 big-endian, merged by addition
 /// - Count tag: payload is u64 big-endian, merged by addition
 ///
-/// If the value format is invalid, the new value replaces the existing one
-/// (last-writer-wins fallback).
+/// Fail-closed: malformed inputs or tag mismatches return an error
+/// (RS-3009 merge.malformed_operand) rather than silently overwriting.
 #[derive(Debug)]
 pub struct SumCountMergeOperator;
 
@@ -41,14 +41,18 @@ impl MergeOperator for SumCountMergeOperator {
 
         // Both existing and new must be at least 9 bytes (1 tag + 8 payload).
         if existing.len() < 9 || value.len() < 9 {
-            // Malformed: last-writer-wins.
-            return Ok(value);
+            // Fail-closed: malformed operand (RS-3009).
+            return Err(MergeOperatorError::Callback {
+                message: "RS-3009: merge operand malformed (expected 9 bytes: 1 tag + 8 payload)".into(),
+            });
         }
 
         let tag = existing[0];
         if tag != value[0] {
-            // Tag mismatch: last-writer-wins.
-            return Ok(value);
+            // Fail-closed: tag mismatch (RS-3009).
+            return Err(MergeOperatorError::Callback {
+                message: "RS-3009: merge tag mismatch between existing and incoming value".into(),
+            });
         }
 
         match tag {
@@ -71,8 +75,10 @@ impl MergeOperator for SumCountMergeOperator {
                 Ok(Bytes::from(out))
             }
             _ => {
-                // Unknown tag: last-writer-wins.
-                Ok(value)
+                // Fail-closed: unknown tag (RS-3009).
+                Err(MergeOperatorError::Callback {
+                    message: "RS-3009: unknown merge tag byte".into(),
+                })
             }
         }
     }
@@ -162,22 +168,23 @@ mod tests {
     }
 
     #[test]
-    fn tag_mismatch_last_writer_wins() {
+    fn tag_mismatch_returns_error() {
         let op = SumCountMergeOperator;
         let existing = Bytes::from(MergeOperatorRegistry::encode_sum(100));
         let value = Bytes::from(MergeOperatorRegistry::encode_count(1));
-        let result = op.merge(&key(), Some(existing), value).unwrap();
-        // Last writer wins: count value
-        assert_eq!(MergeOperatorRegistry::decode_count(&result), Some(1));
+        let result = op.merge(&key(), Some(existing), value);
+        // Fail-closed: tag mismatch is an error (RS-3009).
+        assert!(result.is_err());
     }
 
     #[test]
-    fn malformed_existing_last_writer_wins() {
+    fn malformed_existing_returns_error() {
         let op = SumCountMergeOperator;
         let existing = Bytes::from_static(b"short");
         let value = Bytes::from(MergeOperatorRegistry::encode_sum(99));
-        let result = op.merge(&key(), Some(existing), value).unwrap();
-        assert_eq!(MergeOperatorRegistry::decode_sum(&result), Some(99));
+        let result = op.merge(&key(), Some(existing), value);
+        // Fail-closed: malformed operand is an error (RS-3009).
+        assert!(result.is_err());
     }
 
     #[test]

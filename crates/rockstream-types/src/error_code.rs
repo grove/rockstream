@@ -5,6 +5,30 @@
 
 use std::fmt;
 
+/// Severity level for an error code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Severity {
+    /// Informational — no action required.
+    Info,
+    /// Warning — degraded but operational.
+    Warning,
+    /// Error — operation failed, user action required.
+    Error,
+    /// Fatal — system cannot continue without intervention.
+    Fatal,
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Info => write!(f, "INFO"),
+            Self::Warning => write!(f, "WARN"),
+            Self::Error => write!(f, "ERROR"),
+            Self::Fatal => write!(f, "FATAL"),
+        }
+    }
+}
+
 /// An error code in the `RS-XXXX` format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ErrorCode(u16);
@@ -55,6 +79,10 @@ pub const RS_2002: ErrorCode = ErrorCode::new(2002);
 /// Unsupported isolation level.
 pub const RS_2003: ErrorCode = ErrorCode::new(2003);
 
+// 3xxx: Merge / arrangement
+/// Merge operand malformed (fail-closed: never silently overwrites).
+pub const RS_3009: ErrorCode = ErrorCode::new(3009);
+
 // 4xxx: Connector
 /// Source connection failed.
 pub const RS_4001: ErrorCode = ErrorCode::new(4001);
@@ -64,6 +92,20 @@ pub const RS_4002: ErrorCode = ErrorCode::new(4002);
 // 5xxx: Upgrade / migration
 /// Incompatible storage format.
 pub const RS_5001: ErrorCode = ErrorCode::new(5001);
+
+/// Metadata for a registered error code.
+pub struct ErrorCodeMeta {
+    /// The error code.
+    pub code: ErrorCode,
+    /// Human-readable description.
+    pub description: &'static str,
+    /// Severity level.
+    pub severity: Severity,
+    /// Actionable next steps for the operator/user.
+    pub next_steps: &'static str,
+    /// Documentation URL (relative path within docs site).
+    pub doc_url: &'static str,
+}
 
 /// Returns a human-readable description for a known error code.
 pub fn description(code: ErrorCode) -> &'static str {
@@ -78,10 +120,44 @@ pub fn description(code: ErrorCode) -> &'static str {
         2001 => "View not found",
         2002 => "Query timeout",
         2003 => "Unsupported isolation level",
+        3009 => "Merge operand malformed",
         4001 => "Source connection failed",
         4002 => "Sink write failed",
         5001 => "Incompatible storage format",
         _ => "Unknown error",
+    }
+}
+
+/// Returns the severity for a known error code.
+pub fn severity(code: ErrorCode) -> Severity {
+    match code.0 {
+        1 => Severity::Fatal,
+        2 => Severity::Error,
+        3 => Severity::Error,
+        3009 => Severity::Error,
+        5001 => Severity::Fatal,
+        _ => Severity::Error,
+    }
+}
+
+/// Returns actionable next steps for a known error code.
+pub fn next_steps(code: ErrorCode) -> &'static str {
+    match code.0 {
+        1 => "Report this bug with the support bundle.",
+        2 => "Check configuration file and CLI flags.",
+        3 => "Verify storage directory permissions and disk space.",
+        1001 => "Check pipeline name and ensure it has been created.",
+        1002 => "Review schema evolution rules; a new view may be required.",
+        1003 => "Inspect the dead-letter queue for malformed records.",
+        1004 => "Use a different pipeline name or drop the existing one.",
+        2001 => "Check view name and ensure the pipeline is running.",
+        2002 => "Reduce query scope or increase timeout.",
+        2003 => "Use a supported isolation level (snapshot or eventual).",
+        3009 => "Inspect the stored arrangement value; possible data corruption or law version mismatch.",
+        4001 => "Verify source connection settings and network connectivity.",
+        4002 => "Check sink availability and credentials.",
+        5001 => "Run the storage migration tool before upgrading.",
+        _ => "See documentation for this error code.",
     }
 }
 

@@ -5,8 +5,9 @@
 
 use rockstream_connectors::sink::Sink;
 use rockstream_connectors::source::Source;
-use rockstream_control::audit::{AuditEvent, FileAuditLog};
+use rockstream_control::audit::FileAuditLog;
 use rockstream_ops::operator::Operator;
+use rockstream_types::audit::AuditEvent;
 use rockstream_types::timestamp::Epoch;
 use std::path::Path;
 
@@ -30,7 +31,7 @@ pub struct PipelineConfig {
 /// Run a pipeline: source → operator → sink, epoch by epoch.
 ///
 /// Returns the result after the source is exhausted.
-pub fn run_pipeline(
+pub async fn run_pipeline(
     config: &PipelineConfig,
     source: &mut dyn Source,
     operator: &mut dyn Operator,
@@ -64,16 +65,16 @@ pub fn run_pipeline(
 
     let mut epoch: Epoch = 0;
 
-    while let Some(batch) = source.poll_batch(epoch) {
+    while let Some(batch) = source.poll_batch(epoch).await {
         // Process through operator
-        let output = operator.process(&batch);
+        let output = operator.process(&batch).await;
 
         // Write to sink
-        sink.write_batch(&output);
-        sink.commit(epoch);
+        sink.write_batch(&output).await;
+        sink.commit(epoch).await;
 
         // Signal epoch complete
-        operator.epoch_complete(epoch);
+        operator.epoch_complete(epoch).await;
 
         tracing::debug!(epoch, "epoch completed");
         epoch += 1;
@@ -95,7 +96,7 @@ pub fn run_pipeline(
 }
 
 /// Run the default no-op pipeline in the given storage directory.
-pub fn run_noop_pipeline(storage_dir: &Path) -> PipelineResult {
+pub async fn run_noop_pipeline(storage_dir: &Path) -> PipelineResult {
     use rockstream_connectors::noop_sink::NoopSink;
     use rockstream_connectors::noop_source::NoopSource;
     use rockstream_ops::noop::NoopOperator;
@@ -112,25 +113,25 @@ pub fn run_noop_pipeline(storage_dir: &Path) -> PipelineResult {
     let mut operator = NoopOperator::new();
     let mut sink = NoopSink::new();
 
-    run_pipeline(&config, &mut source, &mut operator, &mut sink, &audit_log)
+    run_pipeline(&config, &mut source, &mut operator, &mut sink, &audit_log).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn run_noop_pipeline_completes() {
+    #[tokio::test]
+    async fn run_noop_pipeline_completes() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run_noop_pipeline(dir.path());
+        let result = run_noop_pipeline(dir.path()).await;
         assert_eq!(result.epochs_completed, 5);
         assert_eq!(result.pipeline_name, "noop-pipeline");
     }
 
-    #[test]
-    fn run_noop_pipeline_writes_audit_events() {
+    #[tokio::test]
+    async fn run_noop_pipeline_writes_audit_events() {
         let dir = tempfile::tempdir().unwrap();
-        run_noop_pipeline(dir.path());
+        run_noop_pipeline(dir.path()).await;
 
         let audit_path = dir.path().join("audit.jsonl");
         let log = FileAuditLog::open(&audit_path).unwrap();
@@ -148,10 +149,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pipeline_audit_events_have_timestamps() {
+    #[tokio::test]
+    async fn pipeline_audit_events_have_timestamps() {
         let dir = tempfile::tempdir().unwrap();
-        run_noop_pipeline(dir.path());
+        run_noop_pipeline(dir.path()).await;
 
         let audit_path = dir.path().join("audit.jsonl");
         let log = FileAuditLog::open(&audit_path).unwrap();
@@ -163,8 +164,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pipeline_with_custom_source() {
+    #[tokio::test]
+    async fn pipeline_with_custom_source() {
         use rockstream_connectors::noop_sink::NoopSink;
         use rockstream_connectors::noop_source::NoopSource;
         use rockstream_ops::noop::NoopOperator;
@@ -182,7 +183,7 @@ mod tests {
         let mut operator = NoopOperator::new();
         let mut sink = NoopSink::new();
 
-        let result = run_pipeline(&config, &mut source, &mut operator, &mut sink, &audit_log);
+        let result = run_pipeline(&config, &mut source, &mut operator, &mut sink, &audit_log).await;
         assert_eq!(result.epochs_completed, 10);
         assert_eq!(result.pipeline_name, "custom-pipeline");
     }

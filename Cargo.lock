@@ -1885,6 +1885,7 @@ dependencies = [
  "clap",
  "rockstream-control",
  "rockstream-runtime",
+ "rockstream-types",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1901,7 +1902,9 @@ dependencies = [
 name = "rockstream-connectors"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "rockstream-types",
+ "tokio",
  "tracing",
 ]
 
@@ -1935,8 +1938,9 @@ dependencies = [
 name = "rockstream-ops"
 version = "0.1.0"
 dependencies = [
- "rockstream-connectors",
+ "async-trait",
  "rockstream-types",
+ "tokio",
  "tracing",
 ]
 
@@ -1958,6 +1962,7 @@ dependencies = [
 name = "rockstream-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "rockstream-connectors",
  "rockstream-control",
  "rockstream-ops",
@@ -1965,6 +1970,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
 ]
 

@@ -11,6 +11,8 @@ rockstream-types = { workspace = true }
 rockstream-connectors = { workspace = true }
 rockstream-control = { workspace = true }
 rockstream-ops = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

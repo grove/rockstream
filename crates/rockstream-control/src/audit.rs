@@ -1,64 +1,16 @@
 //! Audit-log skeleton for RockStream.
 //!
-//! Every control-plane action writes an audit event. This module provides the
-//! event structure and a file-backed audit log writer.
+//! Every control-plane action writes an audit event. This module provides
+//! the file-backed audit log writer. The `AuditEvent` type itself lives in
+//! `rockstream-types::audit` so any crate can construct events without
+//! depending on the control-plane.
 
-use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-/// An audit event recording a control-plane action.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditEvent {
-    /// Unix timestamp in milliseconds.
-    pub timestamp_ms: u64,
-    /// Actor performing the action (user, system, or service).
-    pub actor: String,
-    /// Action performed (e.g., "pipeline.created", "pipeline.started").
-    pub action: String,
-    /// Resource affected (e.g., pipeline name).
-    pub resource: String,
-    /// Optional error code if the action failed.
-    pub error_code: Option<String>,
-    /// Optional detail message.
-    pub detail: Option<String>,
-}
-
-impl AuditEvent {
-    /// Create a new audit event with the current timestamp.
-    pub fn now(
-        actor: impl Into<String>,
-        action: impl Into<String>,
-        resource: impl Into<String>,
-    ) -> Self {
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        Self {
-            timestamp_ms,
-            actor: actor.into(),
-            action: action.into(),
-            resource: resource.into(),
-            error_code: None,
-            detail: None,
-        }
-    }
-
-    /// Attach a detail message.
-    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
-        self.detail = Some(detail.into());
-        self
-    }
-
-    /// Attach an error code.
-    pub fn with_error_code(mut self, code: impl Into<String>) -> Self {
-        self.error_code = Some(code.into());
-        self
-    }
-}
+// Re-export the canonical AuditEvent type.
+pub use rockstream_types::audit::AuditEvent;
 
 /// A file-backed audit log that writes JSONL.
 pub struct FileAuditLog {

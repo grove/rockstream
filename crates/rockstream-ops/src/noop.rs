@@ -2,9 +2,9 @@
 //!
 //! Passes batches through without transformation. Used in the no-op pipeline.
 
+use async_trait::async_trait;
 use crate::operator::Operator;
-use rockstream_connectors::sink::SinkBatch;
-use rockstream_connectors::source::SourceBatch;
+use rockstream_types::batch::{SinkBatch, SourceBatch};
 use rockstream_types::timestamp::Epoch;
 
 /// An operator that passes through records without transformation.
@@ -32,8 +32,9 @@ impl Default for NoopOperator {
     }
 }
 
+#[async_trait]
 impl Operator for NoopOperator {
-    fn process(&mut self, input: &SourceBatch) -> SinkBatch {
+    async fn process(&mut self, input: &SourceBatch) -> SinkBatch {
         tracing::trace!(
             epoch = input.epoch,
             records = input.record_count,
@@ -45,7 +46,7 @@ impl Operator for NoopOperator {
         }
     }
 
-    fn epoch_complete(&mut self, epoch: Epoch) {
+    async fn epoch_complete(&mut self, epoch: Epoch) {
         self.epochs_processed += 1;
         tracing::trace!(epoch, "noop operator epoch complete");
     }
@@ -59,24 +60,24 @@ impl Operator for NoopOperator {
 mod tests {
     use super::*;
 
-    #[test]
-    fn noop_operator_passthrough() {
+    #[tokio::test]
+    async fn noop_operator_passthrough() {
         let mut op = NoopOperator::new();
         let input = SourceBatch {
             record_count: 5,
             epoch: 0,
         };
-        let output = op.process(&input);
+        let output = op.process(&input).await;
         assert_eq!(output.record_count, 5);
         assert_eq!(output.epoch, 0);
     }
 
-    #[test]
-    fn noop_operator_epoch_counting() {
+    #[tokio::test]
+    async fn noop_operator_epoch_counting() {
         let mut op = NoopOperator::new();
         assert_eq!(op.epochs_processed(), 0);
-        op.epoch_complete(0);
-        op.epoch_complete(1);
+        op.epoch_complete(0).await;
+        op.epoch_complete(1).await;
         assert_eq!(op.epochs_processed(), 2);
     }
 

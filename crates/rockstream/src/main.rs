@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::Path;
 use tracing_subscriber::EnvFilter;
 
@@ -11,6 +11,21 @@ struct Cli {
     command: Option<Command>,
 }
 
+/// Valid roles for a RockStream node.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Role {
+    /// Run all roles in a single process (embedded profile).
+    All,
+    /// Run as a worker node only.
+    Worker,
+    /// Run as a control-plane node only.
+    Control,
+    /// Run as a gateway node only.
+    Gateway,
+    /// Run as a frontier coordinator only.
+    Frontier,
+}
+
 #[derive(Parser, Debug)]
 enum Command {
     /// Start the RockStream server.
@@ -19,15 +34,16 @@ enum Command {
         #[arg(long, default_value = "./data")]
         storage: String,
 
-        /// Role to run as (all, worker, control, gateway, frontier).
-        #[arg(long, default_value = "all")]
-        role: String,
+        /// Role to run as.
+        #[arg(long, default_value = "all", value_enum)]
+        role: Role,
     },
     /// Print version information.
     Version,
 }
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     // Initialize tracing with env-filter support.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -38,27 +54,43 @@ fn main() {
 
     match cli.command {
         Some(Command::Start { storage, role }) => {
-            tracing::info!(storage = %storage, role = %role, "starting rockstream");
+            tracing::info!(storage = %storage, role = ?role, "starting rockstream");
 
             let storage_path = Path::new(&storage);
-            std::fs::create_dir_all(storage_path).expect("failed to create storage directory");
+            if let Err(e) = std::fs::create_dir_all(storage_path) {
+                tracing::error!(
+                    error = %e,
+                    path = %storage_path.display(),
+                    "RS-0003: failed to create storage directory"
+                );
+                std::process::exit(1);
+            }
 
             // Audit: server started
             let audit_path = storage_path.join("audit.jsonl");
-            let audit_log = rockstream_control::audit::FileAuditLog::open(&audit_path)
-                .expect("failed to open audit log");
-            let event = rockstream_control::audit::AuditEvent::now(
+            let audit_log = match rockstream_control::audit::FileAuditLog::open(&audit_path) {
+                Ok(log) => log,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        path = %audit_path.display(),
+                        "RS-0003: failed to open audit log"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let event = rockstream_types::audit::AuditEvent::now(
                 "system",
                 "server.started",
                 "rockstream",
             )
-            .with_detail(format!("storage={storage}, role={role}"));
+            .with_detail(format!("storage={storage}, role={role:?}"));
             audit_log
                 .append(&event)
                 .expect("failed to write audit event");
 
             // Run no-op pipeline
-            let result = rockstream_runtime::pipeline::run_noop_pipeline(storage_path);
+            let result = rockstream_runtime::pipeline::run_noop_pipeline(storage_path).await;
             tracing::info!(epochs = result.epochs_completed, "pipeline completed");
 
             // Create support bundle
@@ -68,7 +100,7 @@ fn main() {
             tracing::info!(path = %bundle_path.display(), "support bundle written");
 
             // Audit: server stopped
-            let event = rockstream_control::audit::AuditEvent::now(
+            let event = rockstream_types::audit::AuditEvent::now(
                 "system",
                 "server.stopped",
                 "rockstream",

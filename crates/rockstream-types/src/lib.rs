@@ -1,14 +1,26 @@
 //! Shared types for RockStream.
 //!
 //! This crate defines core types used across the RockStream system:
-//! timestamps, frontiers, Z-set rows, and schema definitions.
+//! timestamps, frontiers, Z-set rows, schema definitions, identity types,
+//! batch types, merge-law descriptors, and audit events.
 
+pub mod audit;
+pub mod batch;
 pub mod error_code;
+pub mod frontier;
+pub mod ids;
+pub mod merge_law;
 
-/// Placeholder module for timestamp types.
+/// Timestamp types.
 pub mod timestamp {
     /// A logical epoch number.
     pub type Epoch = u64;
+
+    /// Processing-time timestamp (wall-clock millis since Unix epoch).
+    pub type ProcessingTime = u64;
+
+    /// Event-time timestamp (application-defined millis since Unix epoch).
+    pub type EventTime = u64;
 }
 
 #[cfg(test)]

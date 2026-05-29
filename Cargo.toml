@@ -22,7 +22,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/geir-gronmo/rockstream"
+repository = "https://github.com/trickle-labs/rockstream"
 
 [workspace.dependencies]
 # Shared workspace dependencies
