@@ -63,11 +63,8 @@ impl MapOperator {
                 .into_array(1)
                 .expect("empty array from map expression");
             let out_schema = output_codec.schema();
-            let out_batch = arrow::record_batch::RecordBatch::try_new(
-                out_schema,
-                vec![array],
-            )
-            .expect("map output RecordBatch construction failed");
+            let out_batch = arrow::record_batch::RecordBatch::try_new(out_schema, vec![array])
+                .expect("map output RecordBatch construction failed");
             output_codec
                 .decode_batch_single(&out_batch)
                 .unwrap_or_else(|| (key.to_vec(), value.to_vec()))

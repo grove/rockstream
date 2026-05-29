@@ -96,8 +96,11 @@ pub fn read_fallback(key: &LawMetricKey) -> u64 {
     with_registry(|reg| reg.fallback.get(key).map(|c| c.get()).unwrap_or(0))
 }
 
-/// Reset all counters. Only for use in tests.
-#[cfg(test)]
+/// Reset all counters to zero.
+///
+/// For use in tests only. Calling this from production code has no effect on
+/// correctness but loses metric history.
+#[doc(hidden)]
 pub fn reset_all() {
     with_registry(|reg| {
         reg.applied.clear();

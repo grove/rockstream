@@ -92,6 +92,8 @@ pub const RS_4002: ErrorCode = ErrorCode::new(4002);
 // 5xxx: Upgrade / migration
 /// Incompatible storage format.
 pub const RS_5001: ErrorCode = ErrorCode::new(5001);
+/// Unknown merge law referenced in arrangement header.
+pub const RS_5002: ErrorCode = ErrorCode::new(5002);
 
 /// Metadata for a registered error code.
 pub struct ErrorCodeMeta {
@@ -124,6 +126,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         4001 => "Source connection failed",
         4002 => "Sink write failed",
         5001 => "Incompatible storage format",
+        5002 => "Unknown merge law in arrangement header",
         _ => "Unknown error",
     }
 }
@@ -136,6 +139,7 @@ pub fn severity(code: ErrorCode) -> Severity {
         3 => Severity::Error,
         3009 => Severity::Error,
         5001 => Severity::Fatal,
+        5002 => Severity::Fatal,
         _ => Severity::Error,
     }
 }
@@ -157,6 +161,7 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         4001 => "Verify source connection settings and network connectivity.",
         4002 => "Check sink availability and credentials.",
         5001 => "Run the storage migration tool before upgrading.",
+        5002 => "Register the merge law or migrate the arrangement before attaching the shard.",
         _ => "See documentation for this error code.",
     }
 }
@@ -194,7 +199,7 @@ mod tests {
     fn all_codes_have_descriptions() {
         let codes = [
             RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_2001, RS_2002,
-            RS_2003, RS_4001, RS_4002, RS_5001,
+            RS_2003, RS_4001, RS_4002, RS_5001, RS_5002,
         ];
         for code in codes {
             assert_ne!(

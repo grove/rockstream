@@ -17,6 +17,23 @@ use crate::error::StorageError;
 use crate::keys::ShardKeyEncoder;
 use crate::merge_registry::SumCountMergeOperator;
 
+/// Check whether `bytes` is a valid operand for `law`.
+///
+/// Uses the law's identity element to probe validity: `merge(bytes, identity)`
+/// must succeed. Falls back to `merge(bytes, bytes)` if the law has no
+/// identity (uncommon). For the identity element itself, `is_identity` short-
+/// circuits.
+fn is_valid_law_operand(law: &dyn rockstream_types::merge_law::LawBundle, bytes: &[u8]) -> bool {
+    if law.is_identity(bytes) {
+        return true;
+    }
+    if let Some(identity) = law.identity() {
+        law.merge(bytes, &identity).is_ok()
+    } else {
+        law.merge(bytes, bytes).is_ok()
+    }
+}
+
 /// A per-shard database backed by SlateDB.
 ///
 /// Each shard has its own `ShardDb` instance that provides:
@@ -225,15 +242,12 @@ impl ShardDb {
                     law_name: law.name(),
                     law_version: law.version().0,
                 };
-                // Attempt to interpret via law (identity check proves it is
-                // a valid operand).
-                if law.is_identity(&bytes) || law.merge(&bytes, &bytes).is_ok() {
+                if is_valid_law_operand(law, &bytes) {
                     rockstream_types::metrics::inc_applied(&metric_key);
-                    Ok(Some(bytes.to_vec()))
                 } else {
                     rockstream_types::metrics::inc_fallback(&metric_key);
-                    Ok(Some(bytes.to_vec()))
                 }
+                Ok(Some(bytes.to_vec()))
             }
         }
     }
@@ -247,7 +261,7 @@ impl ShardDb {
     /// - Otherwise the raw bytes are returned and `merge_law_fallback_total`
     ///   is incremented.
     ///
-    /// Returns a list of `(key, merged_value)` pairs in sorted key order.
+    /// Returns a list of `(key, value)` pairs in sorted key order.
     pub async fn scan_merged(
         &self,
         prefix: &[u8],
@@ -263,13 +277,12 @@ impl ShardDb {
         let results = entries
             .into_iter()
             .map(|(k, v)| {
-                if law.is_identity(&v) || law.merge(&v, &v).is_ok() {
+                if is_valid_law_operand(law, &v) {
                     rockstream_types::metrics::inc_applied(&metric_key);
-                    (k, v.to_vec())
                 } else {
                     rockstream_types::metrics::inc_fallback(&metric_key);
-                    (k, v.to_vec())
                 }
+                (k, v.to_vec())
             })
             .collect();
 

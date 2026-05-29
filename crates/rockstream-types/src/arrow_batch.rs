@@ -70,19 +70,14 @@ pub fn append_weight_column(
 /// Returns `None` if the batch has no `_weight` column.
 pub fn extract_weight_array(batch: &RecordBatch) -> Option<&Int64Array> {
     let idx = batch.schema().index_of(WEIGHT_COLUMN).ok()?;
-    batch
-        .column(idx)
-        .as_any()
-        .downcast_ref::<Int64Array>()
+    batch.column(idx).as_any().downcast_ref::<Int64Array>()
 }
 
 /// Split a weighted batch into (data batch, weights).
 ///
 /// The `_weight` column is removed from the returned data batch.
 /// Returns `None` if the batch has no `_weight` column.
-pub fn split_weight_column(
-    batch: &RecordBatch,
-) -> Option<(RecordBatch, Vec<i64>)> {
+pub fn split_weight_column(batch: &RecordBatch) -> Option<(RecordBatch, Vec<i64>)> {
     let idx = batch.schema().index_of(WEIGHT_COLUMN).ok()?;
 
     let weights: Vec<i64> = batch

@@ -543,3 +543,144 @@ async fn determinism_interleaved_operations() {
     assert_eq!(state1.len(), state2.len());
     assert_eq!(state1, state2);
 }
+
+// === Law-Aware Read Tests (v0.6) ===
+
+/// `get_merged` returns `Some(value)` for a key that exists and increments
+/// `merge_law_applied_total`.
+#[serial_test::serial]
+#[tokio::test]
+async fn get_merged_returns_value_and_increments_applied() {
+    use rockstream_types::laws::weight_add::encode_weight;
+    use rockstream_types::laws::weight_add::WeightAddV1;
+    use rockstream_types::merge_law::MergeLawId;
+    use rockstream_types::metrics::{read_applied, LawMetricKey};
+
+    let (db, _) = test_shard_db("test/get_merged_applied").await;
+    let law = WeightAddV1;
+
+    let metric_key = LawMetricKey {
+        law_id: MergeLawId(0x0001),
+        law_name: "WeightAdd",
+        law_version: 1,
+    };
+    let applied_before = read_applied(&metric_key);
+
+    let key = b"arr_key_1";
+    let value = encode_weight(42);
+    db.put(key, &value).await.unwrap();
+
+    let result = db.get_merged(key, &law).await.unwrap();
+    assert!(result.is_some());
+
+    let applied_after = read_applied(&metric_key);
+    assert!(
+        applied_after > applied_before,
+        "applied counter must have incremented"
+    );
+
+    db.close().await.unwrap();
+}
+
+/// `get_merged` returns `None` for a missing key (no metric incremented).
+#[serial_test::serial]
+#[tokio::test]
+async fn get_merged_missing_key_returns_none() {
+    use rockstream_types::laws::weight_add::WeightAddV1;
+    use rockstream_types::merge_law::MergeLawId;
+    use rockstream_types::metrics::{read_applied, read_fallback, LawMetricKey};
+
+    let (db, _) = test_shard_db("test/get_merged_none").await;
+    let law = WeightAddV1;
+
+    let metric_key = LawMetricKey {
+        law_id: MergeLawId(0x0001),
+        law_name: "WeightAdd",
+        law_version: 1,
+    };
+    let applied_before = read_applied(&metric_key);
+    let fallback_before = read_fallback(&metric_key);
+
+    let result = db.get_merged(b"no_such_key", &law).await.unwrap();
+    assert!(result.is_none());
+
+    // No increment for a missing key
+    assert_eq!(read_applied(&metric_key), applied_before);
+    assert_eq!(read_fallback(&metric_key), fallback_before);
+
+    db.close().await.unwrap();
+}
+
+/// `scan_merged` returns all prefix entries and increments applied counter.
+#[serial_test::serial]
+#[tokio::test]
+async fn scan_merged_returns_entries_and_increments_applied() {
+    use rockstream_types::laws::weight_add::encode_weight;
+    use rockstream_types::laws::weight_add::WeightAddV1;
+    use rockstream_types::merge_law::MergeLawId;
+    use rockstream_types::metrics::{read_applied, LawMetricKey};
+
+    let (db, _) = test_shard_db("test/scan_merged_applied").await;
+    let law = WeightAddV1;
+
+    let metric_key = LawMetricKey {
+        law_id: MergeLawId(0x0001),
+        law_name: "WeightAdd",
+        law_version: 1,
+    };
+    let applied_before = read_applied(&metric_key);
+
+    // Write two valid WeightAdd values under the same prefix
+    db.put(b"arr/k1", &encode_weight(10)).await.unwrap();
+    db.put(b"arr/k2", &encode_weight(20)).await.unwrap();
+    db.put(b"other/k3", b"unrelated").await.unwrap();
+
+    let results = db.scan_merged(b"arr/", &law).await.unwrap();
+    assert_eq!(results.len(), 2);
+
+    let applied_after = read_applied(&metric_key);
+    assert_eq!(
+        applied_after - applied_before,
+        2,
+        "each valid entry must increment applied"
+    );
+
+    db.close().await.unwrap();
+}
+
+/// `scan_merged` falls back and increments `merge_law_fallback_total` when
+/// the stored bytes are not valid for the law (simulates disabled
+/// read-path resolution).
+#[serial_test::serial]
+#[tokio::test]
+async fn scan_merged_fallback_increments_fallback_metric() {
+    use rockstream_types::laws::weight_add::WeightAddV1;
+    use rockstream_types::merge_law::MergeLawId;
+    use rockstream_types::metrics::{read_fallback, LawMetricKey};
+
+    let (db, _) = test_shard_db("test/scan_merged_fallback").await;
+    let law = WeightAddV1;
+
+    let metric_key = LawMetricKey {
+        law_id: MergeLawId(0x0001),
+        law_name: "WeightAdd",
+        law_version: 1,
+    };
+    let fallback_before = read_fallback(&metric_key);
+
+    // Write bytes that WeightAddV1 cannot parse as a valid operand
+    // (wrong length — WeightAdd expects exactly 8 bytes for i64)
+    db.put(b"arr/bad1", b"BADBYTES_NOT_8").await.unwrap();
+    db.put(b"arr/bad2", b"X").await.unwrap();
+
+    let results = db.scan_merged(b"arr/", &law).await.unwrap();
+    assert_eq!(results.len(), 2, "fallback still returns raw bytes");
+
+    let fallback_after = read_fallback(&metric_key);
+    assert!(
+        fallback_after > fallback_before,
+        "fallback counter must increment for invalid operands"
+    );
+
+    db.close().await.unwrap();
+}

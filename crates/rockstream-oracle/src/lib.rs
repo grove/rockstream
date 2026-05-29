@@ -9,6 +9,7 @@
 //! (where declared), serialization round-trip, and fail-closed malformed
 //! operand handling.
 
+pub mod batch_oracle;
 pub mod law_harness;
 
 #[cfg(test)]

@@ -75,9 +75,8 @@ impl ProjectOperator {
 
             // Build output RecordBatch from evaluated columns.
             let out_schema = output_codec.schema();
-            let out_batch =
-                arrow::record_batch::RecordBatch::try_new(out_schema, result_columns)
-                    .expect("projection output RecordBatch construction failed");
+            let out_batch = arrow::record_batch::RecordBatch::try_new(out_schema, result_columns)
+                .expect("projection output RecordBatch construction failed");
 
             output_codec.decode_batch_single(&out_batch)
         });
