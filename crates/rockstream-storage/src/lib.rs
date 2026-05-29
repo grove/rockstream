@@ -7,6 +7,7 @@
 //! - `DbReader` for cross-shard snapshot reads
 //! - Merge operator registry for associative aggregates
 //! - WAL reader utilities
+//! - WAL listing cache (hot-path LIST avoidance, DESIGN.md §9.1)
 //!
 //! No code path depends on range deletion. Cleanup uses
 //! scan-and-delete or compaction-filter patterns.
@@ -17,12 +18,14 @@ pub mod merge_registry;
 pub mod reader;
 pub mod shard_db;
 pub mod wal;
+pub mod wal_cache;
 
 pub use error::StorageError;
 pub use keys::{CatalogKeyEncoder, ShardKeyEncoder, ShardPrefix};
 pub use merge_registry::{MergeOperatorRegistry, SumCountMergeOperator};
 pub use reader::ShardReader;
-pub use shard_db::ShardDb;
+pub use shard_db::{ShardDb, WriteBatch};
+pub use wal_cache::WalListingCache;
 
 #[cfg(test)]
 mod tests;

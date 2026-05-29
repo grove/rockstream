@@ -8,15 +8,22 @@
 //! Credit-based backpressure: the task holds a credit token for each in-flight
 //! input batch. When credits are exhausted, the upstream source is implicitly
 //! paused because the bounded channel fills up.
+//!
+//! Cooperative scheduling (DESIGN.md §9.3): when a `ProcessDelta` input
+//! contains more rows than `SchedulerConfig::max_rows_per_quantum`, the task
+//! splits the work into chunks and calls `tokio::task::yield_now()` between
+//! each chunk. This prevents a single expensive epoch from starving heartbeat
+//! sends and frontier reports running as separate tokio tasks.
 
 use tokio::sync::mpsc;
 
-use rockstream_types::batch::ZSetBatch;
+use rockstream_types::batch::{ZSet, ZSetBatch};
 use rockstream_types::ids::OperatorId;
 use rockstream_types::timestamp::Epoch;
 
 use crate::epoch_output::EpochOutput;
 use crate::operator::Operator;
+use crate::scheduler::{SchedulerConfig, YieldCounter};
 
 /// Command sent to an operator task.
 #[derive(Debug)]
@@ -43,6 +50,9 @@ pub struct OperatorTaskHandle {
 /// Returns an `OperatorTaskHandle` for sending commands to the task and a
 /// receiver for collecting `EpochOutput` fragments.
 ///
+/// Uses `SchedulerConfig::default()` (quantum = 65536). For custom quantum
+/// sizing or yield-ratio metrics, use `spawn_operator_task_with_config`.
+///
 /// # Parameters
 /// - `operator_id`: Unique ID for this operator instance.
 /// - `operator`: The boxed `Operator` implementation.
@@ -52,9 +62,37 @@ pub struct OperatorTaskHandle {
 ///   is applied to the sender.
 pub fn spawn_operator_task(
     operator_id: OperatorId,
+    operator: Box<dyn Operator>,
+    output_tx: mpsc::Sender<EpochOutput>,
+    cmd_buffer: usize,
+) -> OperatorTaskHandle {
+    spawn_operator_task_with_config(
+        operator_id,
+        operator,
+        output_tx,
+        cmd_buffer,
+        SchedulerConfig::default(),
+        YieldCounter::new(),
+    )
+}
+
+/// Run an operator as a background tokio task with explicit scheduler config.
+///
+/// Identical to `spawn_operator_task` but accepts a `SchedulerConfig` for
+/// quantum sizing and a `YieldCounter` for metric reporting.
+///
+/// When `input.zset.len() > config.max_rows_per_quantum`, the task splits
+/// the input into chunks of `max_rows_per_quantum` rows, processes each
+/// chunk, calls `tokio::task::yield_now()` between chunks, and records the
+/// yield in `yield_counter`. This is the cooperative scheduling contract
+/// described in DESIGN.md §9.3.
+pub fn spawn_operator_task_with_config(
+    operator_id: OperatorId,
     mut operator: Box<dyn Operator>,
     output_tx: mpsc::Sender<EpochOutput>,
     cmd_buffer: usize,
+    config: SchedulerConfig,
+    yield_counter: YieldCounter,
 ) -> OperatorTaskHandle {
     let (tx, mut rx) = mpsc::channel::<OperatorCmd>(cmd_buffer);
 
@@ -62,9 +100,53 @@ pub fn spawn_operator_task(
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 OperatorCmd::ProcessDelta { epoch, input } => {
-                    let delta = operator.process_delta(&input).await;
+                    yield_counter.record_epoch();
+                    let row_count = input.zset.len() as u64;
+                    let quantum = config.max_rows_per_quantum;
+
+                    let delta = if row_count > quantum {
+                        // Quantum-bounded path: split input into chunks, yielding
+                        // between each so other tokio tasks (heartbeats, frontier
+                        // reporters) get scheduling opportunities.
+                        let rows: Vec<_> = input.zset.iter().collect();
+                        let chunk_size = quantum as usize;
+                        let total_chunks = rows.len().div_ceil(chunk_size);
+                        let mut accumulated = ZSet::new();
+                        let mut did_yield = false;
+
+                        for (i, chunk) in rows.chunks(chunk_size).enumerate() {
+                            let mut chunk_zset = ZSet::new();
+                            for row in chunk {
+                                chunk_zset.insert(row.key.clone(), row.value.clone(), row.weight);
+                            }
+                            let chunk_batch = ZSetBatch {
+                                zset: chunk_zset,
+                                epoch,
+                            };
+                            let partial = operator.process_delta(&chunk_batch).await;
+                            accumulated.merge(&partial.zset);
+
+                            // Yield between chunks (not after the last one).
+                            if i + 1 < total_chunks {
+                                did_yield = true;
+                                tokio::task::yield_now().await;
+                            }
+                        }
+
+                        if did_yield {
+                            yield_counter.record_yield();
+                        }
+
+                        ZSetBatch {
+                            zset: accumulated,
+                            epoch,
+                        }
+                    } else {
+                        // Fast path: batch fits within one quantum.
+                        operator.process_delta(&input).await
+                    };
+
                     let output = EpochOutput::new(operator_id, epoch, delta, false);
-                    // Best-effort send; if the coordinator has shut down, stop.
                     if output_tx.send(output).await.is_err() {
                         break;
                     }
@@ -75,8 +157,8 @@ pub fn spawn_operator_task(
                     let final_out = EpochOutput::new(
                         operator_id,
                         epoch,
-                        rockstream_types::batch::ZSetBatch {
-                            zset: rockstream_types::batch::ZSet::new(),
+                        ZSetBatch {
+                            zset: ZSet::new(),
                             epoch,
                         },
                         true,

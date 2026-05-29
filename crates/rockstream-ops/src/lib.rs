@@ -12,6 +12,7 @@ pub mod noop;
 pub mod operator;
 pub mod project;
 pub mod row_codec;
+pub mod scheduler;
 pub mod task;
 
 #[cfg(test)]
