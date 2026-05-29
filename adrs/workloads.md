@@ -254,3 +254,31 @@ This would provide Materialize-style hard isolation for workloads that require i
 while keeping the default path (shared worker pool + soft constraints) simple and
 cost-efficient. This is not part of the current design; it is noted here to ensure
 the schema evolution path is not accidentally closed off.
+
+### Cross-schema view tagging and bulk operations
+
+The current design supports per-view and per-schema lifecycle operations (pause, resume).
+However, users may want to group related views across multiple schemas for bulk operations
+without moving them into a shared schema.
+
+A tagging system would enable this:
+
+```sql
+CREATE MATERIALIZED VIEW reporting.daily_summary AS
+  SELECT ...
+TAGS ('critical', 'sla_sensitive', 'pii');
+
+CREATE MATERIALIZED VIEW data_science.model_input AS
+  SELECT ...
+TAGS ('sla_sensitive', 'batch_only');
+
+-- Later, bulk operations across schema boundaries:
+ALTER VIEWS WITH TAG 'critical' SET PRIORITY = 'high';
+ALTER VIEWS WITH TAG 'critical' PAUSE;
+ALTER VIEWS WITH TAG 'pii' REQUIRES ENCRYPTION;
+```
+
+This would be orthogonal to workloads and schemas, allowing more flexible operational
+groupings. Tags would be persisted as first-class metadata and queryable via catalog
+views. This is deferred to a follow-on design to keep the current scope focused on
+workloads as the primary resource management construct.
