@@ -12,3 +12,7 @@ rockstream-types = { workspace = true }
 rockstream-plan = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+rockstream-diff = { workspace = true }
+rockstream-runtime = { workspace = true }

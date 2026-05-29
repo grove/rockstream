@@ -108,81 +108,88 @@ pub fn spawn_operator_task_with_config(
 ) -> OperatorTaskHandle {
     let (tx, mut rx) = mpsc::channel::<OperatorCmd>(cmd_buffer);
 
-    spawner.spawn_box("operator-task", Box::pin(async move {
-        while let Some(cmd) = rx.recv().await {
-            match cmd {
-                OperatorCmd::ProcessDelta { epoch, input } => {
-                    yield_counter.record_epoch();
-                    let row_count = input.zset.len() as u64;
-                    let quantum = config.max_rows_per_quantum;
+    spawner.spawn_box(
+        "operator-task",
+        Box::pin(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    OperatorCmd::ProcessDelta { epoch, input } => {
+                        yield_counter.record_epoch();
+                        let row_count = input.zset.len() as u64;
+                        let quantum = config.max_rows_per_quantum;
 
-                    let delta = if row_count > quantum {
-                        // Quantum-bounded path: split input into chunks, yielding
-                        // between each so other tokio tasks (heartbeats, frontier
-                        // reporters) get scheduling opportunities.
-                        let rows: Vec<_> = input.zset.iter().collect();
-                        let chunk_size = quantum as usize;
-                        let total_chunks = rows.len().div_ceil(chunk_size);
-                        let mut accumulated = ZSet::new();
-                        let mut did_yield = false;
+                        let delta = if row_count > quantum {
+                            // Quantum-bounded path: split input into chunks, yielding
+                            // between each so other tokio tasks (heartbeats, frontier
+                            // reporters) get scheduling opportunities.
+                            let rows: Vec<_> = input.zset.iter().collect();
+                            let chunk_size = quantum as usize;
+                            let total_chunks = rows.len().div_ceil(chunk_size);
+                            let mut accumulated = ZSet::new();
+                            let mut did_yield = false;
 
-                        for (i, chunk) in rows.chunks(chunk_size).enumerate() {
-                            let mut chunk_zset = ZSet::new();
-                            for row in chunk {
-                                chunk_zset.insert(row.key.clone(), row.value.clone(), row.weight);
+                            for (i, chunk) in rows.chunks(chunk_size).enumerate() {
+                                let mut chunk_zset = ZSet::new();
+                                for row in chunk {
+                                    chunk_zset.insert(
+                                        row.key.clone(),
+                                        row.value.clone(),
+                                        row.weight,
+                                    );
+                                }
+                                let chunk_batch = ZSetBatch {
+                                    zset: chunk_zset,
+                                    epoch,
+                                };
+                                let partial = operator.process_delta(&chunk_batch).await;
+                                accumulated.merge(&partial.zset);
+
+                                // Yield between chunks (not after the last one).
+                                if i + 1 < total_chunks {
+                                    did_yield = true;
+                                    tokio::task::yield_now().await;
+                                }
                             }
-                            let chunk_batch = ZSetBatch {
-                                zset: chunk_zset,
+
+                            if did_yield {
+                                yield_counter.record_yield();
+                            }
+
+                            ZSetBatch {
+                                zset: accumulated,
                                 epoch,
-                            };
-                            let partial = operator.process_delta(&chunk_batch).await;
-                            accumulated.merge(&partial.zset);
-
-                            // Yield between chunks (not after the last one).
-                            if i + 1 < total_chunks {
-                                did_yield = true;
-                                tokio::task::yield_now().await;
                             }
-                        }
+                        } else {
+                            // Fast path: batch fits within one quantum.
+                            operator.process_delta(&input).await
+                        };
 
-                        if did_yield {
-                            yield_counter.record_yield();
+                        let output = EpochOutput::new(operator_id, epoch, delta, false);
+                        if output_tx.send(output).await.is_err() {
+                            break;
                         }
-
-                        ZSetBatch {
-                            zset: accumulated,
-                            epoch,
-                        }
-                    } else {
-                        // Fast path: batch fits within one quantum.
-                        operator.process_delta(&input).await
-                    };
-
-                    let output = EpochOutput::new(operator_id, epoch, delta, false);
-                    if output_tx.send(output).await.is_err() {
-                        break;
                     }
-                }
-                OperatorCmd::EpochComplete { epoch } => {
-                    operator.epoch_complete(epoch).await;
-                    // Send final fragment to signal epoch boundary.
-                    let final_out = EpochOutput::new(
-                        operator_id,
-                        epoch,
-                        ZSetBatch {
-                            zset: ZSet::new(),
+                    OperatorCmd::EpochComplete { epoch } => {
+                        operator.epoch_complete(epoch).await;
+                        // Send final fragment to signal epoch boundary.
+                        let final_out = EpochOutput::new(
+                            operator_id,
                             epoch,
-                        },
-                        true,
-                    );
-                    if output_tx.send(final_out).await.is_err() {
-                        break;
+                            ZSetBatch {
+                                zset: ZSet::new(),
+                                epoch,
+                            },
+                            true,
+                        );
+                        if output_tx.send(final_out).await.is_err() {
+                            break;
+                        }
                     }
+                    OperatorCmd::Shutdown => break,
                 }
-                OperatorCmd::Shutdown => break,
             }
-        }
-    }));
+        }),
+    );
 
     OperatorTaskHandle { operator_id, tx }
 }
