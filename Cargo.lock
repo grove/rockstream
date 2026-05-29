@@ -3433,6 +3433,7 @@ version = "0.9.0"
 dependencies = [
  "clap",
  "rockstream-control",
+ "rockstream-plan",
  "rockstream-runtime",
  "rockstream-types",
  "tokio",
@@ -3452,6 +3453,7 @@ name = "rockstream-connectors"
 version = "0.9.0"
 dependencies = [
  "async-trait",
+ "rand 0.8.6",
  "rockstream-types",
  "tokio",
  "tracing",
@@ -3527,7 +3529,9 @@ dependencies = [
  "object_store 0.12.5",
  "rockstream-connectors",
  "rockstream-control",
+ "rockstream-diff",
  "rockstream-ops",
+ "rockstream-plan",
  "rockstream-storage",
  "rockstream-types",
  "serde",

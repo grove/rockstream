@@ -10,7 +10,9 @@ description = "Worker process, circuit executor, scheduler, and exchange for Roc
 rockstream-types = { workspace = true }
 rockstream-connectors = { workspace = true }
 rockstream-control = { workspace = true }
+rockstream-diff = { workspace = true }
 rockstream-ops = { workspace = true }
+rockstream-plan = { workspace = true }
 rockstream-storage = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
