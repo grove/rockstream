@@ -1488,160 +1488,459 @@ perform coordinated maintenance across a group of related views.
 
 ### 34. Glossary
 
-**Arrangement** — Indexed operator state, typically a key-value map of
-the data an operator needs to support incremental updates. The state of
-a join, for example, is an arrangement of each side's rows indexed by
-the join key.
+**Arrangement** — The internal data structure an operator maintains to
+support incremental updates. Think of it as an indexed table that lives
+inside the engine, keyed in exactly the way the operator needs. A join
+operator, for example, keeps one arrangement per join side: the left
+side is indexed by the join key so that when a right-side row arrives,
+the operator can instantly look up all matching left-side rows without
+scanning anything. An aggregation operator keeps one arrangement per
+group key, storing the running partial result (e.g. the current `SUM`
+and row count). Arrangements are what make incremental maintenance fast
+— rather than re-scanning source data on every update, operators read
+and update only the relevant entries. Arrangement size is the primary
+cost of a materialized view; `EXPLAIN INCREMENTAL VERBOSE` shows you
+exactly how much each operator is using.
 
-**Backpressure** — A mechanism by which downstream operators (or sinks)
-signal upstream that they cannot accept more data, causing upstream to
-slow down. In RockStream, implemented via the credit system on
-connectors.
+**Backpressure** — The mechanism by which a slow consumer tells a fast
+producer to slow down. Without backpressure, a connector reading from
+Kafka faster than the engine can process would eventually exhaust memory.
+RockStream handles this via a credit system: each connector has a credit
+balance representing how many bytes of data it is allowed to hand to the
+engine. As the engine processes data, it replenishes credits. When
+credits reach zero, the connector pauses and waits. Backpressure is
+entirely automatic; operators never configure it. Its visible effect is
+a slightly lower observed input rate when the engine is under pressure
+— which is exactly the right behavior.
 
-**Cadence** — How often a workload closes epochs. The four modes are
-deferred low-latency, periodic, calculated, and immediate.
+**Cadence** — How often a workload closes epochs and commits their
+results to storage. Cadence is the knob between freshness and cost: more
+frequent commits mean fresher data but more per-row overhead; less
+frequent commits mean staler data but more work coalesced per commit.
+RockStream offers four modes. *Deferred low-latency* (the default)
+closes epochs as fast as the SLO requires, typically every ten to a few
+hundred milliseconds. *Periodic* closes epochs at a fixed wall-clock
+interval regardless of load. *Calculated* derives the cadence from what
+downstream consumers actually need, so you don't over-maintain an
+upstream view. *Immediate* commits synchronously within the writing
+transaction, available only for simple single-shard views. In practice
+you set a freshness SLO and let the system choose its cadence.
 
-**Connector** — A piece of code that bridges between an external system
-(Kafka, PostgreSQL, S3, etc.) and the RockStream engine, exposing the
-external data as a source or accepting the engine's output as a sink.
+**Change retention** — How long a view's change history is kept
+available for subscribers to resume from after a disconnect. When a
+`SUBSCRIBE` connection drops and reconnects, it can specify an epoch to
+resume from. If that epoch is within the change retention window, the
+subscriber receives exactly the changes it missed — no data lost, no
+need to restart from scratch. If the epoch is older than the retention
+window, the subscriber gets an error (`RS-2005`) and must restart with a
+full snapshot. The default is one hour, configurable per view with
+`CHANGE_RETENTION`. Longer retention costs more storage in the change
+log; shorter retention reduces storage but increases the risk that a
+slow subscriber has to re-snapshot.
 
-**Coordination group** — A set of views that the system treats as a
-single consistency unit. Diamonds (two views from a common source, a
-third view joining them) are the most common example.
+**Connector** — A piece of code that bridges one external system and the
+RockStream engine. Source connectors translate external events (Kafka
+messages, Postgres CDC rows, S3 Parquet files, HTTP webhook payloads)
+into the engine's internal delta format. Sink connectors do the reverse:
+they accept committed view deltas and write them to external systems
+(Kafka topics, Iceberg tables, downstream databases). All connectors
+implement the same interface — opaque offset tokens for exactly-once
+replay and a backpressure credit signal — so the engine doesn't care
+what's on the other end. RockStream ships built-in connectors for Kafka,
+PostgreSQL CDC, S3, Iceberg, and an internal direct-write path.
+Third-party connectors can be built against the published SDK.
 
-**Delta** — A change, typically expressed as a Z-set. A delta might
-contain inserts (+1 weight) and deletes (-1 weight). Operators process
-deltas; they don't reprocess whole tables.
+**Coordination group** — A set of views that the engine treats as a
+single consistency unit, ensuring that a query joining them always sees
+all of them at the same epoch. The classic case is the diamond pattern:
+two views both read from the same upstream source, and a third view
+joins those two. Without coordination, the third view could see the
+first intermediate view at epoch 42 and the second at epoch 41, mixing
+data from different instants. With a coordination group, the third view
+waits until both intermediates have published a frontier of at least 42
+before processing epoch 42. This is enforced automatically by the
+frontier protocol — the engine detects the diamond in the view
+dependency graph and enforces the invariant without any user
+configuration.
 
-**Epoch** — A batch of input changes processed and committed together
-as an atomic unit. Epoch durations are bounded by the cadence and the
-SLO.
+**Dead-letter queue (DLQ)** — A per-source safety net for records that
+failed to decode. When a connector encounters a message it can't parse
+— because the payload is corrupt, the schema changed, or a required
+field is missing — it doesn't crash, skip the record silently, or block
+the entire source. Instead, it routes the record to the DLQ: a catalog
+table you can query with regular SQL. Each DLQ entry stores the arrival
+time, source offset, error code and message, the raw bytes as hex (so
+you can inspect or reprocess them externally), and a `replay_attempt`
+counter tracking how many times the record has been replayed. You can
+replay entries after fixing the underlying issue or dismiss ones that
+are permanently unrecoverable. The system warns you automatically when
+entries accumulate faster than a configurable threshold
+(`dlq_warn_threshold`, default 100 per hour).
 
-**Frontier** — A piece of metadata published by an operator that says
-"I have processed everything up to epoch *N* and I will not send you
-older updates." Frontiers are the protocol RockStream uses to
-coordinate progress across operators and shards.
+**Delta** — A description of change, not a description of state. Rather
+than saying "the NORTH region's revenue is 1100," a delta says "the
+NORTH region's revenue went up by 42." This is the fundamental
+representation RockStream uses internally: instead of storing snapshots
+and recomputing from scratch, operators receive deltas and apply them to
+their existing state. A delta is expressed as a Z-set — a set of rows
+each carrying an integer weight: +1 for an insertion, -1 for a
+deletion. An update is modeled as a -1 row (old value) plus a +1 row
+(new value). The reason this matters is that almost every relational
+operation can be applied to a delta to produce a new delta — a filter
+applied to a delta produces a delta of filtered changes, an aggregate
+applied to a delta produces a delta of aggregate changes. This property
+is what makes the entire incremental engine work.
 
-**Inline view** — A view defined with `CREATE VIEW` (not `CREATE
-MATERIALIZED VIEW`). Stored as a SQL fragment; expanded inline when
-referenced. Consumes no state.
+**Epoch** — An atomic batch of input changes that gets processed and
+committed together. When an epoch ends, every change in that epoch —
+every view row update, every arrangement state write, every piece of
+operator metadata — is written to SlateDB as a single atomic batch.
+Either all of it lands, or none of it does. This all-or-nothing property
+is what lets the system recover from crashes without losing data or
+producing partial results. Epochs also bound the freshness: if your
+SLO is 200 ms and the epoch is 100 ms, the worst-case lag from input
+to visible output is roughly 300 ms (one full epoch plus processing
+time). Short epochs improve freshness; long epochs reduce overhead. The
+system tunes epoch duration to stay inside the SLO.
 
-**Materialized view** — A view defined with `CREATE MATERIALIZED VIEW`.
-Continuously maintained by the engine; queryable like a table. Consumes
-storage proportional to its result size plus operator state.
+**Frontier** — A lightweight, monotonically advancing progress marker
+published by each operator. An operator's frontier says: "I have
+finished processing everything up to epoch N, and I will never produce
+updates at any epoch earlier than that." Downstream operators read their
+inputs' frontiers before they act — they only process epoch N when all
+their inputs have published a frontier of N or higher. This substitutes
+cheap metadata reads for expensive distributed locking. Frontiers are
+monotonic: they can only ever advance, never retreat. That monotonicity
+is what lets consumers act on a frontier without fear of contradiction.
+The frontier protocol is the core coordination mechanism of the entire
+engine.
 
-**Namespace** — An isolation boundary roughly analogous to a PostgreSQL
-database. Catalog objects, workloads, quotas, and access control are
-scoped to a namespace.
+**Inline view** — A view created with `CREATE VIEW` (without
+`MATERIALIZED`). It is stored as a SQL fragment in the catalog and
+expanded — inlined — into any query or materialized view that references
+it at plan compilation time. It consumes no storage, no arrangement
+state, and no operator instances. Nothing about an inline view runs
+continuously; it is purely a macro that saves copy-pasting the same SQL.
+The trade-off is that every materialized view that references the same
+inline view independently performs the inline view's computation. If
+that computation is expensive and shared across many materialized views,
+it is more efficient to promote it to a materialized view of its own so
+the computation is shared.
 
-**Workload** — A named resource policy. Groups related views under a
-shared freshness SLO, memory limit, and priority. The unit of
-operational intent.
+**Lifecycle state** — A named, machine-readable label describing what a
+materialized view is currently doing and whether operator attention is
+needed. Rather than surfacing a wall of metrics and leaving you to
+diagnose the situation yourself, RockStream distills the view's
+condition into a single named state. HEALTHY means everything is fine.
+BUILDING means the initial backfill is running and the view is
+queryable but may be incomplete. RECOVERING means a worker restarted
+and is replaying from a checkpoint. STRESSED means the SLO is met but
+resources are nearly exhausted — a warning to plan capacity before
+hitting a problem. OVER_BUDGET_RELAXED means the memory limit was hit
+and the system is voluntarily degrading freshness to stay within budget.
+REPLACING means a replacement view is hydrating in the background.
+BLOCKED means a non-recoverable error requires manual intervention.
+Each non-HEALTHY state maps to a documented action.
 
-**Quota** — A resource cap (state bytes, object-store rate, etc.)
-applied at the workload or namespace level.
+**Materialized view** — A SQL query whose result is continuously
+maintained by the engine as the underlying source data changes. Unlike
+a table, you never write to it directly — the engine writes to it for
+you, applying deltas as inputs arrive. Unlike a traditional database
+materialized view, there is no `REFRESH` step; the view is always
+current to within the workload's SLO. It occupies storage proportional
+to its result size, plus arrangement state for the intermediate
+computation. Querying it is no different from querying a table. The
+cost model is inverted compared to a regular query: you pay upfront at
+write time (maintaining the view incrementally) and each read is cheap.
+This is the right trade-off when many clients read the same result
+frequently.
 
-**Shard** — A partition of the cluster's state. Each shard is owned by
-one worker and corresponds to one SlateDB instance.
+**Namespace** — An isolation boundary that groups related catalog
+objects, workloads, and users together, roughly analogous to a database
+in PostgreSQL. All catalog objects (tables, views, workloads, connectors)
+belong to a namespace. Resource quotas are enforced per namespace, so
+one team's runaway workload cannot consume capacity allocated to another
+team. Access control is also scoped to namespaces — a user can have full
+rights in namespace A and no visibility into namespace B. Connections
+route to a namespace via the connection string, exactly like a database
+name in Postgres. For single-team deployments the default namespace is
+fine; namespaces become important when multiple teams share a cluster.
 
-**Sink** — A destination for view output, typically an external system
-like Kafka, Iceberg, or another database. Optional; views can be
-queried directly without a sink.
+**Quota** — A hard or soft resource cap applied at the workload or
+namespace level, preventing any single workload or tenant from consuming
+more than its share of the cluster. The most important quota is the
+memory limit (`MEMORY_LIMIT`), which caps how much arrangement state the
+views in a workload can collectively hold. There are also object-store
+RPS quotas and CPU quotas. Quotas are enforced continuously; when a
+workload approaches its limit the system emits proactive warnings
+(RS-5018 at 80%, RS-5019 at 95%). If the limit is exceeded, the system
+degrades freshness gracefully rather than crashing or dropping data.
 
-**SLO (service-level objective)** — A workload-level promise about
-freshness, memory limit, or priority. The system tunes itself to meet
-the SLO.
+**Shard** — A partition of the cluster's state. Each shard is a
+self-contained SlateDB instance, owned by exactly one worker at any
+given moment. Sharding lets RockStream scale beyond a single machine:
+different shards can live on different workers, and work is parallelized
+across them. When a worker dies, its shards are reassigned to other
+workers. The number of shards for a workload can be expanded through a
+rebalance. More shards mean more parallelism and higher throughput, but
+also more overhead from cross-shard shuffles and metadata management.
+The system manages shard placement automatically.
 
-**Source** — An input that feeds views. Defined via a connector pointing
-at an external system or via RockStream's internal write API.
+**Sink** — A destination for a view's output. Sinks are optional: you
+can query a materialized view directly without ever configuring one.
+When you want to forward view output to an external system — writing
+updated rows to a Kafka topic, appending new partitions to an Iceberg
+table, pushing changes to a downstream database — you add a sink
+connector. Sinks implement the same exactly-once commit protocol as
+sources: they receive `prepare`/`commit`/`abort` calls aligned with the
+engine's epoch boundaries, so every external write is atomic and
+idempotent with respect to crashes.
 
-**Watermark** — A piece of event-time metadata emitted by connectors
-that tells time-window operators when they can close a window.
-Separate from frontiers, which track processing progress.
+**SLO (service-level objective)** — A workload-level declaration of the
+outcome you want, rather than a configuration of how to achieve it. The
+freshness SLO says "I want my views to be at most N seconds behind their
+inputs." The memory limit says "I don't want to spend more than X GB on
+arrangement state." The priority says "when the cluster is contended,
+this workload matters more than lower-priority ones." The engine then
+tunes its internal knobs — epoch size, parallelism, source throttling,
+shard placement — to honor those targets. SLO compliance (a 0.0–1.0
+metric per view) tells you whether the target is being met. When it
+falls below 1.0, the engine reports a named degradation reason so you
+know exactly what to change.
 
-**Z-set** — A multiset with integer weights. The data type that flows
-between operators in RockStream.
-
-**Change retention** — How long a view keeps its change history
-available for subscribers to resume from. Default 1 hour; configurable
-per view via `CHANGE_RETENTION`.
-
-**Dead-letter queue (DLQ)** — A per-source catalog table holding
-records that failed to decode. Queryable, replayable, dismissable.
-
-**Lifecycle state** — A named state (HEALTHY, BUILDING, BACKFILLING,
-RECOVERING, STRESSED, OVER_BUDGET_RELAXED, RPS_THROTTLED, PAUSED,
-REPLACING, BLOCKED) indicating what a view is doing and whether
-action is needed.
+**Source** — The input side of a pipeline. A source is declared with
+`CREATE SOURCE` and points at an external system via a connector, or at
+RockStream's internal direct-write path for applications that push rows
+directly via SQL DML. Sources produce a continuous stream of deltas that
+flow into the engine's operator graph. Sources can be paused for bulk
+loads or maintenance windows, gated on watermark alignment, or limited
+by partition filters if the connector supports them. A source's
+exactly-once delivery guarantee is built on opaque offset tokens: the
+connector remembers where it is, the engine stores that token durably,
+and on restart the connector resumes from the last committed offset.
 
 **Subscribe** — A long-lived SQL connection that streams view changes
-to the client as they commit. Supports filtering, projection, and
-resumption from a past epoch.
+to the client as the engine commits them, instead of requiring the
+client to poll with repeated `SELECT` statements. A subscriber sees
+every change to the view in real time, with metadata indicating whether
+each row was inserted (+1) or deleted (-1). Subscribing is ideal for
+event-driven architectures: cache invalidation, pushing updates to
+downstream Kafka topics, notifying application services of changes.
+Subscribers can apply server-side filters and column projections to
+reduce network traffic. They can resume from a past epoch after a
+disconnect — within the change retention window — without missing any
+updates. For bootstrapping, `AS OF NOW WITH SNAPSHOT` first delivers
+the full current state and then switches to live deltas.
 
-**View replacement** — Zero-downtime upgrade of a view's definition via
-`CREATE REPLACEMENT MATERIALIZED VIEW ... FOR ...`, followed by
-`APPLY REPLACEMENT` (or `DISCARD REPLACEMENT` to abandon).
+**View replacement** — A mechanism for upgrading a materialized view's
+definition with zero downtime. Instead of dropping the old view (which
+would create a gap in freshness and error out any running consumers),
+you create a replacement view that hydrates in the background while the
+original continues serving queries at full SLO. Once the replacement's
+frontier catches up to the original's frontier, you apply the swap
+atomically: the catalog flips query routing in one step, and the
+original view's resources are freed. Subscribers to the original view
+see the new definition without reconnecting. If something goes wrong
+during hydration, `DISCARD REPLACEMENT` abandons the shadow plan and
+the original is unaffected. View replacement is the recommended path
+for any breaking schema change, query restructuring, or join-key rename.
 
-**Write fence** — A cross-session token obtained via
-`rockstream.write_fence()` that lets a reader wait for a specific
-write made by a different session.
+**Watermark** — Event-time metadata emitted by source connectors to tell
+time-window operators when they can safely close a window. A watermark
+says "I believe no further events with event timestamps earlier than T
+will arrive." This is distinct from a frontier, which tracks processing
+progress (how many epochs have been committed). Watermarks track event
+time — when did something actually happen out in the world — while
+frontiers track how far the engine has advanced through the input
+stream. Both are needed for correct windowing: you need the watermark
+to know when to finalize a window's result, and the frontier to know
+when that finalized result is visible to consumers. For non-windowed
+queries, watermarks are irrelevant and the engine ignores them.
+
+**Workload** — A named resource policy that groups related materialized
+views under shared operational intent. A workload specifies a freshness
+SLO, a memory limit, and a priority. The engine builds a single shared
+operator graph for all views in the workload, so common subplans are
+computed once and fanned out to multiple view outputs — more efficient
+than maintaining each view independently. Workloads also form the unit
+of multi-tenancy: different workloads have independent resource budgets
+and priorities. A view that omits `WITH WORKLOAD` inherits its schema's
+default workload, which in turn falls back to the system default.
+
+**Write fence** — A cross-session coordination token that lets one
+service tell another "wait until you can see the write I just made."
+Within a single SQL session, RockStream already handles read-after-write
+automatically — a `SELECT` issued after an `INSERT` in the same session
+will always see the inserted row reflected in maintained views, with no
+extra work. The fence is for cross-service handoffs: service A inserts a
+row, calls `rockstream.write_fence()` to get a token, passes the token
+to service B (via a message queue, a REST response, a job record), and
+service B uses the token to wait only until that specific write is
+visible. Without the fence, service B would have to guess how long to
+sleep or poll repeatedly. With the fence, it waits exactly as long as
+necessary and no longer.
+
+**Z-set** — A multiset where each distinct row carries an integer weight.
+The weight represents how many times that row logically appears: +1
+means inserted, -1 means deleted, +2 means the same value appears in
+two upstream source rows. Z-sets are the fundamental unit of data that
+flows between operators in RockStream. The math works out cleanly:
+applying an SQL operation to the union of a current Z-set and a delta
+Z-set produces the same result as applying the operation to the current
+Z-set and then merging in the result of applying the operation to the
+delta alone. This distributivity property is what allows the engine to
+process only changes rather than full tables on every update.
 
 ### 35. Decision Trees
 
-**"Should I create a new workload?"** Ask yourself: do these views need
-the same freshness target? Should they share a memory budget? Should
-they have the same priority? If yes to all three, one workload. If no
-to any, separate workloads.
+**"Should I create a new workload?"**
 
-**"Which cadence should I pick?"** Start with the default (deferred
-low-latency). Switch to periodic if you want predictable batching and
-can tolerate fixed-interval latency. Use calculated if your view feeds
-downstream views with widely varying freshness needs. Use immediate
-only when you have read-your-writes requirements and your view fits
-the eligibility criteria.
+Start by asking three questions: Do these views need the same freshness
+target? Should they share a memory budget? Should they have the same
+priority under contention? If the answer to all three is yes, put them
+in the same workload — the engine will build a shared operator graph for
+them, which is more efficient than independent pipelines. If any answer
+is no, use separate workloads. The most common reason to split is
+divergent SLOs: a real-time dashboard might need sub-second freshness
+while a nightly reporting view is fine with five-minute lag. Mixing
+them in one workload forces the system to run at the stricter target,
+wasting resources for the views that don't need it. Separate workloads
+also protect views from each other: if one workload's views consume a
+lot of memory, only that workload degrades; the other continues normally.
 
-**"Do I need IMMEDIATE mode?"** Probably not. If your reason is
-"I want fast updates," set a tight freshness SLO instead. If your
-reason is "I want cross-view consistency," coordination groups give
-you that automatically. The narrow case where you actually need
-IMMEDIATE is read-your-writes consistency on a single-shard view that
-must reflect a write before the write transaction returns.
+**"Which cadence should I pick?"**
 
-**"Should I use a materialized view or an inline view?"** Materialized
-if the view is queried often, joined with other tables, or feeds
-downstream maintained data. Inline if it's just a reusable SQL fragment
-or an abstraction layer.
+You almost certainly shouldn't pick one directly. Set a freshness SLO
+and let the system choose. The SLO-driven tuner picks epoch sizes and
+cadence automatically and responds to changing load in real time. That
+said, if you have a specific reason to override: use *periodic* when
+your data arrives in predictable bursts (nightly ETL loads, hourly
+batch jobs) and you'd rather amortize processing into one large commit
+than many tiny ones. Use *calculated* when you have a chain of views at
+different freshness levels — the upstream view runs at the cadence the
+strictest downstream consumer actually needs, not faster. Only reach for
+*immediate* if you have a strict read-your-writes requirement, your view
+definition is a simple single-shard query, and you've verified the
+planner accepts it as IMMEDIATE-eligible. For every other case, deferred
+low-latency plus a freshness SLO is the answer.
 
-**"Should I enable the cold tier?"** Yes if you have ad-hoc analytical
-workloads over long time horizons. No if all your reads are point
-queries or dashboards against recent data.
+**"Do I need IMMEDIATE mode?"**
 
-**"How tight should my freshness SLO be?"** Tighter SLOs cost more.
-Pick the loosest SLO that meets your business requirement. "Dashboard
-that refreshes every 5 seconds" doesn't need a 100-ms SLO; one or two
-seconds is plenty.
+Probably not, and it's worth understanding why before reaching for it.
+IMMEDIATE mode commits a view update synchronously within the same
+transaction as the source write — the write doesn't return until the
+view is updated. This is only possible for views that fit entirely on
+one shard, with no cross-shard joins or global aggregates, because a
+true cluster-wide synchronous update would require distributed locking
+that would collapse throughput. If your reason for wanting IMMEDIATE is
+"I want fresh data fast," set a tight SLO of 50–200 ms instead; the
+asynchronous path delivers this without any restrictions on the query.
+If your reason is "I need cross-view consistency," coordination groups
+(the diamond pattern) give you that for free across any number of views.
+The genuine use case for IMMEDIATE is narrow: a single-shard view where
+the writing application must see its own write reflected in the view
+before the `INSERT` returns, with no tolerance for even a sub-second
+delay.
 
-**"Do I need a write fence?"** Only if you have cross-service
-coordination where service A writes and service B reads. For reads in
-the same session as the write, the default read-after-write behavior
-handles it automatically.
+**"Should I use a materialized view or an inline view?"**
 
-**"Should I use SUBSCRIBE or poll with SELECT?"** Use SUBSCRIBE when
-you need push-based real-time updates (event-driven architecture, cache
-invalidation, streaming to Kafka). Use SELECT when you need point-in-time
-reads (dashboards, API responses, ad-hoc queries).
+Ask whether the result will be read more than once. A materialized view
+pays a one-time cost to maintain the result incrementally, so each read
+is fast regardless of how large the underlying data is. An inline view
+pays nothing upfront but re-runs the defining query every time it's
+referenced. For a view that's queried thousands of times a second, or
+joined into other maintained views, materialization is almost always the
+right choice. For a view that exists purely as a SQL abstraction layer
+— a stable interface hiding messy underlying tables — an inline view is
+fine, and the zero maintenance cost matters. The ambiguous case is a
+view referenced across many materialized views as a common subplan. In
+that case, materializing it once and having other views read from it is
+more efficient than each view independently inlining and recomputing it.
 
-**"When should I use view replacement vs. DROP + CREATE?"** Use
-replacement when you need zero-downtime schema changes and don't want
-subscribers to miss updates during the transition. Use DROP + CREATE
-when the view is non-critical and a brief gap in freshness is
-acceptable.
+**"Should I enable the cold tier?"**
 
-**"How do I know if a view needs attention?"** Check `SHOW VIEW STATUS`.
-If the state is anything other than HEALTHY, the status output tells
-you what to do. For deeper diagnosis, run `EXPLAIN INCREMENTAL` at the
-appropriate level (default → VERBOSE → ANALYZE) depending on how much
-detail you need.
+Yes, if anyone needs to run ad-hoc SQL over weeks or months of data.
+The live view (in SlateDB) is optimized for point queries and real-time
+dashboards; it's not the right tool for scanning three months of order
+history. The cold tier writes periodic columnar snapshots (Iceberg or
+Delta Lake format) to object storage, which tools like DuckDB, Trino,
+and Spark can read directly without going through RockStream. The cost
+is low (object storage pricing, a periodic background write) and the
+benefit is large (full analytical SQL over the view's history). If all
+your reads are key lookups, point queries, or dashboard aggregations
+over the last few hours, skip it — the cold tier adds cost without
+adding value for those use cases.
+
+**"How tight should my freshness SLO be?"**
+
+Tighter SLOs cost more: they require more frequent epoch commits, more
+parallelism, and more object-store writes per second. The right approach
+is to figure out the loosest SLO your use case can tolerate and set
+that. Ask: if the dashboard is five seconds stale, does anyone notice?
+If yes, set 1–2 seconds. If not, set 5 seconds and save the resources.
+A common mistake is setting a 100 ms SLO because it sounds impressive
+when 1 second would be indistinguishable to users and half the cost.
+Remember that the SLO is enforced — if the cluster can't meet it, you'll
+get degradation events. Setting a realistic SLO means those events are
+meaningful signals rather than constant noise.
+
+**"Do I need a write fence?"**
+
+Only in one specific situation: a write happens in one service (or
+session) and a read happens in a different service (or session), and the
+reader must see the writer's changes before proceeding. Within a single
+SQL session, RockStream already handles read-after-write automatically
+— a `SELECT` issued after an `INSERT` in the same session will always
+see the inserted row reflected in maintained views, with no extra work.
+The write fence is for cross-service handoffs: service A inserts a row,
+calls `rockstream.write_fence()` to get a token, passes it to service B
+(via a message queue, a REST response, a job record), and service B uses
+the token to wait only until that specific write is visible. Without the
+fence, service B would have to guess how long to sleep or poll
+repeatedly. With the fence, it waits exactly as long as necessary.
+
+**"Should I use SUBSCRIBE or poll with SELECT?"**
+
+If your consumer reacts to changes as they happen — forwarding updates
+to a cache, notifying downstream services, writing to another Kafka
+topic, powering a WebSocket feed — use SUBSCRIBE. You get changes pushed
+to you in real time with exactly-once semantics and the ability to
+resume from a past position after a disconnect. If your consumer asks
+"what is the state right now?" on demand — a dashboard that renders on
+page load, an API endpoint returning a current count, a batch job that
+runs every hour — use SELECT. The distinction is push versus pull.
+SUBSCRIBE is more efficient for high-frequency change consumers because
+it avoids the overhead of repeated query planning and result scanning;
+polling is simpler for infrequent, stateless reads.
+
+**"When should I use view replacement vs. DROP + CREATE?"**
+
+Use view replacement whenever there are active consumers — running
+queries, subscribers, downstream views — that would notice a gap.
+Replacement lets you upgrade a view's definition (new columns, query
+restructuring, breaking schema change) with zero downtime: the original
+keeps serving queries at full SLO while the replacement hydrates in the
+background, and the swap is atomic. Subscribers to the original
+automatically see the new definition without reconnecting. DROP + CREATE
+is simpler but creates a window where the view doesn't exist: any
+running query against it fails, any subscriber errors, and any
+downstream materialized view that reads from it blocks. That is
+acceptable for a development environment or a non-critical view where
+a brief gap is tolerable, but should be avoided in production.
+
+**"How do I know if a view needs attention?"**
+
+Start with `SHOW VIEW STATUS`. If every view shows HEALTHY you're done.
+If any view is in a non-HEALTHY state, the status output includes the
+reason and the recommended action — no guessing required. For views that
+are HEALTHY but slower than expected, run `EXPLAIN INCREMENTAL` to see
+the operator graph annotated with per-operator statistics. A ⚠ on a
+specific operator means that operator is the bottleneck. For more detail
+— shard counts, memory usage per operator, parallelism utilisation —
+add VERBOSE. For live runtime numbers — rows per second, state read
+rate, p99 latency, recent DLQ entries — add ANALYZE. The right pattern
+is to start with the cheapest tool (status), escalate only if the answer
+isn't there, and stop when you find the cause.
 
 ### 36. Further Reading
 
