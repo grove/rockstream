@@ -30,6 +30,8 @@ jobs:
         run: cargo test --workspace
       - name: cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
+      - name: exit criteria sign-offs
+        run: bash scripts/check-exit-criteria.sh
 
   release-version-check:
     name: Version / tag alignment

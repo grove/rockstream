@@ -1,4 +1,4 @@
-.PHONY: build test clippy fmt check e2e clean
+.PHONY: build test clippy fmt check e2e approve clean
 
 # Build the workspace
 build:
@@ -62,3 +62,28 @@ release:
 # Clean build artifacts
 clean:
 	cargo clean
+
+# Create a sign-off template for a completed version.
+# Usage: make approve VERSION=0.6.0
+# Fill in the generated file, then commit it alongside the ROADMAP.md ✅ Done update.
+approve:
+	@test -n "$(VERSION)" || (echo "ERROR: VERSION is required. Usage: make approve VERSION=0.6.0" && exit 1)
+	@test ! -f sign-offs/v$(VERSION).md || (echo "ERROR: sign-offs/v$(VERSION).md already exists" && exit 1)
+	@mkdir -p sign-offs
+	@{ \
+	  echo "# v$(VERSION) Sign-off"; \
+	  echo ""; \
+	  echo "**Signed off**: $$(date +%Y-%m-%d)"; \
+	  echo ""; \
+	  echo "## Exit Criteria Verification"; \
+	  echo ""; \
+	  echo "All criteria in the Proof column of ROADMAP.md for v$(VERSION) have been verified."; \
+	  echo ""; \
+	  echo "- [ ] \`cargo test --workspace\` passes"; \
+	  echo "- [ ] All Proof criteria verified against running code or CI output"; \
+	  echo "- [ ] ROADMAP.md status updated to \`✅ Done\`"; \
+	  echo ""; \
+	  echo "## Notes"; \
+	  echo ""; \
+	} > sign-offs/v$(VERSION).md
+	@echo "Created sign-offs/v$(VERSION).md — check off each item, then commit."

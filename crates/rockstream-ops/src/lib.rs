@@ -4,8 +4,12 @@
 //! the `Operator` trait defined here.
 
 pub mod epoch_output;
+pub mod filter;
+pub mod map;
 pub mod noop;
 pub mod operator;
+pub mod project;
+pub mod row_codec;
 pub mod task;
 
 #[cfg(test)]

@@ -7,4 +7,5 @@ license.workspace = true
 description = "Shared types for RockStream (timestamps, frontiers, Z-set rows, schemas)"
 
 [dependencies]
+arrow = { workspace = true }
 serde = { workspace = true }

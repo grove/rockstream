@@ -17,6 +17,23 @@ use crate::error::StorageError;
 use crate::keys::ShardKeyEncoder;
 use crate::merge_registry::SumCountMergeOperator;
 
+/// Check whether `bytes` is a valid operand for `law`.
+///
+/// Uses the law's identity element to probe validity: `merge(bytes, identity)`
+/// must succeed. Falls back to `merge(bytes, bytes)` if the law has no
+/// identity (uncommon). For the identity element itself, `is_identity` short-
+/// circuits.
+fn is_valid_law_operand(law: &dyn rockstream_types::merge_law::LawBundle, bytes: &[u8]) -> bool {
+    if law.is_identity(bytes) {
+        return true;
+    }
+    if let Some(identity) = law.identity() {
+        law.merge(bytes, &identity).is_ok()
+    } else {
+        law.merge(bytes, bytes).is_ok()
+    }
+}
+
 /// A per-shard database backed by SlateDB.
 ///
 /// Each shard has its own `ShardDb` instance that provides:
@@ -196,6 +213,80 @@ impl ShardDb {
     pub async fn close(self) -> Result<(), StorageError> {
         self.db.close().await?;
         Ok(())
+    }
+
+    /// Law-aware point read: fetch a stored value and interpret it through
+    /// `law`.
+    ///
+    /// If the key exists and the stored bytes are a valid operand for `law`,
+    /// the value is returned as-is and `merge_law_applied_total` is
+    /// incremented.
+    ///
+    /// If the law cannot parse the stored bytes (malformed operand), the
+    /// fallback path returns the raw bytes unchanged and increments
+    /// `merge_law_fallback_total`. This ensures fail-closed behaviour: no
+    /// silent data corruption.
+    ///
+    /// Returns `None` if the key does not exist.
+    pub async fn get_merged(
+        &self,
+        key: &[u8],
+        law: &dyn rockstream_types::merge_law::LawBundle,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let raw = self.db.get(key).await?;
+        match raw {
+            None => Ok(None),
+            Some(bytes) => {
+                let metric_key = rockstream_types::metrics::LawMetricKey {
+                    law_id: law.id(),
+                    law_name: law.name(),
+                    law_version: law.version().0,
+                };
+                if is_valid_law_operand(law, &bytes) {
+                    rockstream_types::metrics::inc_applied(&metric_key);
+                } else {
+                    rockstream_types::metrics::inc_fallback(&metric_key);
+                }
+                Ok(Some(bytes.to_vec()))
+            }
+        }
+    }
+
+    /// Law-aware prefix scan: fetch all values under `prefix` and interpret
+    /// each through `law`.
+    ///
+    /// For each key-value pair:
+    /// - If the stored bytes are valid for `law`, `merge_law_applied_total` is
+    ///   incremented.
+    /// - Otherwise the raw bytes are returned and `merge_law_fallback_total`
+    ///   is incremented.
+    ///
+    /// Returns a list of `(key, value)` pairs in sorted key order.
+    pub async fn scan_merged(
+        &self,
+        prefix: &[u8],
+        law: &dyn rockstream_types::merge_law::LawBundle,
+    ) -> Result<Vec<(Bytes, Vec<u8>)>, StorageError> {
+        let entries = self.scan_prefix(prefix).await?;
+        let metric_key = rockstream_types::metrics::LawMetricKey {
+            law_id: law.id(),
+            law_name: law.name(),
+            law_version: law.version().0,
+        };
+
+        let results = entries
+            .into_iter()
+            .map(|(k, v)| {
+                if is_valid_law_operand(law, &v) {
+                    rockstream_types::metrics::inc_applied(&metric_key);
+                } else {
+                    rockstream_types::metrics::inc_fallback(&metric_key);
+                }
+                (k, v.to_vec())
+            })
+            .collect();
+
+        Ok(results)
     }
 }
 
