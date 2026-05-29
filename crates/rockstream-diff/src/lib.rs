@@ -5,9 +5,7 @@
 //! one or more physical operators with merge-law annotations attached by
 //! the differentiator.
 
-use rockstream_plan::{
-    AggregateFunc, NotMergeSafeReason, OpKind, OpNode, PlanNode,
-};
+use rockstream_plan::{AggregateFunc, NotMergeSafeReason, OpKind, OpNode, PlanNode};
 use rockstream_types::ids::OperatorId;
 use rockstream_types::laws::weight_add::WEIGHT_ADD_ID;
 use rockstream_types::merge_law::MergeLawId;
@@ -104,9 +102,7 @@ impl DiffCtx {
                 });
                 id
             }
-            PlanNode::Join {
-                left, right, ..
-            } => {
+            PlanNode::Join { left, right, .. } => {
                 let left_id = self.diff_node(left, nodes);
                 let right_id = self.diff_node(right, nodes);
                 let id = self.alloc_id();
@@ -203,7 +199,10 @@ mod tests {
 
         let mut ctx = DiffCtx::new();
         let nodes = ctx.differentiate(&plan);
-        let agg = nodes.iter().find(|n| matches!(n.kind, OpKind::Aggregate)).unwrap();
+        let agg = nodes
+            .iter()
+            .find(|n| matches!(n.kind, OpKind::Aggregate))
+            .unwrap();
         assert_eq!(agg.merge_law, Some(WEIGHT_ADD_ID));
         assert!(agg.not_merge_safe_reason.is_none());
     }
@@ -224,7 +223,10 @@ mod tests {
 
         let mut ctx = DiffCtx::new();
         let nodes = ctx.differentiate(&plan);
-        let agg = nodes.iter().find(|n| matches!(n.kind, OpKind::Aggregate)).unwrap();
+        let agg = nodes
+            .iter()
+            .find(|n| matches!(n.kind, OpKind::Aggregate))
+            .unwrap();
         assert!(agg.merge_law.is_none());
         assert_eq!(
             agg.not_merge_safe_reason,
@@ -242,8 +244,10 @@ mod tests {
 
         let mut ctx = DiffCtx::new();
         let nodes = ctx.differentiate(&plan);
-        let join = nodes.iter().find(|n| matches!(n.kind, OpKind::Join)).unwrap();
+        let join = nodes
+            .iter()
+            .find(|n| matches!(n.kind, OpKind::Join))
+            .unwrap();
         assert_eq!(join.merge_law, Some(WEIGHT_ADD_ID));
     }
 }
-

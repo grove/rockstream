@@ -84,10 +84,7 @@ pub fn decode_weight(bytes: &[u8]) -> Result<i64, String> {
 
 fn parse_weight(bytes: &[u8]) -> Result<i64, String> {
     if bytes.len() != 8 {
-        return Err(format!(
-            "WeightAdd: expected 8 bytes, got {}",
-            bytes.len()
-        ));
+        return Err(format!("WeightAdd: expected 8 bytes, got {}", bytes.len()));
     }
     let arr: [u8; 8] = bytes.try_into().unwrap();
     Ok(i64::from_be_bytes(arr))

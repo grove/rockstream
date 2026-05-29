@@ -85,7 +85,8 @@ pub fn check_law_properties(law: &dyn LawBundle, values: &[Vec<u8>]) {
             let a_bc = law.merge(a, &bc).expect("merge(a, merge(b,c)) failed");
 
             assert_eq!(
-                ab_c, a_bc,
+                ab_c,
+                a_bc,
                 "Associativity violated for values[{}..={}]",
                 i,
                 i + 2

@@ -43,7 +43,8 @@ impl MergeOperator for SumCountMergeOperator {
         if existing.len() < 9 || value.len() < 9 {
             // Fail-closed: malformed operand (RS-3009).
             return Err(MergeOperatorError::Callback {
-                message: "RS-3009: merge operand malformed (expected 9 bytes: 1 tag + 8 payload)".into(),
+                message: "RS-3009: merge operand malformed (expected 9 bytes: 1 tag + 8 payload)"
+                    .into(),
             });
         }
 

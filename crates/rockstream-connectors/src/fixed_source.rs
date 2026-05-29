@@ -4,7 +4,7 @@
 //! and the oracle harness to drive the IVM pipeline with known data.
 
 use async_trait::async_trait;
-use rockstream_types::batch::{SourceBatch, ZSetBatch, ZSet};
+use rockstream_types::batch::{SourceBatch, ZSet, ZSetBatch};
 use rockstream_types::timestamp::Epoch;
 
 use crate::source::Source;

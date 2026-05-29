@@ -32,11 +32,7 @@ impl LawRegistry {
     pub fn register(&mut self, law: Arc<dyn LawBundle>) {
         let id = law.id();
         if self.laws.contains_key(&id) {
-            panic!(
-                "Duplicate law registration: {} ({})",
-                id,
-                law.name()
-            );
+            panic!("Duplicate law registration: {} ({})", id, law.name());
         }
         self.laws.insert(id, law);
     }

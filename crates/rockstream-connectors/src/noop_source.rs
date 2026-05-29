@@ -3,8 +3,8 @@
 //! Produces empty batches for testing and validation. Used in the no-op
 //! pipeline to prove the system starts, runs, and shuts down cleanly.
 
-use async_trait::async_trait;
 use crate::source::{Source, SourceBatch};
+use async_trait::async_trait;
 use rockstream_types::timestamp::Epoch;
 
 /// A source that produces empty batches.

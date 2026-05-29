@@ -79,12 +79,9 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            let event = rockstream_types::audit::AuditEvent::now(
-                "system",
-                "server.started",
-                "rockstream",
-            )
-            .with_detail(format!("storage={storage}, role={role:?}"));
+            let event =
+                rockstream_types::audit::AuditEvent::now("system", "server.started", "rockstream")
+                    .with_detail(format!("storage={storage}, role={role:?}"));
             audit_log
                 .append(&event)
                 .expect("failed to write audit event");
@@ -100,11 +97,8 @@ async fn main() {
             tracing::info!(path = %bundle_path.display(), "support bundle written");
 
             // Audit: server stopped
-            let event = rockstream_types::audit::AuditEvent::now(
-                "system",
-                "server.stopped",
-                "rockstream",
-            );
+            let event =
+                rockstream_types::audit::AuditEvent::now("system", "server.stopped", "rockstream");
             audit_log
                 .append(&event)
                 .expect("failed to write audit event");

@@ -15,9 +15,7 @@ use rockstream_types::merge_law::MergeLawId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanNode {
     /// Read from a named source.
-    Source {
-        name: String,
-    },
+    Source { name: String },
     /// Filter rows by a predicate expression.
     Filter {
         input: Box<PlanNode>,
@@ -29,10 +27,7 @@ pub enum PlanNode {
         columns: Vec<Expr>,
     },
     /// Apply a scalar function to each row (map).
-    Map {
-        input: Box<PlanNode>,
-        func: Expr,
-    },
+    Map { input: Box<PlanNode>, func: Expr },
     /// Aggregate with group-by keys.
     Aggregate {
         input: Box<PlanNode>,
@@ -229,10 +224,6 @@ mod tests {
             NotMergeSafeReason::ExtremumRequiresRmw.as_str(),
             "extremum_requires_rmw"
         );
-        assert_eq!(
-            NotMergeSafeReason::ClampNotALaw.as_str(),
-            "clamp_not_a_law"
-        );
+        assert_eq!(NotMergeSafeReason::ClampNotALaw.as_str(), "clamp_not_a_law");
     }
 }
-
