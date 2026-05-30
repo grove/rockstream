@@ -82,6 +82,8 @@ pub const RS_1008: ErrorCode = ErrorCode::new(1008);
 pub const RS_1009: ErrorCode = ErrorCode::new(1009);
 /// Bootstrap interrupted; connector position lost and cannot resume.
 pub const RS_1010: ErrorCode = ErrorCode::new(1010);
+/// View-on-view DAG contains a cycle; rejected at compile time.
+pub const RS_1011: ErrorCode = ErrorCode::new(1011);
 
 // 2xxx: Gateway / query
 /// View not found.
@@ -137,6 +139,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         1008 => "View is not paused",
         1009 => "Non-monotone delta rejected in monotone recursion",
         1010 => "Bootstrap interrupted; connector position lost",
+        1011 => "View-on-view DAG contains a cycle",
         2001 => "View not found",
         2002 => "Query timeout",
         2003 => "Unsupported isolation level",

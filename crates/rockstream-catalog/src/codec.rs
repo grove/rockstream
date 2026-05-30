@@ -235,6 +235,12 @@ fn encode_node(
                 "batch_size": batch_size,
             })
         }
+        PlanNode::ViewRef { view_name } => {
+            serde_json::json!({
+                "type": "ViewRef",
+                "view_name": view_name,
+            })
+        }
     }
 }
 
@@ -557,6 +563,13 @@ fn decode_node(v: &Value, registry: &LawRegistry, path: &str) -> Result<PlanNode
                 source_name,
                 batch_size,
             })
+        }
+        "ViewRef" => {
+            let view_name = v["view_name"]
+                .as_str()
+                .ok_or_else(|| CatalogError::Codec(format!("{path}: ViewRef missing 'view_name'")))?
+                .to_owned();
+            Ok(PlanNode::ViewRef { view_name })
         }
         other => Err(CatalogError::Codec(format!(
             "{path}: unknown node type '{other}'"
