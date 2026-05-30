@@ -734,6 +734,17 @@ production-ready.
 
 **Goal**: Move from single-process to distributed execution.
 
+**Entry criteria** (all must be satisfied before work begins)
+
+- `sign-offs/v0.27.md` exists with all items checked (Phase 3.5 complete).
+- `cargo test --workspace` is green on `main`.
+- ROADMAP.md v0.27 row shows `✅ Done`.
+- Design freeze confirmed: no open design-scope exceptions that would change
+  the Phase 4 distributed protocol surface.
+- Storage operational budget validated under `SimRuntime` (v0.27 ✅).
+  Real S3 validation at 1 GB+ shard size is required before v0.30 ships —
+  it is not a blocker for starting v0.28 (control plane).
+
 **Deliverables**
 
 - **Shard manager** (`rockstream-runtime::shard`):
