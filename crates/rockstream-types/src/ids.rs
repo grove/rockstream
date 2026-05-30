@@ -60,6 +60,11 @@ define_id!(
     WorkloadId, u64, "workload"
 );
 
+define_id!(
+    /// Identifies a worker node in the cluster.
+    WorkerId, u64, "worker"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
