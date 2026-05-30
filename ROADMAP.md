@@ -146,7 +146,7 @@ without that proof, the version is not done.
 | v0.19 | ✅ Done | Window functions | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `NTILE`, sliding SUM/AVG, partition recomputation; sliding-aggregate sub-components reuse `SumCount/v1`. **Escape hatch**: if sliding-aggregate incremental maintenance proves intractable, fall back to partition-scoped recomputation for all window functions (correct, slower). | Window-heavy randomized tests match batch; partition recomputation cost is measured and documented; sliding-aggregate law re-use is reported in `EXPLAIN`. |
 | v0.20 | ✅ Done | Time windows, watermarks, and `MaxRegister/v1` | TUMBLE, HOP, SESSION, event-time TTL, late-data policies, frontier-aware retention hooks; watermarks register and emit through `MaxRegister/v1` / `MinRegister/v1` (semilattice, idempotent); event-time frontier driven by connector watermark channel from §13.3. **Escape hatch applied**: TUMBLE only implemented; HOP/SESSION deferred to the next version. | Late data test matrix proves `drop`, `update`, and `route_to_sink` behavior; TTL never removes visible state; a synthetic source that emits watermarks closes tumbling windows exactly once even under out-of-order input; duplicate-watermark replay test proves idempotence. |
 | v0.21 | ✅ Done | Top-K and approximate sketches | Top-K detection, `K + epsilon` state, delete refill path, delta swaps, partitioned Top-K; `HyperLogLog/v1` registered for internal cardinality estimation in the planner cost model. Escape hatch not triggered: HLL accuracy was sufficient for cost-model correctness. | Random insert/update/delete Top-K tests match batch; delete from current top K refills correctly; HLL sketch-union law tests prove idempotence under reorder and duplicate replay; partitioned Top-K verified with independent partition state. |
-| v0.22 | ✅ Done | Recursion with monotone partial progress | Recursive PlanNodes, nested timestamp scheduler, semi-naive and DRed strategies, convergence detection, safety caps; monotone (insert-only) recursive terms publish `complete_through` via `WeightAdd/v1`'s monotone declaration. Escape hatch applied: DRed proved unsound under concurrent deletes; non-monotone terms rejected with `RS-1009` and flagged `not_merge_safe_reason=recursion_dred_required` in `EXPLAIN INCREMENTAL`. | Transitive closure and hierarchy examples converge; cyclic graph tests produce correct deltas with no infinite loop; a monotone reachability view emits partial progress before full convergence; `RecursiveOp` matches `RecursiveOracle` for randomised edge sequences. |
+| v0.22 | ✅ Done | Recursion with monotone partial progress | Recursive PlanNodes, nested timestamp scheduler, semi-naive and DRed strategies, convergence detection, safety caps; monotone (insert-only) recursive terms publish `complete_through` via `WeightAdd/v1`'s monotone declaration. Escape hatch applied: DRed proved unsound under concurrent deletes; non-monotone terms rejected with `RS-1509` and flagged `not_merge_safe_reason=recursion_dred_required` in `EXPLAIN INCREMENTAL`. | Transitive closure and hierarchy examples converge; cyclic graph tests produce correct deltas with no infinite loop; a monotone reachability view emits partial progress before full convergence; `RecursiveOp` matches `RecursiveOracle` for randomised edge sequences. |
 | v0.23 | ✅ Done | Bootstrap and snapshot mode | Snapshot sources, streamed bootstrap epochs, bootstrap frontier, reconciliation after connector position loss. `SnapshotOp` delivers a pre-loaded relation as insert-only batches; `resume_from(N)` skips committed rows to prevent duplication on restart; `is_complete()` signals the bootstrap frontier. `RS-1010` registered for position-loss interruption. | 100k-row equivalent synthetic snapshot matches `BootstrapOracle` batch reference; restart during bootstrap (resume_from) does not duplicate or skip rows; idempotent epoch replay verified. |
 | v0.24 | ✅ Done | View-on-view DAG | `ViewRef`, upstream view CDC, cadence inheritance, diamond consistency (structural via frontier meet — no explicit group API), cycle detection. `PlanNode::ViewRef` and `OpKind::ViewRef` added; `dag` module with `detect_cycle` (RS-1011) and `topological_order`; `ViewDagOracle` reference implementation; 11 proof tests. | Five-level DAG and diamond topology converge under continuous input; cycles are rejected at compile time. |
 | v0.25 | ✅ Done | Lateral, SRF, UDF, and approximate-aggregate surface | Lateral functions/subqueries, row-scoped recomputation, scalar UDF hooks, UDAF interface sketch; `APPROX_COUNT_DISTINCT(v)` exposed via `HyperLogLog/v1`, `APPROX_MEMBERSHIP(v)` via `BloomUnion/v1`. | JSON/unnest/generate_series style examples match batch; `APPROX_*` aggregates pass sketch-union law tests; UDAF requirements (including a future `MergeLaw` annotation slot) are documented before implementation. |
@@ -252,33 +252,36 @@ that is the discipline this project needs.
 
 These are explicit places to pause, learn, and possibly reshape the roadmap.
 
-| Gate | After | Question |
-|---|---:|---|
-| Architecture sanity | v0.4 | Do SlateDB, the runtime abstraction, and local developer ergonomics still fit the design? |
-| IVM kernel confidence | v0.10 | Is the core delta engine simple enough to debug, and does replay work cleanly? |
-| Storage operational budget | v0.10 | Do SlateDB operational budgets (write amp, get_merged p99, compaction debt) hold at 5GB+ shard sizes on real object storage? |
-| SQL scope control | v0.18 | Are we still building the right SQL subset first, or have edge cases started to dominate? |
-| Single-shard correctness | v0.27 | Is the IVM engine correct and fast enough to justify distribution work? |
-| Distributed architecture | v0.36 | Does the shard/exchange/frontier/checkpoint model actually hold under simulation and chaos? |
-| CRDT value | v0.36 | Are internal merge-law annotations reducing read-modify-write, shuffle, and gateway scan cost enough to confirm the v0.43–v0.45 user-visible CRDT column rollout? If not, the column types are deferred and the version slots reassessed. |
-| User-defined laws readiness | v0.45 | Is the built-in CRDT catalog (`COUNTER`, `LWW`, `G_SET`, `OR_SET`, `MAX/MIN_REGISTER`, `APPROX_*`) stable enough — under property tests, chaos, connector schema, and cold-tier — to open `CREATE MERGE LAW` to users in v0.51? |
-| Product wedge | v0.45 | Is the `psql` + live views + connectors experience compelling enough for pilot users? |
-| Production readiness | v0.52 | Is the system operable by someone who did not build it? |
-| Data lake integration | v0.55 | Does the cold-tier + catalog story deliver real value, or is feeding external tools sufficient without the cold tier? |
-| Optimistic transactions | v0.55 | Does the mixed optimistic + CRDT transaction subset work reliably under simulation and soak (no partial visibility, explainable abort rates), or should it stay experimental past 1.0? |
-| Coordinator Group | v0.55 | Given the optimistic-transaction soak result: is write-skew prevention across 2+ base-table shards a real pilot-customer need? If yes, proceed with Phase 13 (§13.10). If the exact-key subset covers all known cases, defer coordinator group past 1.0. |
+| Gate | After | Question | Outcome |
+|---|---:|---|---|
+| Architecture sanity | v0.4 | Do SlateDB, the runtime abstraction, and local developer ergonomics still fit the design? | ✅ Passed. Confirmed. |
+| IVM kernel confidence | v0.10 | Is the core delta engine simple enough to debug, and does replay work cleanly? | ✅ Passed. Full assessment in plans/full-assessment-v0.10.md. |
+| Storage operational budget | v0.10 | Do SlateDB operational budgets (write amp, get_merged p99, compaction debt) hold at 5GB+ shard sizes on real object storage? | ⚠ Partial — validated under SimRuntime. Real S3 validation pending as Phase 4 entry condition. |
+| SQL scope control | v0.18 | Are we still building the right SQL subset first, or have edge cases started to dominate? | ✅ Passed. SQL Alpha soak clean. |
+| Single-shard correctness | v0.27 | Is the IVM engine correct and fast enough to justify distribution work? | ✅ Passed. TPC-H 22/22, fuzzer, law-equivalence corpus clean. |
+| Distributed architecture | v0.36 | Does the shard/exchange/frontier/checkpoint model actually hold under simulation and chaos? | |
+| CRDT value | v0.36 | Are internal merge-law annotations reducing read-modify-write, shuffle, and gateway scan cost enough to confirm the v0.43–v0.45 user-visible CRDT column rollout? If not, the column types are deferred and the version slots reassessed. | |
+| User-defined laws readiness | v0.45 | Is the built-in CRDT catalog (`COUNTER`, `LWW`, `G_SET`, `OR_SET`, `MAX/MIN_REGISTER`, `APPROX_*`) stable enough — under property tests, chaos, connector schema, and cold-tier — to open `CREATE MERGE LAW` to users in v0.51? | |
+| Product wedge | v0.45 | Is the `psql` + live views + connectors experience compelling enough for pilot users? | |
+| Production readiness | v0.52 | Is the system operable by someone who did not build it? | |
+| Data lake integration | v0.55 | Does the cold-tier + catalog story deliver real value, or is feeding external tools sufficient without the cold tier? | |
+| Optimistic transactions | v0.55 | Does the mixed optimistic + CRDT transaction subset work reliably under simulation and soak (no partial visibility, explainable abort rates), or should it stay experimental past 1.0? | |
+| Coordinator Group | v0.55 | Given the optimistic-transaction soak result: is write-skew prevention across 2+ base-table shards a real pilot-customer need? If yes, proceed with Phase 13 (§13.10). If the exact-key subset covers all known cases, defer coordinator group past 1.0. | |
 
 At each gate, the default action is not to accelerate. The default action is to
 remove uncertainty.
 
-**Design freeze after v0.10.** Once the IVM Kernel Confidence gate is passed,
-new sections may not be added to DESIGN.md or IVM.md unless they are required
-to unblock a specific coded milestone. The documents become implementation
-references, not the primary work product. Gaps discovered during coding are
-tracked as GitHub issues and resolved with targeted corrections to the relevant
-section — not as numbered design-revision passes. The test: after v0.10, every
-DESIGN.md commit should be small and targeted ("correct §7.5: exchange
-loopback threshold"), not broad ("v3.X adds Y, Z").
+**Design freeze after v0.27.** The design freeze was originally specified for
+v0.10 but was deferred through the single-shard implementation phase
+(v0.11–v0.27) to allow design refinements informed by implementation
+experience. As of v0.27, DESIGN.md has stabilized at v3.28. From this point
+forward, new sections may not be added to DESIGN.md or IVM.md unless they are
+required to unblock a specific coded milestone. The documents become
+implementation references, not the primary work product. Gaps discovered during
+coding are tracked as GitHub issues and resolved with targeted corrections to
+the relevant section — not as numbered design-revision passes. The test: after
+v0.27, every DESIGN.md commit should be small and targeted ("correct §7.5:
+exchange loopback threshold"), not broad ("v3.X adds Y, Z").
 
 **Enforcement.** The design freeze is enforced by CI: any PR that touches
 DESIGN.md or IVM.md must include a `freeze-exception: <issue-url>` trailer

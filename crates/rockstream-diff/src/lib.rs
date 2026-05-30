@@ -276,7 +276,7 @@ impl DiffCtx {
                 // Non-monotone: DRed escape hatch — still WeightAdd/v1 for the
                 // arrangement, but flagged with RecursionDredRequired because
                 // retractions require read-modify-write and are rejected at
-                // runtime with RS-1009.
+                // runtime with RS-1509.
                 let reason = if *monotone {
                     None
                 } else {

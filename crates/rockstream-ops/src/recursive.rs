@@ -36,7 +36,7 @@
 //!
 //! When `monotone = true` the operator enforces that all input weights are
 //! strictly positive (+1).  Negative-weight (retraction) rows are rejected
-//! with a `RS-1009` error.  Monotone recursion publishes a
+//! with a `RS-1509` error.  Monotone recursion publishes a
 //! `complete_through` token (the `converged()` flag) once convergence is
 //! reached: rows emitted before convergence represent partial progress —
 //! they will never be retracted because the relation is insert-only.
@@ -44,7 +44,7 @@
 //! ### DRed escape hatch (non-monotone)
 //!
 //! When `monotone = false`, the operator still accepts and processes inserts
-//! normally, but any retraction delta is rejected with `RS-1009`.  The
+//! normally, but any retraction delta is rejected with `RS-1509`.  The
 //! planner marks this operator `not_merge_safe_reason =
 //! recursion_dred_required` (EXPLAIN INCREMENTAL) to indicate that full
 //! DRed support is not yet implemented.
@@ -89,7 +89,7 @@ impl RecursiveOp {
     ///
     /// # Parameters
     /// - `max_iterations`: safety cap on semi-naive iterations per epoch.
-    /// - `monotone`: if `true`, retractions are rejected with `RS-1009`.
+    /// - `monotone`: if `true`, retractions are rejected with `RS-1509`.
     /// - `step_fn`: maps the current-iteration frontier to candidate new rows.
     pub fn new(max_iterations: usize, monotone: bool, step_fn: StepFn) -> Self {
         assert!(max_iterations > 0, "max_iterations must be positive");
@@ -109,7 +109,7 @@ impl RecursiveOp {
     ///
     /// # Errors
     ///
-    /// Returns `Err("RS-1009: ...")` if `monotone = true` and any row in
+    /// Returns `Err("RS-1509: ...")` if `monotone = true` and any row in
     /// `base_delta` has a negative weight (retraction).
     pub fn process(&mut self, base_delta: &ZSet) -> Result<ZSet, String> {
         // ── Monotone / escape-hatch check ────────────────────────────────────
@@ -117,7 +117,7 @@ impl RecursiveOp {
             for row in base_delta.iter() {
                 if row.weight < 0 {
                     return Err(format!(
-                        "RS-1009: non-monotone delta rejected in monotone recursion \
+                        "RS-1509: non-monotone delta rejected in monotone recursion \
                          (key={:?}, weight={})",
                         row.key, row.weight
                     ));
@@ -210,7 +210,7 @@ impl Operator for RecursiveOp {
     async fn process_delta(&mut self, input: &ZSetBatch) -> ZSetBatch {
         let output = match RecursiveOp::process(self, &input.zset) {
             Ok(delta) => delta,
-            Err(_) => ZSet::new(), // RS-1009: non-monotone rejected; emit empty delta.
+            Err(_) => ZSet::new(), // RS-1509: non-monotone rejected; emit empty delta.
         };
         ZSetBatch {
             zset: output,

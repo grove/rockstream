@@ -9,7 +9,7 @@
 //! 6. `DiffCtx` assigns `WeightAdd/v1` to monotone `Recursion` nodes.
 //! 7. `DiffCtx` flags non-monotone `Recursion` with `RecursionDredRequired`.
 //! 8. DRed escape hatch: `RecursiveOp` rejects negative-weight deltas in
-//!    monotone mode with `RS-1009`.
+//!    monotone mode with `RS-1509`.
 //! 9. `RecursiveOp` matches `RecursiveOracle` for randomised edge sequences.
 
 #[cfg(test)]
@@ -299,7 +299,7 @@ mod recursive_proof_tests {
 
     // ── Proof 8: DRed escape hatch rejects negative-weight deltas ─────────────
 
-    /// Monotone RecursiveOp must reject any delta with weight < 0 (RS-1009).
+    /// Monotone RecursiveOp must reject any delta with weight < 0 (RS-1509).
     #[test]
     fn proof_dred_escape_hatch_rejects_non_monotone() {
         let edge_set = edges(&[(1, 2)]);
@@ -313,7 +313,7 @@ mod recursive_proof_tests {
         };
         op.process(&insert).expect("insert should succeed");
 
-        // Now try to delete it — must fail with RS-1009.
+        // Now try to delete it — must fail with RS-1509.
         let delete = {
             let mut z = ZSet::new();
             z.insert(vec![1], vec![2], -1);
@@ -323,8 +323,8 @@ mod recursive_proof_tests {
         assert!(result.is_err(), "monotone op must reject retraction");
         let err = result.unwrap_err();
         assert!(
-            err.contains("RS-1009"),
-            "error must mention RS-1009, got: {err}"
+            err.contains("RS-1509"),
+            "error must mention RS-1509, got: {err}"
         );
     }
 

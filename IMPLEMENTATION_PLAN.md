@@ -33,23 +33,23 @@ gates, and the build philosophy, see [ROADMAP.md](ROADMAP.md).
 
 The phase numbers here map to ROADMAP.md roadmap versions as follows:
 
-| Phase | ROADMAP versions | Focus |
-|---|---|---|
-| 0 | v0.1–v0.4 | Repository, simulation, storage, no-op pipeline |
-| 1 | v0.5–v0.10 | Single-shard IVM core (IVM-1 … IVM-3) |
-| 2 | v0.11–v0.18 | SQL frontend, joins, set ops (IVM-4 … IVM-6) |
-| 3 | v0.19–v0.26 | Advanced operators: windows, recursion, view-on-view (IVM-7 … IVM-12) |
-| 3.5 | v0.27 | IVM correctness soak (IVM-13) |
-| 4 | v0.28–v0.30 | Multi-shard execution and exchange subsystem |
-| 5 | v0.31–v0.32 | Frontier protocol and progress tracking |
-| 6 | v0.33–v0.36 | Fault tolerance, exactly-once, chaos |
-| 7 | v0.37–v0.39 | Elasticity: split, merge, drain, clone |
-| 8 | v0.40–v0.43 | Postgres query gateway, introspection, freshness, subscribe, direct-write CRDT surface, OLTP session ergonomics |
-| 9 | v0.44–v0.45 | Connectors and sinks (Tier 1 + Tier 2 contract); OR-Set; CRDT schema metadata |
-| 10 | v0.46–v0.50 | Auth, observability, auto-tuner, secondary indexes, upgrades, security |
-| 11 | v0.51–v0.52 | Long soak and production beta handoff |
-| 12 | v0.53–v0.55 | Cold-tier sink, Iceberg REST catalog, snapshot GC |
-| 13 | post-v0.55 | Coordinator Group: scoped multi-shard SERIALIZABLE (1.0 track) |
+| Phase | ROADMAP versions | Status | Focus |
+|---|---|---|---|
+| 0 | v0.1–v0.4 | ✅ Complete | Repository, simulation, storage, no-op pipeline |
+| 1 | v0.5–v0.10 | ✅ Complete | Single-shard IVM core (IVM-1 … IVM-3) |
+| 2 | v0.11–v0.18 | ✅ Complete | SQL frontend, joins, set ops (IVM-4 … IVM-6) |
+| 3 | v0.19–v0.26 | ✅ Complete | Advanced operators: windows, recursion, view-on-view (IVM-7 … IVM-12) |
+| 3.5 | v0.27 | ✅ Complete | IVM correctness soak (IVM-13) |
+| 4 | v0.28–v0.30 | Not started | Multi-shard execution and exchange subsystem |
+| 5 | v0.31–v0.32 | Not started | Frontier protocol and progress tracking |
+| 6 | v0.33–v0.36 | Not started | Fault tolerance, exactly-once, chaos |
+| 7 | v0.37–v0.39 | Not started | Elasticity: split, merge, drain, clone |
+| 8 | v0.40–v0.43 | Not started | Postgres query gateway, introspection, freshness, subscribe, direct-write CRDT surface, OLTP session ergonomics |
+| 9 | v0.44–v0.45 | Not started | Connectors and sinks (Tier 1 + Tier 2 contract); OR-Set; CRDT schema metadata |
+| 10 | v0.46–v0.50 | Not started | Auth, observability, auto-tuner, secondary indexes, upgrades, security |
+| 11 | v0.51–v0.52 | Not started | Long soak and production beta handoff |
+| 12 | v0.53–v0.55 | Not started | Cold-tier sink, Iceberg REST catalog, snapshot GC |
+| 13 | post-v0.55 | Not started | Coordinator Group: scoped multi-shard SERIALIZABLE (1.0 track) |
 
 Durations are indicative effort, not calendar time, and assume a small
 dedicated team. The ROADMAP.md version table is the single source of truth
@@ -484,6 +484,11 @@ If any budget is exceeded by >2x the specified target, the project must
 file a tracking issue and either adjust the target or implement a mitigation
 before advancing past v0.19.
 
+**v0.27 status**: storage budget tests validated under `SimRuntime` with
+in-memory object store. The PUT p99 < 200ms and GET p99 < 100ms gates pass
+in-memory. Real S3 validation at 1GB+ shard sizes is required as a Phase 4
+entry condition before v0.30 (exchange) ships.
+
 ---
 
 ## Phase 3 — Advanced Operators
@@ -549,6 +554,9 @@ no new fundamental mechanisms.
 - Compiler strategy selection:
   - Semi-naive for monotone insert-only recursion.
   - DRed for monotone mixed insert/delete/update recursion.
+    **v0.22 outcome**: DRed proved unsound under concurrent deletes.
+    Non-monotone recursive terms are rejected with RS-1509. Only semi-naive
+    (monotone insert-only) and full recomputation are implemented.
   - Full recomputation fallback for non-monotone terms, unsupported multiple
     self-references, or recursive/output column mismatches.
 - Implement the nested-time scheduler loop:
@@ -566,7 +574,7 @@ no new fundamental mechanisms.
 
 **Escape hatch**: if DRed proves unsound under concurrent deletes within the
 version budget, restrict to monotone-only recursion (semi-naive) and reject
-non-monotone recursive terms with `RS-1007 recursion.non_monotone_not_supported`.
+non-monotone recursive terms with `RS-1509 recursion.non_monotone_not_supported`.
 DRed is then tracked as a follow-up issue.
 
 ### Milestone IVM-11 — Bootstrap & snapshot mode (IVM.md §13 IVM-10, §12)
@@ -711,6 +719,14 @@ distribution and fault tolerance. (IVM.md §13 IVM-13.)
 After Phase 3.5 the IVM engine is feature-complete and correct for
 single-shard. Phases 4–11 make it distributed, durable, elastic, and
 production-ready.
+
+### Escape Hatches Exercised (Phase 0–3.5 Summary)
+
+| Version | Escape Hatch | Outcome | Impact on Later Phases |
+|---------|-------------|---------|------------------------|
+| v0.20 | HOP/SESSION windows deferred | Applied: TUMBLE only in v0.20. HOP/SESSION shipped in v0.21 — resolved. | None. |
+| v0.21 | HLL accuracy fallback | Not triggered: HLL accuracy sufficient for cost-model correctness. | None. |
+| v0.22 | DRed recursion unsound | Applied: DRed proved unsound under concurrent deletes. Non-monotone terms rejected with RS-1509. | Phase 4 distributed recursion uses semi-naive only. Non-monotone recursive views remain unsupported. DRed is a candidate future optimization. |
 
 ---
 

@@ -1387,8 +1387,11 @@ of the timestamp vector).
 Convergence detection: iteration stops when the recursive delta distincts to
 empty and the inner frontier advances past the iteration timestamp. The compiler
 also classifies recursive terms for monotonicity. INSERT-only monotone recursion
-uses semi-naive evaluation; mixed insert/delete/update changes use DRed
-(delete-and-rederive); non-monotone or unsupported recursive terms fall back to
+uses semi-naive evaluation. **DRed (delete-and-rederive) was evaluated in v0.22
+and proved unsound under concurrent deletes; non-monotone recursive terms are
+rejected with `RS-1509 recursion.non_monotone_not_supported`.** DRed may be
+revisited as a future optimization once the distributed recursion surface
+(Phase 4) stabilizes. Non-monotone or unsupported recursive terms fall back to
 full recomputation. See [IVM.md §11](IVM.md#11-recursion-with-recursive).
 
 ### 6.9 Time Windows (Tumbling, Hopping, Session)
@@ -4298,6 +4301,8 @@ rockstream resource {usage, usage --workload=<name>, cluster}
 rockstream schema-evolution {status --schema=<name>, history --view=<name>}
 rockstream support  bundle [--view=<name>]        # see §14.12
 rockstream audit    {tail, query}                 # see §14.11
+rockstream sql      "<query>"                        # parse, lower to PlanNode IR, and print
+                                                   # EXPLAIN INCREMENTAL against the catalog
 rockstream debug    arrangement <view> <op_id> <key>  # see §14.7.1
 ```
 
@@ -4599,6 +4604,7 @@ RS-1005  connector.watermark_required
 RS-1006  source.no_stable_identity
 RS-1010  view.dependent_inline_view_exists
 RS-1011  view.inline_cycle_detected
+RS-1509  recursion.non_monotone_not_supported
 RS-2001  view.unsupported_sql_construct
 RS-2002  view.state_budget_exceeded
 RS-2003  isolation.serializable_not_supported
@@ -5151,6 +5157,23 @@ millions of seeded executions on every commit. RockStream's coordination
 surface (epoch commit + frontier protocol + 2PC + checkpoint barrier) is small
 enough that a similar harness can exhaustively explore it. The investment
 pays back the first time a multi-shard race ships to production.
+
+### 17.8 Simulation Fidelity Boundaries
+
+`SimRuntime` models an idealised object store. The following table documents
+which real-object-store behaviors are modeled and which require integration
+tests against a real endpoint (MinIO minimum) at the Phase 4 and Phase 6 gates.
+
+| Behavior | Modeled by SimRuntime | Real S3 |
+|----------|----------------------|--------|
+| Latency distribution | Uniform random (configurable) | Long-tailed, prefix-dependent |
+| Conditional writes (If-Match) | Yes (in-memory CAS) | Yes (S3 conditional writes) |
+| LIST consistency after PUT | Immediate | Strong (since Dec 2020 for S3; varies for other providers) |
+| Rate limiting (HTTP 429) | Via `buggify!()` injection | Provider-specific, prefix-scoped |
+| Partial object writes | Not modeled | Can occur on large PUTs |
+
+Behaviors not modeled by `SimRuntime` must be covered by integration tests
+against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
 
 ---
 
