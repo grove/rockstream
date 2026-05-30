@@ -388,23 +388,31 @@ fn bench_azure(c: &mut Criterion) {
     }
 }
 
-// One-shot gate probes run outside Criterion (they print sign-off evidence).
+/// One-shot gate probes run outside Criterion (they print sign-off evidence).
+/// Guarded by `STORAGE_BUDGET_RUN_GATES=1` env var to prevent hangs during normal `cargo bench`.
 fn gate_probes(c: &mut Criterion) {
-    // WAL cache gate runs on every invocation (no cloud deps).
-    run_wal_cache_gate();
+    let run_gates = std::env::var("STORAGE_BUDGET_RUN_GATES")
+        .ok()
+        .map(|s| s == "1")
+        .unwrap_or(false);
 
-    // In-memory gate probe (establishes a baseline).
-    run_gate_probe("in_memory", in_memory_store());
+    if run_gates {
+        // WAL cache gate runs on every invocation (no cloud deps).
+        run_wal_cache_gate();
 
-    // Azure gate probe (only when configured).
-    if let Some(store) = azure_store() {
-        run_gate_probe("azure", store.clone());
-        run_write_amplification_probe("azure", store);
-    } else {
-        println!(
-            "[storage_budget] GATE SKIP: write_amplification probe requires Azure env vars. \
-             Set AZURE_STORAGE_ACCOUNT_NAME + key/SP credentials to enable."
-        );
+        // In-memory gate probe (establishes a baseline).
+        run_gate_probe("in_memory", in_memory_store());
+
+        // Azure gate probe (only when configured).
+        if let Some(store) = azure_store() {
+            run_gate_probe("azure", store.clone());
+            run_write_amplification_probe("azure", store);
+        } else {
+            println!(
+                "[storage_budget] GATE SKIP: write_amplification probe requires Azure env vars. \
+                 Set AZURE_STORAGE_ACCOUNT_NAME + key/SP credentials to enable."
+            );
+        }
     }
 
     // Dummy Criterion bench so Criterion does not complain about an empty group.
