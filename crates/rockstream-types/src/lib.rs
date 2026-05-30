@@ -13,6 +13,8 @@ pub mod ids;
 pub mod laws;
 pub mod merge_law;
 pub mod metrics;
+pub mod view_lifecycle;
+pub mod workload;
 
 /// Timestamp types.
 pub mod timestamp {

@@ -1,6 +1,8 @@
 //! Catalog error types with RS-XXXX error codes.
 
-use rockstream_types::error_code::{ErrorCode, RS_1002, RS_5002};
+use rockstream_types::error_code::{
+    ErrorCode, RS_1002, RS_1005, RS_1006, RS_1007, RS_1008, RS_5002,
+};
 use thiserror::Error;
 
 /// Errors from the catalog layer.
@@ -38,6 +40,22 @@ pub enum CatalogError {
     /// Entry not found in the catalog.
     #[error("catalog entry not found: {name}")]
     NotFound { name: String },
+
+    /// Workload not found — `RS-1005`.
+    #[error("RS-1005: workload not found: {name}")]
+    WorkloadNotFound { name: String },
+
+    /// Workload already exists — `RS-1006`.
+    #[error("RS-1006: workload already exists: {name}")]
+    WorkloadAlreadyExists { name: String },
+
+    /// View is already paused — `RS-1007`.
+    #[error("RS-1007: view '{name}' is already paused")]
+    ViewAlreadyPaused { name: String },
+
+    /// View is not paused — `RS-1008`.
+    #[error("RS-1008: view '{name}' is not paused")]
+    ViewNotPaused { name: String },
 }
 
 impl CatalogError {
@@ -46,6 +64,10 @@ impl CatalogError {
         match self {
             Self::IncompatibleSchemaChange { .. } => RS_1002,
             Self::UnknownMergeLaw { .. } => RS_5002,
+            Self::WorkloadNotFound { .. } => RS_1005,
+            Self::WorkloadAlreadyExists { .. } => RS_1006,
+            Self::ViewAlreadyPaused { .. } => RS_1007,
+            Self::ViewNotPaused { .. } => RS_1008,
             Self::Codec(_) | Self::AlreadyExists { .. } | Self::NotFound { .. } => {
                 // Use RS-0001 (internal error) for codec/store errors.
                 rockstream_types::error_code::RS_0001
@@ -76,5 +98,21 @@ mod tests {
         };
         assert_eq!(err.error_code(), RS_5002);
         assert!(err.to_string().contains("RS-5002"));
+    }
+
+    #[test]
+    fn workload_errors_have_correct_codes() {
+        let e1 = CatalogError::WorkloadNotFound { name: "x".into() };
+        let e2 = CatalogError::WorkloadAlreadyExists { name: "x".into() };
+        let e3 = CatalogError::ViewAlreadyPaused { name: "v".into() };
+        let e4 = CatalogError::ViewNotPaused { name: "v".into() };
+        assert_eq!(e1.error_code(), RS_1005);
+        assert_eq!(e2.error_code(), RS_1006);
+        assert_eq!(e3.error_code(), RS_1007);
+        assert_eq!(e4.error_code(), RS_1008);
+        assert!(e1.to_string().contains("RS-1005"));
+        assert!(e2.to_string().contains("RS-1006"));
+        assert!(e3.to_string().contains("RS-1007"));
+        assert!(e4.to_string().contains("RS-1008"));
     }
 }

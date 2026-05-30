@@ -70,6 +70,14 @@ pub const RS_1002: ErrorCode = ErrorCode::new(1002);
 pub const RS_1003: ErrorCode = ErrorCode::new(1003);
 /// Pipeline already exists.
 pub const RS_1004: ErrorCode = ErrorCode::new(1004);
+/// Workload not found.
+pub const RS_1005: ErrorCode = ErrorCode::new(1005);
+/// Workload already exists.
+pub const RS_1006: ErrorCode = ErrorCode::new(1006);
+/// View is already paused.
+pub const RS_1007: ErrorCode = ErrorCode::new(1007);
+/// View is not paused.
+pub const RS_1008: ErrorCode = ErrorCode::new(1008);
 
 // 2xxx: Gateway / query
 /// View not found.
@@ -119,6 +127,10 @@ pub fn description(code: ErrorCode) -> &'static str {
         1002 => "Incompatible schema change",
         1003 => "Record decode error",
         1004 => "Pipeline already exists",
+        1005 => "Workload not found",
+        1006 => "Workload already exists",
+        1007 => "View is already paused",
+        1008 => "View is not paused",
         2001 => "View not found",
         2002 => "Query timeout",
         2003 => "Unsupported isolation level",
@@ -154,6 +166,10 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1002 => "Review schema evolution rules; a new view may be required.",
         1003 => "Inspect the dead-letter queue for malformed records.",
         1004 => "Use a different pipeline name or drop the existing one.",
+        1005 => "Check the workload name; ensure it has been created with CREATE WORKLOAD.",
+        1006 => "Use a different workload name or drop the existing workload first.",
+        1007 => "The view is already paused; use RESUME MATERIALIZED VIEW to restart it.",
+        1008 => "The view is not paused; only paused views can be resumed.",
         2001 => "Check view name and ensure the pipeline is running.",
         2002 => "Reduce query scope or increase timeout.",
         2003 => "Use a supported isolation level (snapshot or eventual).",
@@ -198,8 +214,8 @@ mod tests {
     #[test]
     fn all_codes_have_descriptions() {
         let codes = [
-            RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_2001, RS_2002,
-            RS_2003, RS_4001, RS_4002, RS_5001, RS_5002,
+            RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
+            RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_4001, RS_4002, RS_5001, RS_5002,
         ];
         for code in codes {
             assert_ne!(

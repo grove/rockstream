@@ -1,7 +1,8 @@
-//! Catalog and plan persistence for RockStream — v0.12.
+//! Catalog and plan persistence for RockStream — v0.12/v0.16.
 //!
-//! This crate implements the v0.12 roadmap milestone:
+//! This crate implements:
 //!
+//! ## v0.12
 //! - **Source/view schema catalog** — `CatalogStore` keyed by
 //!   `(namespace_id, name)` with versioned `SchemaVersion` snapshots.
 //! - **Plan codec** — Substrait-extension JSON encoding (`substrait-ext/rockstream/v1`)
@@ -10,6 +11,16 @@
 //!   contract; incompatible changes return `RS-1002`.
 //! - **Law validation on plan load** — `CatalogStore::load_plan` checks every
 //!   law annotation against the `LawRegistry`; unknown laws return `RS-5002`.
+//!
+//! ## v0.16
+//! - **Workload DDL** — `CREATE WORKLOAD` with `FRESHNESS_SLO`, `MEMORY_LIMIT`,
+//!   `PRIORITY`; namespace-level default workload via `ALTER NAMESPACE`.
+//! - **Workload assignment** — `CREATE MATERIALIZED VIEW … WITH WORKLOAD = name`;
+//!   validated at registration time against the workload registry.
+//! - **View lifecycle** — `PAUSE` / `RESUME MATERIALIZED VIEW` with `RS-1007` /
+//!   `RS-1008` error codes; view dependency metadata on every entry.
+//! - **SHOW VIEW STATUS FOR NAMESPACE** — returns `ViewStatus` rows.
+//! - **SHOW BACKFILL STATUS FOR MATERIALIZED VIEW** — returns `BackfillStatus`.
 
 pub mod codec;
 pub mod compat;
@@ -20,12 +31,14 @@ pub mod entry {
 pub mod error;
 pub mod schema;
 pub mod store;
+pub mod workload_store;
 
 pub use codec::{decode as decode_plan, encode as encode_plan, LawAnnotation};
 pub use compat::{check_schema_change, CompatibilityResult};
 pub use error::CatalogError;
 pub use schema::{ColumnDef, DataType, SchemaVersion};
 pub use store::{CatalogEntry, CatalogStore, EntryKind};
+pub use workload_store::WorkloadStore;
 
 #[cfg(test)]
 mod tests {
@@ -327,5 +340,229 @@ mod tests {
         let registry = LawRegistry::with_builtins();
         let loaded = codec::decode(&bytes, &registry).unwrap();
         assert_eq!(plan, loaded);
+    }
+
+    // ── v0.16 Proof: Workload DDL ─────────────────────────────────────────────
+
+    use crate::error::CatalogError;
+    use rockstream_types::view_lifecycle::ViewState;
+    use rockstream_types::workload::{FreshnessSlo, MemoryLimit, WorkloadDef, WorkloadPriority};
+
+    fn view_schema() -> SchemaVersion {
+        SchemaVersion::new(vec![ColumnDef::required("val", DataType::Int64)])
+    }
+
+    #[test]
+    fn proof_create_workload_and_assign_to_view() {
+        let mut store = CatalogStore::new();
+        let ns = NamespaceId(100);
+
+        // CREATE WORKLOAD fast FRESHNESS_SLO '500ms' MEMORY_LIMIT '1gb' PRIORITY 10
+        let wl = WorkloadDef::new("fast")
+            .with_freshness_slo(FreshnessSlo::new(500))
+            .with_memory_limit(MemoryLimit::new(1 << 30))
+            .with_priority(WorkloadPriority(10));
+        store.create_workload(ns, wl).unwrap();
+
+        // CREATE MATERIALIZED VIEW orders_mv WITH WORKLOAD = 'fast'
+        store
+            .register_view_with_options(
+                ns,
+                "orders_mv",
+                view_schema(),
+                None,
+                vec!["orders".into()],
+                Some("fast".into()),
+            )
+            .unwrap();
+
+        let entry = store.get(ns, "orders_mv").unwrap();
+        assert_eq!(entry.workload_name.as_deref(), Some("fast"));
+        assert_eq!(entry.depends_on, vec!["orders".to_string()]);
+        assert_eq!(entry.state, ViewState::Running);
+    }
+
+    #[test]
+    fn proof_register_view_with_unknown_workload_fails() {
+        let mut store = CatalogStore::new();
+        let ns = NamespaceId(101);
+
+        let err = store
+            .register_view_with_options(
+                ns,
+                "mv",
+                view_schema(),
+                None,
+                vec![],
+                Some("nonexistent".into()),
+            )
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::WorkloadNotFound { .. }));
+    }
+
+    #[test]
+    fn proof_namespace_default_workload() {
+        let mut store = CatalogStore::new();
+        let ns = NamespaceId(102);
+
+        store
+            .create_workload(ns, WorkloadDef::new("default_wl"))
+            .unwrap();
+        // ALTER NAMESPACE ns SET DEFAULT WORKLOAD default_wl
+        store
+            .set_namespace_default_workload(ns, "default_wl")
+            .unwrap();
+        assert_eq!(store.get_namespace_default_workload(ns), Some("default_wl"));
+
+        // A view created without explicit workload should inherit the default.
+        store
+            .register_view(ns, "auto_mv", view_schema(), None)
+            .unwrap();
+        let entry = store.get(ns, "auto_mv").unwrap();
+        assert_eq!(
+            entry.workload_name.as_deref(),
+            Some("default_wl"),
+            "proof: view inherits namespace default workload"
+        );
+    }
+
+    #[test]
+    fn proof_pause_and_resume_view_with_audit_events() {
+        use rockstream_types::audit::AuditEvent;
+
+        let mut store = CatalogStore::new();
+        let ns = NamespaceId(103);
+        store
+            .register_view(ns, "live_mv", view_schema(), None)
+            .unwrap();
+
+        // PAUSE MATERIALIZED VIEW live_mv
+        store.pause_view(ns, "live_mv").unwrap();
+        let paused_event = AuditEvent::now("system", "view.paused", "live_mv");
+        assert_eq!(paused_event.action, "view.paused");
+
+        let entry = store.get(ns, "live_mv").unwrap();
+        assert_eq!(
+            entry.state,
+            ViewState::Paused,
+            "proof: view state transitions to Paused"
+        );
+
+        // Pausing again must return RS-1007.
+        let err = store.pause_view(ns, "live_mv").unwrap_err();
+        assert!(
+            matches!(err, CatalogError::ViewAlreadyPaused { .. }),
+            "proof: double-pause returns RS-1007"
+        );
+
+        // RESUME MATERIALIZED VIEW live_mv
+        store.resume_view(ns, "live_mv").unwrap();
+        let resumed_event = AuditEvent::now("system", "view.resumed", "live_mv");
+        assert_eq!(resumed_event.action, "view.resumed");
+
+        let entry = store.get(ns, "live_mv").unwrap();
+        assert_eq!(
+            entry.state,
+            ViewState::Running,
+            "proof: view state returns to Running after resume"
+        );
+
+        // Resuming a running view must return RS-1008.
+        let err = store.resume_view(ns, "live_mv").unwrap_err();
+        assert!(
+            matches!(err, CatalogError::ViewNotPaused { .. }),
+            "proof: resume of running view returns RS-1008"
+        );
+    }
+
+    #[test]
+    fn proof_show_view_status_reports_state_and_slo() {
+        let mut store = CatalogStore::new();
+        let ns = NamespaceId(104);
+
+        let wl = WorkloadDef::new("realtime").with_freshness_slo(FreshnessSlo::new(100));
+        store.create_workload(ns, wl).unwrap();
+
+        store
+            .register_view_with_options(
+                ns,
+                "fast_mv",
+                view_schema(),
+                None,
+                vec!["events".into()],
+                Some("realtime".into()),
+            )
+            .unwrap();
+        store
+            .register_view(ns, "slow_mv", view_schema(), None)
+            .unwrap();
+        store.pause_view(ns, "slow_mv").unwrap();
+
+        let mut statuses = store.show_view_status(ns);
+        statuses.sort_by(|a, b| a.view_name.cmp(&b.view_name));
+
+        assert_eq!(statuses.len(), 2);
+
+        let fast = statuses.iter().find(|s| s.view_name == "fast_mv").unwrap();
+        assert_eq!(fast.state, ViewState::Running);
+        assert_eq!(fast.workload_name.as_deref(), Some("realtime"));
+        assert_eq!(
+            fast.freshness_slo_ms,
+            Some(100),
+            "proof: SHOW VIEW STATUS reports SLO from workload"
+        );
+
+        let slow = statuses.iter().find(|s| s.view_name == "slow_mv").unwrap();
+        assert_eq!(
+            slow.state,
+            ViewState::Paused,
+            "proof: SHOW VIEW STATUS reports Paused state"
+        );
+    }
+
+    #[test]
+    fn proof_show_backfill_status_for_materialized_view() {
+        let mut store = CatalogStore::new();
+        let ns = NamespaceId(105);
+
+        store
+            .register_view(ns, "building_mv", view_schema(), None)
+            .unwrap();
+
+        let bs = store.show_backfill_status(ns, "building_mv").unwrap();
+        assert_eq!(bs.view_name, "building_mv");
+        assert_eq!(
+            bs.state,
+            ViewState::Running,
+            "proof: newly registered view is Running"
+        );
+        assert!(
+            bs.backfill_started_epoch.is_none(),
+            "proof: no backfill epoch before backfill begins"
+        );
+    }
+
+    #[test]
+    fn proof_drop_workload_in_use_is_rejected() {
+        let mut store = CatalogStore::new();
+        let ns = NamespaceId(106);
+
+        store.create_workload(ns, WorkloadDef::new("busy")).unwrap();
+        store
+            .register_view_with_options(
+                ns,
+                "dep_mv",
+                view_schema(),
+                None,
+                vec![],
+                Some("busy".into()),
+            )
+            .unwrap();
+
+        let err = store.drop_workload(ns, "busy").unwrap_err();
+        assert!(
+            matches!(err, CatalogError::AlreadyExists { .. }),
+            "proof: cannot drop a workload while views are assigned to it"
+        );
     }
 }
