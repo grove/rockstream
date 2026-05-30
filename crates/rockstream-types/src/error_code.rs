@@ -88,6 +88,10 @@ pub const RS_1011: ErrorCode = ErrorCode::new(1011);
 pub const RS_1512: ErrorCode = ErrorCode::new(1512);
 /// Distributed recursion max-iteration cap exceeded without convergence (v0.33).
 pub const RS_1513: ErrorCode = ErrorCode::new(1513);
+/// Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded (v0.34).
+pub const RS_1601: ErrorCode = ErrorCode::new(1601);
+/// Cluster checkpoint recovery in progress; pipeline is in RECOVERING state (v0.34).
+pub const RS_1602: ErrorCode = ErrorCode::new(1602);
 
 // 2xxx: Gateway / query
 /// View not found.
@@ -146,6 +150,8 @@ pub fn description(code: ErrorCode) -> &'static str {
         1011 => "View-on-view DAG contains a cycle",
         1512 => "Inner-frontier stall in distributed recursion; per-shard recompute triggered",
         1513 => "Distributed recursion max-iteration cap exceeded without convergence",
+        1601 => "Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded",
+        1602 => "Cluster checkpoint recovery in progress",
         2001 => "View not found",
         2002 => "Query timeout",
         2003 => "Unsupported isolation level",
@@ -195,6 +201,8 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         5002 => "Register the merge law or migrate the arrangement before attaching the shard.",
         1512 => "Check the step function for infinite cycles or skewed partitioning; review per-shard recompute logs.",
         1513 => "Increase max_iterations or restructure the recursive query to converge faster.",
+        1601 => "Reduce input rate or increase checkpoint alignment buffer capacity; check for slow shards holding up barrier propagation.",
+        1602 => "Wait for recovery to complete; monitor shard reassignment and frontier progress via SHOW VIEW STATUS.",
         _ => "See documentation for this error code.",
     }
 }
@@ -233,7 +241,7 @@ mod tests {
         let codes = [
             RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
             RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_4001, RS_4002, RS_5001, RS_5002,
-            RS_1512, RS_1513,
+            RS_1512, RS_1513, RS_1601, RS_1602,
         ];
         for code in codes {
             assert_ne!(
