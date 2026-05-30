@@ -111,7 +111,11 @@ mod tumble_proof_tests {
 
         // The emitted state must now contain both rows (original + late).
         let emitted = op.emitted();
-        assert_eq!(emitted[&0].len(), 2, "two rows in updated window emitted state");
+        assert_eq!(
+            emitted[&0].len(),
+            2,
+            "two rows in updated window emitted state"
+        );
     }
 
     // ── Proof 3: LateDataPolicy::RouteToSink ─────────────────────────────────
