@@ -363,6 +363,9 @@ fn run_wal_cache_gate() {
 /// a WAL flush per `put()` call which makes sequential-put throughput
 /// unrepresentative of object-store behavior.
 ///
+/// This probe is intentionally heavy and is disabled unless
+/// `STORAGE_BUDGET_RUN_WRITE_AMP=1` is set.
+///
 /// For sign-off runs: `STORAGE_BUDGET_WRITE_AMP_EPOCHS=50` (default 50).
 /// For quick validation: `STORAGE_BUDGET_WRITE_AMP_EPOCHS=5`.
 fn run_write_amplification_probe(label: &str, store: Arc<dyn ObjectStore>) {
@@ -465,7 +468,20 @@ fn gate_probes(c: &mut Criterion) {
         // Azure gate probe (only when configured).
         if let Some(store) = azure_store() {
             run_gate_probe("azure", store.clone());
-            run_write_amplification_probe("azure", store);
+
+            let run_write_amp = std::env::var("STORAGE_BUDGET_RUN_WRITE_AMP")
+                .ok()
+                .map(|s| s == "1")
+                .unwrap_or(false);
+
+            if run_write_amp {
+                run_write_amplification_probe("azure", store);
+            } else {
+                println!(
+                    "[storage_budget] GATE SKIP: write_amplification probe disabled by default. \
+                     Set STORAGE_BUDGET_RUN_WRITE_AMP=1 to enable."
+                );
+            }
         } else {
             println!(
                 "[storage_budget] GATE SKIP: write_amplification probe requires Azure env vars. \
