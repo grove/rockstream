@@ -6,7 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ids::WorkerId;
+use crate::ids::{ShardId, WorkerId};
+use crate::lease::{ShardLease, ShardRevokeReason};
 
 /// The role a node is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -164,6 +165,32 @@ pub enum ControlMessage {
     },
     /// Instructs the worker to stop gracefully.
     Shutdown,
+    /// The control plane has assigned a shard lease to this worker.
+    ///
+    /// The worker must not write to `lease.shard_id` unless it holds the
+    /// current [`LeaseToken`].
+    ShardAssigned {
+        /// The new lease (includes shard_id, worker_id, lease_token).
+        lease: ShardLease,
+    },
+    /// The control plane has revoked a previously assigned shard lease.
+    ///
+    /// The worker must stop writing to `shard_id` immediately and discard
+    /// any buffered writes associated with the old token.
+    ShardRevoked {
+        /// The shard whose lease was revoked.
+        shard_id: ShardId,
+        /// Why the lease was revoked.
+        reason: ShardRevokeReason,
+    },
+    /// Response to a [`WorkerMessage::FenceWrite`] request: confirms whether
+    /// the given [`LeaseToken`] is still the current writer for `shard_id`.
+    FenceAck {
+        /// The shard that was fenced.
+        shard_id: ShardId,
+        /// `true` if `lease_token` is the current active token.
+        valid: bool,
+    },
 }
 
 /// A message sent from a worker to the control plane.
@@ -179,6 +206,19 @@ pub enum WorkerMessage {
     },
     /// Graceful deregistration.
     Deregister { worker_id: WorkerId },
+    /// Request the control plane to acquire a shard lease on behalf of this
+    /// worker. The control plane responds with [`ControlMessage::ShardAssigned`]
+    /// or an error (connection close).
+    RequestShard {
+        worker_id: WorkerId,
+        shard_id: ShardId,
+    },
+    /// Ask the control plane whether this token is still the active writer.
+    /// Used by a worker before committing an epoch to double-check the fence.
+    FenceWrite {
+        shard_id: ShardId,
+        lease_token: crate::ids::LeaseToken,
+    },
 }
 
 #[cfg(test)]

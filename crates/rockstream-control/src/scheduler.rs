@@ -1,0 +1,268 @@
+//! Shard scheduling: distributes shards across healthy workers.
+//!
+//! The [`ShardScheduler`] combines the [`TopologyCatalog`] (who is alive) with
+//! the [`ShardManager`] (who owns which shard) and the [`PlacementAlgorithm`]
+//! (pick the best worker) to produce a consistent shard-to-worker assignment.
+//!
+//! ## Reassignment after worker death
+//!
+//! When a worker disconnects, [`ShardScheduler::on_worker_dead`] is the single
+//! call-site that:
+//! 1. Releases all leases held by the dead worker.
+//! 2. For each freed shard, picks the next best healthy worker via
+//!    [`PlacementAlgorithm::choose`].
+//! 3. Issues a new (higher) fencing token via [`ShardManager::acquire`].
+//! 4. Returns the new [`ShardLease`] list so `ControlService` can push
+//!    [`ControlMessage::ShardAssigned`] to the new holders.
+
+use rockstream_types::ids::{ShardId, WorkerId};
+use rockstream_types::lease::ShardLease;
+
+use crate::placement::PlacementAlgorithm;
+use crate::shard::{LeaseError, ShardManager};
+use crate::topology::TopologyCatalog;
+
+/// Assignment result from [`ShardScheduler::assign_initial_shards`] or
+/// [`ShardScheduler::on_worker_dead`].
+#[derive(Debug, Clone)]
+pub struct ShardAssignment {
+    /// The new (or updated) lease.
+    pub lease: ShardLease,
+    /// `Some(old_worker_id)` if this assignment evicted an existing holder.
+    pub evicted: Option<WorkerId>,
+}
+
+// Helper to make test assertions more readable.
+#[cfg(test)]
+impl ShardAssignment {
+    fn worker_id(&self) -> WorkerId {
+        self.lease.worker_id
+    }
+}
+
+/// Combines topology awareness with shard-lease management.
+///
+/// Cloning a `ShardScheduler` is cheap: both fields are
+/// `Arc`-backed and share state.
+#[derive(Clone)]
+pub struct ShardScheduler {
+    pub(crate) catalog: TopologyCatalog,
+    pub(crate) manager: ShardManager,
+}
+
+impl ShardScheduler {
+    /// Create a new scheduler backed by the given catalog and manager.
+    pub fn new(catalog: TopologyCatalog, manager: ShardManager) -> Self {
+        Self { catalog, manager }
+    }
+
+    /// Assign an initial set of shards to healthy workers.
+    ///
+    /// Each shard is assigned to the healthy worker with the highest
+    /// `capacity_headroom`.  If no healthy workers are available, the shard is
+    /// skipped and not included in the result.
+    ///
+    /// Shards that are already assigned to a *healthy* worker are left alone.
+    /// Shards held by an *unhealthy* worker are force-reassigned.
+    pub fn assign_initial_shards(&self, shard_ids: &[ShardId]) -> Vec<ShardAssignment> {
+        let workers = self.catalog.healthy_workers();
+        if workers.is_empty() {
+            return Vec::new();
+        }
+
+        let mut assignments = Vec::with_capacity(shard_ids.len());
+        for &shard_id in shard_ids {
+            // Skip shards already held by a healthy worker.
+            if let Some(existing) = self.manager.get(shard_id) {
+                let holder_healthy = workers.iter().any(|w| w.worker_id == existing.worker_id);
+                if holder_healthy {
+                    continue;
+                }
+            }
+
+            // Pick best worker and force-acquire (evicts any stale holder).
+            if let Some(winner) = PlacementAlgorithm::choose(&workers) {
+                let (lease, evicted) = self.manager.force_acquire(shard_id, winner.worker_id);
+                assignments.push(ShardAssignment { lease, evicted });
+            }
+        }
+        assignments
+    }
+
+    /// Handle a worker disconnect: release its leases and reassign shards.
+    ///
+    /// Returns the list of new [`ShardAssignment`]s for the freed shards.
+    /// Shards that cannot be reassigned (no healthy workers left) are omitted.
+    pub fn on_worker_dead(&self, dead_worker_id: WorkerId) -> Vec<ShardAssignment> {
+        let freed = self.manager.release_worker(dead_worker_id);
+        if freed.is_empty() {
+            return Vec::new();
+        }
+
+        let workers: Vec<_> = self
+            .catalog
+            .healthy_workers()
+            .into_iter()
+            .filter(|w| w.worker_id != dead_worker_id)
+            .collect();
+
+        if workers.is_empty() {
+            return Vec::new();
+        }
+
+        let mut assignments = Vec::with_capacity(freed.len());
+        for shard_id in freed {
+            if let Some(winner) = PlacementAlgorithm::choose(&workers) {
+                // acquire() should always succeed here because we just released
+                // the shard; no other worker holds it.
+                match self.manager.acquire(shard_id, winner.worker_id) {
+                    Ok(lease) => assignments.push(ShardAssignment {
+                        lease,
+                        evicted: Some(dead_worker_id),
+                    }),
+                    Err(LeaseError::AlreadyLeased { .. }) => {
+                        // Race: another thread already assigned it.  Return the
+                        // current lease instead.
+                        if let Some(lease) = self.manager.get(shard_id) {
+                            assignments.push(ShardAssignment {
+                                lease,
+                                evicted: Some(dead_worker_id),
+                            });
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        assignments
+    }
+
+    /// Expose the underlying [`ShardManager`] for direct fence queries.
+    pub fn manager(&self) -> &ShardManager {
+        &self.manager
+    }
+
+    /// Expose the underlying [`TopologyCatalog`].
+    pub fn catalog(&self) -> &TopologyCatalog {
+        &self.catalog
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rockstream_types::ids::{ShardId, WorkerId};
+    use rockstream_types::topology::{CapacityHeadroom, NodeRole, WorkerRegistration};
+
+    fn make_scheduler() -> ShardScheduler {
+        let catalog = TopologyCatalog::new();
+        let manager = ShardManager::new();
+        ShardScheduler::new(catalog, manager)
+    }
+
+    fn register(sched: &ShardScheduler, id: u64, headroom: f64) -> WorkerId {
+        let reg = WorkerRegistration::new(
+            WorkerId(id),
+            NodeRole::Worker,
+            format!("127.0.0.1:{}", 8000 + id),
+            CapacityHeadroom::new(headroom),
+        );
+        sched.catalog.register(&reg)
+    }
+
+    #[test]
+    fn assign_initial_shards_to_best_worker() {
+        let sched = make_scheduler();
+        register(&sched, 1, 0.9); // Worker 1 has most capacity
+        register(&sched, 2, 0.3); // Worker 2 less capacity
+
+        let shards = [ShardId(1), ShardId(2), ShardId(3)];
+        let assignments = sched.assign_initial_shards(&shards);
+
+        // All three shards should be assigned (workers are healthy).
+        assert_eq!(assignments.len(), 3);
+        // The best worker (highest headroom = worker 1) should get all shards
+        // because placement picks max headroom each time and headroom doesn't
+        // decrease in our test catalog.
+        for a in &assignments {
+            assert_eq!(a.worker_id(), WorkerId(1));
+        }
+    }
+
+    #[test]
+    fn assign_no_workers_returns_empty() {
+        let sched = make_scheduler();
+        let assignments = sched.assign_initial_shards(&[ShardId(1)]);
+        assert!(assignments.is_empty());
+    }
+
+    #[test]
+    fn worker_death_causes_reassignment() {
+        let sched = make_scheduler();
+        register(&sched, 1, 0.8);
+        register(&sched, 2, 0.7);
+
+        // Worker 1 owns shards 1 and 2.
+        sched.manager.acquire(ShardId(1), WorkerId(1)).unwrap();
+        sched.manager.acquire(ShardId(2), WorkerId(1)).unwrap();
+
+        let old_token_1 = sched.manager.get(ShardId(1)).unwrap().lease_token;
+        let old_token_2 = sched.manager.get(ShardId(2)).unwrap().lease_token;
+
+        // Worker 1 dies.
+        let reassignments = sched.on_worker_dead(WorkerId(1));
+        assert_eq!(reassignments.len(), 2);
+
+        // All freed shards should now be assigned to Worker 2.
+        for a in &reassignments {
+            assert_eq!(a.lease.worker_id, WorkerId(2));
+            assert_eq!(a.evicted, Some(WorkerId(1)));
+        }
+
+        // Old tokens must be invalid.
+        assert!(!sched.manager.is_valid_writer(ShardId(1), old_token_1));
+        assert!(!sched.manager.is_valid_writer(ShardId(2), old_token_2));
+
+        // New tokens must be valid.
+        let new_token_1 = sched.manager.get(ShardId(1)).unwrap().lease_token;
+        let new_token_2 = sched.manager.get(ShardId(2)).unwrap().lease_token;
+        assert!(sched.manager.is_valid_writer(ShardId(1), new_token_1));
+        assert!(sched.manager.is_valid_writer(ShardId(2), new_token_2));
+    }
+
+    #[test]
+    fn worker_death_with_no_remaining_workers_frees_shards() {
+        let sched = make_scheduler();
+        register(&sched, 1, 1.0);
+
+        sched.manager.acquire(ShardId(1), WorkerId(1)).unwrap();
+
+        // Only worker dies → no reassignments possible, but shards are freed.
+        let reassignments = sched.on_worker_dead(WorkerId(1));
+        assert!(reassignments.is_empty());
+        assert!(sched.manager.is_empty());
+    }
+
+    #[test]
+    fn assign_skips_already_held_healthy_shards() {
+        let sched = make_scheduler();
+        register(&sched, 1, 0.9);
+
+        // Pre-assign shard 1 to worker 1.
+        sched.manager.acquire(ShardId(1), WorkerId(1)).unwrap();
+        let existing_token = sched.manager.get(ShardId(1)).unwrap().lease_token;
+
+        // assign_initial_shards should skip shard 1 since worker 1 is healthy.
+        let assignments = sched.assign_initial_shards(&[ShardId(1), ShardId(2)]);
+
+        // Only shard 2 should be newly assigned.
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].lease.shard_id, ShardId(2));
+
+        // Shard 1's token must be unchanged.
+        assert_eq!(
+            sched.manager.get(ShardId(1)).unwrap().lease_token,
+            existing_token
+        );
+    }
+}

@@ -12,6 +12,7 @@ pub mod explain;
 pub mod frontier;
 pub mod ids;
 pub mod laws;
+pub mod lease;
 pub mod merge_law;
 pub mod metrics;
 pub mod state_budget;
