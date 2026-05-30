@@ -231,9 +231,9 @@ mod tests {
         let result = law.merge(&a, &b).unwrap();
         assert_eq!(result[0], 5, "max(5, 2) = 5");
         assert_eq!(result[10], 7, "max(3, 7) = 7");
-        for i in 1..HLL_WIRE_SIZE {
+        for (i, item) in result.iter().enumerate().skip(1) {
             if i != 10 {
-                assert_eq!(result[i], 0, "other registers are 0");
+                assert_eq!(*item, 0, "other registers are 0");
             }
         }
     }
@@ -243,9 +243,11 @@ mod tests {
         let law = HyperLogLogV1;
         let mut a = vec![0u8; HLL_WIRE_SIZE];
         let mut b = vec![0u8; HLL_WIRE_SIZE];
-        for i in 0..HLL_WIRE_SIZE {
-            a[i] = (i % 7) as u8;
-            b[i] = (i % 11) as u8;
+        for (i, a_val) in a.iter_mut().enumerate() {
+            *a_val = (i % 7) as u8;
+        }
+        for (i, b_val) in b.iter_mut().enumerate() {
+            *b_val = (i % 11) as u8;
         }
         let ab = law.merge(&a, &b).unwrap();
         let ba = law.merge(&b, &a).unwrap();
@@ -256,8 +258,8 @@ mod tests {
     fn merge_is_idempotent() {
         let law = HyperLogLogV1;
         let mut a = vec![0u8; HLL_WIRE_SIZE];
-        for i in 0..HLL_WIRE_SIZE {
-            a[i] = i as u8;
+        for (i, item) in a.iter_mut().enumerate() {
+            *item = i as u8;
         }
         let result = law.merge(&a, &a).unwrap();
         assert_eq!(result, a, "merge(a, a) == a for semilattice");
@@ -269,10 +271,14 @@ mod tests {
         let mut a = vec![0u8; HLL_WIRE_SIZE];
         let mut b = vec![0u8; HLL_WIRE_SIZE];
         let mut c = vec![0u8; HLL_WIRE_SIZE];
-        for i in 0..HLL_WIRE_SIZE {
-            a[i] = (i % 5) as u8;
-            b[i] = (i % 7) as u8;
-            c[i] = (i % 11) as u8;
+        for (i, item) in a.iter_mut().enumerate() {
+            *item = (i % 5) as u8;
+        }
+        for (i, item) in b.iter_mut().enumerate() {
+            *item = (i % 7) as u8;
+        }
+        for (i, item) in c.iter_mut().enumerate() {
+            *item = (i % 11) as u8;
         }
         let ab_c = law.merge(&law.merge(&a, &b).unwrap(), &c).unwrap();
         let a_bc = law.merge(&a, &law.merge(&b, &c).unwrap()).unwrap();
@@ -293,8 +299,8 @@ mod tests {
         let law = HyperLogLogV1;
         let id = law.identity().unwrap();
         let mut val = vec![0u8; HLL_WIRE_SIZE];
-        for i in 0..HLL_WIRE_SIZE {
-            val[i] = (i % 13) as u8;
+        for (i, item) in val.iter_mut().enumerate() {
+            *item = (i % 13) as u8;
         }
         assert_eq!(law.merge(&id, &val).unwrap(), val, "identity left-neutral");
         assert_eq!(law.merge(&val, &id).unwrap(), val, "identity right-neutral");
@@ -353,8 +359,7 @@ mod tests {
         // With 100 distinct values and 64 registers, expect 70–140 (±40%).
         assert!(
             ndv > 60.0 && ndv < 200.0,
-            "NDV estimate for 100 distinct values: {}",
-            ndv
+            "NDV estimate for 100 distinct values: {ndv}"
         );
     }
 
@@ -388,15 +393,11 @@ mod tests {
         // Union NDV should be >= NDV of either individual sketch.
         assert!(
             ndv_union >= ndv_a - 1.0,
-            "union NDV {} should be >= NDV_a {}",
-            ndv_union,
-            ndv_a
+            "union NDV {ndv_union} should be >= NDV_a {ndv_a}"
         );
         assert!(
             ndv_union >= ndv_b - 1.0,
-            "union NDV {} should be >= NDV_b {}",
-            ndv_union,
-            ndv_b
+            "union NDV {ndv_union} should be >= NDV_b {ndv_b}"
         );
     }
 }

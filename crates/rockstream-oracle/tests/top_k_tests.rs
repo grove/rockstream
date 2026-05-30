@@ -21,9 +21,7 @@ mod topk_proof_tests {
     use rockstream_oracle::top_k_oracle::{oracle_topk_sorted, FlatTopKRow, TopKOracle};
     use rockstream_plan::{OpKind, PlanNode};
     use rockstream_types::batch::ZSet;
-    use rockstream_types::laws::hyper_log_log::{
-        hll_add, hll_estimate_ndv, HyperLogLogV1, HLL_NUM_REGISTERS,
-    };
+    use rockstream_types::laws::hyper_log_log::{hll_add, HyperLogLogV1, HLL_NUM_REGISTERS};
     use rockstream_types::laws::registry::LawRegistry;
     use rockstream_types::laws::weight_add::WEIGHT_ADD_ID;
     use rockstream_types::merge_law::LawBundle;
