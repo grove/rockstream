@@ -24,3 +24,11 @@ pub use min_register::MinRegisterV1;
 pub use registry::LawRegistry;
 pub use sum_count::SumCountV1;
 pub use weight_add::WeightAddV1;
+
+// Re-export well-known law IDs for use in tests and exchange combiners.
+pub use bloom_union::BLOOM_UNION_ID;
+pub use hyper_log_log::HLL_ID;
+pub use max_register::MAX_REGISTER_ID;
+pub use min_register::MIN_REGISTER_ID;
+pub use sum_count::SUM_COUNT_ID;
+pub use weight_add::WEIGHT_ADD_ID;

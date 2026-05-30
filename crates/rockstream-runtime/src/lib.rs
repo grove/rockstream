@@ -5,6 +5,7 @@
 
 pub mod bench;
 pub mod epoch_coordinator;
+pub mod exchange;
 pub mod explain;
 pub mod pipeline;
 pub mod support_bundle;

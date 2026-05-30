@@ -15,6 +15,7 @@ rockstream-ops = { workspace = true }
 rockstream-plan = { workspace = true }
 rockstream-sim = { workspace = true }
 rockstream-storage = { workspace = true }
+arrow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
