@@ -442,6 +442,7 @@ mod lowering_tests {
                 OpKind::Sink { .. } => "Sink",
                 OpKind::Window { .. } => "Window",
                 OpKind::TumbleWindow { .. } => "TumbleWindow",
+                OpKind::TopK { .. } => "TopK",
             })
             .collect()
     }
@@ -944,6 +945,7 @@ mod soak_tests {
                 OpKind::Sink { .. } => "Sink",
                 OpKind::Window { .. } => "Window",
                 OpKind::TumbleWindow { .. } => "TumbleWindow",
+                OpKind::TopK { .. } => "TopK",
             })
             .collect();
         assert_eq!(got, expected, "operator kind sequence mismatch");

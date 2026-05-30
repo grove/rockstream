@@ -79,6 +79,11 @@ fn kind_label(kind: &OpKind) -> String {
             window_size_ms,
             late_data_policy,
         } => format!("TumbleWindow[{window_size_ms}ms,{late_data_policy:?}]"),
+        OpKind::TopK {
+            k,
+            rank_col,
+            partition_by,
+        } => format!("TopK[k={k},rank={rank_col},partitions={partition_by:?}]"),
     }
 }
 

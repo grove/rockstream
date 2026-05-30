@@ -18,6 +18,7 @@ pub mod row_codec;
 pub mod scheduler;
 pub mod set_ops;
 pub mod task;
+pub mod top_k;
 pub mod tumble;
 pub mod window;
 

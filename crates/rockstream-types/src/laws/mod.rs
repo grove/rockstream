@@ -5,13 +5,17 @@
 //! v0.7 adds `SumCount/v1` — the abelian-group aggregate law (SUM, COUNT, AVG).
 //! v0.8 adds `MaxRegister/v1` and `MinRegister/v1` — semilattice cached-slot
 //!      laws backing the retraction-aware `MinMaxOp` operator.
+//! v0.21 adds `HyperLogLog/v1` — semilattice sketch law for planner NDV
+//!       estimation.
 
+pub mod hyper_log_log;
 pub mod max_register;
 pub mod min_register;
 pub mod registry;
 pub mod sum_count;
 pub mod weight_add;
 
+pub use hyper_log_log::HyperLogLogV1;
 pub use max_register::MaxRegisterV1;
 pub use min_register::MinRegisterV1;
 pub use registry::LawRegistry;

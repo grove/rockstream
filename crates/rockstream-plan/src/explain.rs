@@ -65,6 +65,11 @@ pub fn explain_op_node(node: &OpNode, depth: u32, level: ExplainLevel) -> Explai
             window_size_ms,
             late_data_policy,
         } => format!("TumbleWindow[{window_size_ms}ms,{late_data_policy:?}]"),
+        OpKind::TopK {
+            k,
+            rank_col,
+            partition_by,
+        } => format!("TopK[k={k},rank={rank_col},partitions={partition_by:?}]"),
     };
 
     let shard_info = match level {

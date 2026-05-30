@@ -197,6 +197,20 @@ fn encode_node(
                 "input": encode_node(input, law_for, &format!("{path}/tumble_input")),
             })
         }
+        PlanNode::TopK {
+            input,
+            k,
+            rank_col,
+            partition_by,
+        } => {
+            serde_json::json!({
+                "type": "TopK",
+                "k": k,
+                "rank_col": rank_col,
+                "partition_by": partition_by,
+                "input": encode_node(input, law_for, &format!("{path}/topk_input")),
+            })
+        }
     }
 }
 
@@ -456,6 +470,37 @@ fn decode_node(v: &Value, registry: &LawRegistry, path: &str) -> Result<PlanNode
                 time_col,
                 window_size_ms,
                 late_data_policy,
+            })
+        }
+        "TopK" => {
+            let k = v["k"]
+                .as_u64()
+                .ok_or_else(|| CatalogError::Codec(format!("{path}: TopK missing 'k'")))?
+                as usize;
+            let rank_col = v["rank_col"]
+                .as_u64()
+                .ok_or_else(|| CatalogError::Codec(format!("{path}: TopK missing 'rank_col'")))?
+                as usize;
+            let partition_by = v["partition_by"]
+                .as_array()
+                .ok_or_else(|| CatalogError::Codec(format!("{path}: TopK missing 'partition_by'")))?
+                .iter()
+                .map(|pv| {
+                    pv.as_u64()
+                        .ok_or_else(|| {
+                            CatalogError::Codec(format!(
+                                "{path}: TopK partition_by element not u64"
+                            ))
+                        })
+                        .map(|n| n as usize)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let input = decode_node(&v["input"], registry, &format!("{path}/topk_input"))?;
+            Ok(PlanNode::TopK {
+                input: Box::new(input),
+                k,
+                rank_col,
+                partition_by,
             })
         }
         other => Err(CatalogError::Codec(format!(
