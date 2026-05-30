@@ -9,6 +9,8 @@ use rockstream_plan::{
     AggregateFunc, NotMergeSafeReason, OpKind, OpNode, PlanNode, WindowFunc, WindowStrategy,
 };
 use rockstream_types::ids::OperatorId;
+use rockstream_types::laws::bloom_union::BLOOM_UNION_ID;
+use rockstream_types::laws::hyper_log_log::HLL_ID;
 use rockstream_types::laws::max_register::MAX_REGISTER_ID;
 use rockstream_types::laws::min_register::MIN_REGISTER_ID;
 use rockstream_types::laws::sum_count::SUM_COUNT_ID;
@@ -245,6 +247,21 @@ impl DiffCtx {
                 });
                 id
             }
+            PlanNode::Lateral { input, func } => {
+                let input_id = self.diff_node(input, nodes);
+                let id = self.alloc_id();
+                nodes.push(OpNode {
+                    id,
+                    kind: OpKind::Lateral { func: func.clone() },
+                    // Lateral/SRF is stateless: it maps each input row to
+                    // zero or more output rows with no arrangement.  A
+                    // retracted input row retracts exactly its output rows.
+                    merge_law: None,
+                    not_merge_safe_reason: Some(NotMergeSafeReason::Stateless),
+                    inputs: vec![input_id],
+                });
+                id
+            }
             PlanNode::Recursion {
                 base,
                 step,
@@ -293,6 +310,13 @@ impl DiffCtx {
     /// Both extremum variants also carry `ExtremumRequiresRmw` because
     /// `get_merged()` on the storage arrangement alone is insufficient after
     /// retractions — the operator's prefix-scan rescan is required.
+    ///
+    /// For APPROX_COUNT_DISTINCT, `HyperLogLog/v1` is used (semilattice,
+    /// non-invertible).  Retraction-aware correctness requires a full sketch
+    /// rescan; `ExtremumRequiresRmw` is reported.
+    ///
+    /// For APPROX_MEMBERSHIP, `BloomUnion/v1` is used (semilattice,
+    /// non-invertible).  Same `ExtremumRequiresRmw` requirement.
     fn law_for_aggregate(
         &self,
         aggregates: &[rockstream_plan::AggregateExpr],
@@ -303,6 +327,12 @@ impl DiffCtx {
         let has_min = aggregates
             .iter()
             .any(|a| matches!(a.func, AggregateFunc::Min));
+        let has_approx_distinct = aggregates
+            .iter()
+            .any(|a| matches!(a.func, AggregateFunc::ApproxCountDistinct));
+        let has_approx_membership = aggregates
+            .iter()
+            .any(|a| matches!(a.func, AggregateFunc::ApproxMembership));
 
         if has_max {
             // MAX aggregate: cached slot uses MaxRegister/v1.
@@ -314,6 +344,17 @@ impl DiffCtx {
             // MIN aggregate: cached slot uses MinRegister/v1.
             (
                 Some(MIN_REGISTER_ID),
+                Some(NotMergeSafeReason::ExtremumRequiresRmw),
+            )
+        } else if has_approx_distinct {
+            // APPROX_COUNT_DISTINCT: HyperLogLog/v1 (semilattice).
+            // Non-invertible; retraction requires sketch rescan.
+            (Some(HLL_ID), Some(NotMergeSafeReason::ExtremumRequiresRmw))
+        } else if has_approx_membership {
+            // APPROX_MEMBERSHIP: BloomUnion/v1 (semilattice).
+            // Non-invertible; retraction requires full filter rescan.
+            (
+                Some(BLOOM_UNION_ID),
                 Some(NotMergeSafeReason::ExtremumRequiresRmw),
             )
         } else {

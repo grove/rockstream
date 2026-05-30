@@ -144,6 +144,7 @@ impl ViewDagOracle {
             }
             PlanNode::Recursion { base, .. } => Self::eval_plan(base, env),
             PlanNode::Snapshot { .. } => ZSet::new(),
+            PlanNode::Lateral { input, .. } => Self::eval_plan(input, env),
         }
     }
 }
@@ -176,6 +177,9 @@ fn collect_source_names(
         PlanNode::Recursion { base, step, .. } => {
             collect_source_names(base, env, source_fn);
             collect_source_names(step, env, source_fn);
+        }
+        PlanNode::Lateral { input, .. } => {
+            collect_source_names(input, env, source_fn);
         }
     }
 }

@@ -13,6 +13,7 @@ pub mod aggregate_oracle;
 pub mod batch_oracle;
 pub mod bootstrap_oracle;
 pub mod join_oracle;
+pub mod lateral_srf_oracle;
 pub mod law_harness;
 pub mod min_max_oracle;
 pub mod recursive_oracle;

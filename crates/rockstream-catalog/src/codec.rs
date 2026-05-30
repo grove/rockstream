@@ -22,7 +22,8 @@
 
 use crate::error::CatalogError;
 use rockstream_plan::{
-    AggregateExpr, AggregateFunc, BinaryOp, Expr, LateDataPolicy, PlanNode, WindowExpr, WindowFunc,
+    AggregateExpr, AggregateFunc, BinaryOp, Expr, LateDataPolicy, LateralFunc, PlanNode,
+    WindowExpr, WindowFunc,
 };
 use rockstream_types::laws::registry::LawRegistry;
 use rockstream_types::merge_law::{MergeLawId, MergeLawVersion};
@@ -241,6 +242,13 @@ fn encode_node(
                 "view_name": view_name,
             })
         }
+        PlanNode::Lateral { input, func } => {
+            serde_json::json!({
+                "type": "Lateral",
+                "func": encode_lateral_func(func),
+                "input": encode_node(input, law_for, &format!("{path}/lateral_input")),
+            })
+        }
     }
 }
 
@@ -253,6 +261,11 @@ fn encode_expr(expr: &Expr) -> Value {
             "op": encode_binary_op(*op),
             "left": encode_expr(left),
             "right": encode_expr(right),
+        }),
+        Expr::ScalarUdf { name, args } => serde_json::json!({
+            "type": "ScalarUdf",
+            "name": name,
+            "args": args.iter().map(encode_expr).collect::<Vec<_>>(),
         }),
     }
 }
@@ -289,6 +302,8 @@ fn encode_agg_func(func: AggregateFunc) -> &'static str {
         AggregateFunc::Avg => "Avg",
         AggregateFunc::Min => "Min",
         AggregateFunc::Max => "Max",
+        AggregateFunc::ApproxCountDistinct => "ApproxCountDistinct",
+        AggregateFunc::ApproxMembership => "ApproxMembership",
     }
 }
 
@@ -345,6 +360,21 @@ fn encode_window_func(func: &WindowFunc) -> Value {
         }
         WindowFunc::SlidingAvg { frame_rows } => {
             serde_json::json!({ "kind": "SlidingAvg", "frame_rows": frame_rows })
+        }
+    }
+}
+
+fn encode_lateral_func(func: &LateralFunc) -> Value {
+    match func {
+        LateralFunc::Unnest { col } => serde_json::json!({ "kind": "Unnest", "col": col }),
+        LateralFunc::GenerateSeries { start, stop, step } => serde_json::json!({
+            "kind": "GenerateSeries",
+            "start": start,
+            "stop": stop,
+            "step": step,
+        }),
+        LateralFunc::JsonExtractArray { col } => {
+            serde_json::json!({ "kind": "JsonExtractArray", "col": col })
         }
     }
 }
@@ -571,6 +601,14 @@ fn decode_node(v: &Value, registry: &LawRegistry, path: &str) -> Result<PlanNode
                 .to_owned();
             Ok(PlanNode::ViewRef { view_name })
         }
+        "Lateral" => {
+            let func = decode_lateral_func(&v["func"], path)?;
+            let input = decode_node(&v["input"], registry, &format!("{path}/lateral_input"))?;
+            Ok(PlanNode::Lateral {
+                input: Box::new(input),
+                func,
+            })
+        }
         other => Err(CatalogError::Codec(format!(
             "{path}: unknown node type '{other}'"
         ))),
@@ -618,6 +656,19 @@ fn decode_expr(v: &Value, path: &str) -> Result<Expr, CatalogError> {
                 right: Box::new(right),
             })
         }
+        "ScalarUdf" => {
+            let name = v["name"]
+                .as_str()
+                .ok_or_else(|| CatalogError::Codec(format!("{path}: ScalarUdf missing 'name'")))?
+                .to_owned();
+            let args = v["args"]
+                .as_array()
+                .ok_or_else(|| CatalogError::Codec(format!("{path}: ScalarUdf missing 'args'")))?
+                .iter()
+                .map(|e| decode_expr(e, path))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Expr::ScalarUdf { name, args })
+        }
         other => Err(CatalogError::Codec(format!(
             "{path}: unknown expr type '{other}'"
         ))),
@@ -654,6 +705,8 @@ fn decode_agg_expr(v: &Value, path: &str) -> Result<AggregateExpr, CatalogError>
         "Avg" => AggregateFunc::Avg,
         "Min" => AggregateFunc::Min,
         "Max" => AggregateFunc::Max,
+        "ApproxCountDistinct" => AggregateFunc::ApproxCountDistinct,
+        "ApproxMembership" => AggregateFunc::ApproxMembership,
         other => {
             return Err(CatalogError::Codec(format!(
                 "{path}: unknown aggregate function '{other}'"
@@ -733,6 +786,42 @@ fn decode_window_func(v: &Value, path: &str) -> Result<WindowFunc, CatalogError>
         }),
         other => Err(CatalogError::Codec(format!(
             "{path}: unknown WindowFunc kind '{other}'"
+        ))),
+    }
+}
+
+fn decode_lateral_func(v: &Value, path: &str) -> Result<LateralFunc, CatalogError> {
+    let kind = v["kind"]
+        .as_str()
+        .ok_or_else(|| CatalogError::Codec(format!("{path}: LateralFunc missing 'kind'")))?;
+    match kind {
+        "Unnest" => {
+            let col = v["col"]
+                .as_u64()
+                .ok_or_else(|| CatalogError::Codec(format!("{path}: Unnest missing 'col'")))?
+                as usize;
+            Ok(LateralFunc::Unnest { col })
+        }
+        "GenerateSeries" => {
+            let start = v["start"].as_i64().ok_or_else(|| {
+                CatalogError::Codec(format!("{path}: GenerateSeries missing 'start'"))
+            })?;
+            let stop = v["stop"].as_i64().ok_or_else(|| {
+                CatalogError::Codec(format!("{path}: GenerateSeries missing 'stop'"))
+            })?;
+            let step = v["step"].as_i64().ok_or_else(|| {
+                CatalogError::Codec(format!("{path}: GenerateSeries missing 'step'"))
+            })?;
+            Ok(LateralFunc::GenerateSeries { start, stop, step })
+        }
+        "JsonExtractArray" => {
+            let col = v["col"].as_u64().ok_or_else(|| {
+                CatalogError::Codec(format!("{path}: JsonExtractArray missing 'col'"))
+            })? as usize;
+            Ok(LateralFunc::JsonExtractArray { col })
+        }
+        other => Err(CatalogError::Codec(format!(
+            "{path}: unknown LateralFunc kind '{other}'"
         ))),
     }
 }

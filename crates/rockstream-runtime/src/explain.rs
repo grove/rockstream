@@ -93,6 +93,7 @@ fn kind_label(kind: &OpKind) -> String {
             batch_size,
         } => format!("Snapshot[{source_name},batch={batch_size}]"),
         OpKind::ViewRef { view_name } => format!("ViewRef[{view_name}]"),
+        OpKind::Lateral { func } => format!("Lateral[{func:?}]"),
     }
 }
 

@@ -446,6 +446,7 @@ mod lowering_tests {
                 OpKind::Recursion { .. } => "Recursion",
                 OpKind::Snapshot { .. } => "Snapshot",
                 OpKind::ViewRef { .. } => "ViewRef",
+                OpKind::Lateral { .. } => "Lateral",
             })
             .collect()
     }
@@ -952,6 +953,7 @@ mod soak_tests {
                 OpKind::Recursion { .. } => "Recursion",
                 OpKind::Snapshot { .. } => "Snapshot",
                 OpKind::ViewRef { .. } => "ViewRef",
+                OpKind::Lateral { .. } => "Lateral",
             })
             .collect();
         assert_eq!(got, expected, "operator kind sequence mismatch");

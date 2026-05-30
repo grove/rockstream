@@ -58,6 +58,7 @@ fn collect_refs(plan: &PlanNode, out: &mut Vec<String>) {
             collect_refs(base, out);
             collect_refs(step, out);
         }
+        PlanNode::Lateral { input, .. } => collect_refs(input, out),
     }
 }
 
