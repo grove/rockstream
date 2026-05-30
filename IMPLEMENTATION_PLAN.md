@@ -405,7 +405,10 @@ join queries written as plain SQL.
 - Plain-SQL view DDL works end-to-end: a user can submit
   `CREATE VIEW v AS SELECT ... FROM t1 JOIN t2 ON ... GROUP BY ...` and the
   engine compiles, deploys, and maintains it incrementally.
-- TPC-H Q1, Q3, Q5, Q6, Q11, Q21 all pass parity vs. DataFusion batch.
+- TPC-H Q1, Q3, Q5, Q6, Q11, Q21 all pass *plan-level* parity: lowered
+  PlanNode graph is structurally equivalent to the expected join/aggregate/
+  set-op topology. Batch-execution parity (actual row-level output equality)
+  is deferred to Phase 3.5’s TPC-H 22/22 correctness soak.
 - All compiled plans round-trip through Substrait without loss.
 - Property-test harness extends to every operator combination implemented
   so far.
@@ -461,6 +464,28 @@ join queries written as plain SQL.
 
 ---
 
+### Storage Operational Budget Gate (between Phase 2 and Phase 3)
+
+Before Phase 3 begins, the project must prove that the SlateDB operational
+budgets specified in DESIGN.md §5.4 hold under real object-store latency
+at shard sizes exceeding 1 GB. This is not a new roadmap version — it is a
+gate that must be passed as part of the v0.19 entry criteria.
+
+**Gate evidence required:**
+- Object-store request p99 latencies for PUT/GET/LIST at 1GB and 5GB shard
+  sizes on a real S3-compatible endpoint.
+- Manifest write cadence measured under steady-state (100k rows/s source)
+  and bursty (1M rows/s for 10s) load.
+- WAL listing cache hit ratio > 99% under sustained operation.
+- `write_amplification_ratio` measured and recorded.
+- `min_epoch_ms` floor demonstrably prevents manifest churn.
+
+If any budget is exceeded by >2x the specified target, the project must
+file a tracking issue and either adjust the target or implement a mitigation
+before advancing past v0.19.
+
+---
+
 ## Phase 3 — Advanced Operators
 
 **Goal**: Cover the remaining operators required to handle the full SQL
@@ -477,6 +502,11 @@ standard for analytical workloads.
 - Implement ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, NTILE, sliding SUM/AVG.
 - Optimization (deferred): segment-tree variant for sliding aggregates
   (DESIGN.md §6.7), stored under `op_index/0x02 0xST`.
+
+**Escape hatch**: if sliding-aggregate incremental maintenance proves
+intractable within the version budget, fall back to partition-scoped
+recomputation for all window functions (correct, slower). The segment-tree
+path is then promoted to v0.20 or tracked as a separate follow-up.
 
 **Latency-class caveat.** Partition-based recomputation is O(partition_size)
 per change. Windows over partitions large enough that recomputation exceeds
@@ -496,6 +526,12 @@ operators are expected to either accept the relaxed SLO or split partitions.
   that removes state only after event-time expiry and input/output frontiers
   prove safety.
 - Late-data handling policy: configurable (`drop` / `update` / `route_to_sink`).
+
+**Escape hatch**: if event-time frontier algebra adds excessive overhead to
+the hot path, implement TUMBLE only in this milestone and defer HOP/SESSION
+to v0.21. TUMBLE is the most common window type and exercises the full
+frontier/TTL/compaction-filter pipeline; HOP and SESSION add complexity but
+no new fundamental mechanisms.
 
 ### Milestone IVM-9 — Top-K (continues Phase 2's set-op family)
 
@@ -527,6 +563,11 @@ operators are expected to either accept the relaxed SLO or split partitions.
 - This is Feldera's `IterativeCircuit` model rebuilt for our async runtime.
 - Test: transitive closure on a 1M-edge graph; recursive employee hierarchy;
   graph reachability with cycles.
+
+**Escape hatch**: if DRed proves unsound under concurrent deletes within the
+version budget, restrict to monotone-only recursion (semi-naive) and reject
+non-monotone recursive terms with `RS-1007 recursion.non_monotone_not_supported`.
+DRed is then tracked as a follow-up issue.
 
 ### Milestone IVM-11 — Bootstrap & snapshot mode (IVM.md §13 IVM-10, §12)
 

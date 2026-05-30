@@ -612,6 +612,27 @@ do not change. The control plane records the active runtime profile per
 pipeline, and `EXPLAIN INCREMENTAL` shows which exchanges were elided, looped
 back, or sent over the network.
 
+### 3.1.1 Runtime Profile Transitions
+
+A pipeline transitions between runtime profiles via a control-plane command
+(`ALTER WORKLOAD ... SET RUNTIME_PROFILE = 'distributed'`). Transitions are
+**epoch-aligned**: the control plane waits for the current epoch to commit,
+quiesces the pipeline (no new source data accepted), re-plans operator
+placement, and resumes at the next epoch. State is not migrated — it remains
+in the same SlateDB shards on the same object-store prefix. Only the
+placement map and exchange topology change.
+
+Transitions are valid in one direction only: `embedded → single_worker →
+distributed`. Downgrade is not supported; operators must destroy and recreate
+the pipeline at a lower profile. This prevents the ambiguity of merging
+multiple distributed shards back into one embedded shard.
+
+The `visible_frontier` semantics do NOT change mid-pipeline. A pipeline
+created in `embedded` mode that transitions to `distributed` retains its
+`visible_frontier` on the originating worker; distributed reads use
+`durable_frontier`. The transition command emits a `NOTICE` explaining
+this semantic change.
+
 ### Why Shards (and not "one SlateDB")
 
 SlateDB is single-writer per database. To exceed one writer's throughput we run
@@ -3337,6 +3358,21 @@ Client (psql / JDBC)  ──INSERT──►  Gateway  ──delta──►  Base
 - On `ROLLBACK`, the buffer is discarded without touching the shard.
 - On `BEGIN`, the session pins to the current published vector frontier for
   `REPEATABLE READ` reads within the same transaction.
+
+**Write admission control.** The gateway tracks per-shard pending write bytes
+(`direct_write_pending_bytes{shard_id}`). When pending bytes exceed
+`direct_write_buffer_limit_bytes` (default 64 MB per shard), new `COMMIT`
+operations on sessions targeting that shard are blocked with a
+`RS-2019 write.shard_backpressure` NOTICE after `direct_write_notice_ms`
+(default 1000 ms) and rejected with the same error code after
+`direct_write_timeout_ms` (default 30000 ms). This prevents unbounded
+write-buffer growth when downstream IVM processing or object-store writes
+cannot keep pace with application writes.
+
+The admission signal is the shard's `credits_available()` equivalent for the
+internal source: when the shard's uncommitted epoch buffer exceeds the limit,
+credits are exhausted and writes queue. This mirrors the Kafka source's
+credit-based flow control from §13.3.
 
 **Isolation guarantees:**
 

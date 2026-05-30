@@ -71,6 +71,9 @@ complete:
 - Any new queue, buffer, or scan window has a named upper bound, a metric
   reporting current fill level, and a backpressure or error path when the
   bound is reached. Unbounded in-memory accumulation is never acceptable.
+- Any new simulation test added in a version must survive at least one
+  subsequent version’s commit range without failure (“simulation continuity”).
+  A test that passes at v0.X but fails at v0.X+1 blocks v0.X+1 signoff.
 - Main remains runnable through the single `rockstream` binary.
 - A sign-off file `sign-offs/vX.Y.md` exists with all checklist items marked, confirming the Proof criteria were verified. Run `make approve VERSION=X.Y` to generate the template; CI blocks merging a `✅ Done` marker if the sign-off is missing or has unchecked items.
 
@@ -87,8 +90,8 @@ These names are for orientation. They are not calendar commitments.
 | Milestone | Version | Meaning |
 |---|---:|---|
 | Developer Alpha | v0.10 | Local single-shard engine can maintain simple views and survive crash/replay. |
-| Developer Preview | v0.18 | Single-shard SQL engine demo-able to external users. Blog post + feedback loop. |
-| SQL Alpha | v0.18 | Core SQL views, joins, set ops, and `EXPLAIN` work on one shard. |
+| Developer Preview | v0.27 | Single-shard SQL engine demo-able to external users. Blog post + feedback loop. |
+| SQL Alpha (internal) | v0.18 | Core SQL views, joins, set ops, and `EXPLAIN` work on one shard. Internal-only milestone; not externally advertised. |
 | Single-Shard Beta | v0.27 | Advanced IVM is feature-complete enough for serious single-node testing. |
 | Distributed Alpha | v0.36 | Multi-shard execution, frontier protocol, recovery, and exactly-once basics work. |
 | Integration Beta | v0.45 | Postgres access, direct writes, and major external connectors work end to end. |
@@ -140,10 +143,10 @@ without that proof, the version is not done.
 
 | Version | Focus | Scope | Proof |
 |---|---|---|---|
-| v0.19 | Window functions | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `NTILE`, sliding SUM/AVG, partition recomputation; sliding-aggregate sub-components reuse `SumCount/v1`. | Window-heavy randomized tests match batch; partition recomputation cost is measured and documented; sliding-aggregate law re-use is reported in `EXPLAIN`. |
-| v0.20 | Time windows, watermarks, and `MaxRegister/v1` | TUMBLE, HOP, SESSION, event-time TTL, late-data policies, frontier-aware retention hooks; watermarks register and emit through `MaxRegister/v1` / `MinRegister/v1` (semilattice, idempotent); event-time frontier driven by connector watermark channel from §13.3. | Late data test matrix proves `drop`, `update`, and `route_to_sink` behavior; TTL never removes visible state; a synthetic source that emits watermarks closes tumbling windows exactly once even under out-of-order input; duplicate-watermark replay test proves idempotence. |
-| v0.21 | Top-K and approximate sketches | Top-K detection, `K + epsilon` state, delete refill path, delta swaps, partitioned Top-K; `HyperLogLog/v1` registered for internal cardinality estimation in the planner cost model. | Random insert/update/delete Top-K tests match batch; delete from current top K refills correctly; sketch-union law tests prove idempotence under reorder and duplicate replay. |
-| v0.22 | Recursion with monotone partial progress | Recursive PlanNodes, nested timestamp scheduler, semi-naive and DRed strategies, convergence detection, safety caps; monotone (insert-only) recursive terms publish `complete_through` via `WeightAdd/v1`'s monotone declaration. | Transitive closure and hierarchy examples converge; cyclic graph tests produce correct deltas; a monotone reachability view emits partial progress before all shards reach the cluster frontier. |
+| v0.19 | Window functions | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `NTILE`, sliding SUM/AVG, partition recomputation; sliding-aggregate sub-components reuse `SumCount/v1`. **Escape hatch**: if sliding-aggregate incremental maintenance proves intractable, fall back to partition-scoped recomputation for all window functions (correct, slower). | Window-heavy randomized tests match batch; partition recomputation cost is measured and documented; sliding-aggregate law re-use is reported in `EXPLAIN`. |
+| v0.20 | Time windows, watermarks, and `MaxRegister/v1` | TUMBLE, HOP, SESSION, event-time TTL, late-data policies, frontier-aware retention hooks; watermarks register and emit through `MaxRegister/v1` / `MinRegister/v1` (semilattice, idempotent); event-time frontier driven by connector watermark channel from §13.3. **Escape hatch**: if event-time frontier algebra adds excessive overhead, implement TUMBLE only and defer HOP/SESSION to v0.21. | Late data test matrix proves `drop`, `update`, and `route_to_sink` behavior; TTL never removes visible state; a synthetic source that emits watermarks closes tumbling windows exactly once even under out-of-order input; duplicate-watermark replay test proves idempotence. |
+| v0.21 | Top-K and approximate sketches | Top-K detection, `K + epsilon` state, delete refill path, delta swaps, partitioned Top-K; `HyperLogLog/v1` registered for internal cardinality estimation in the planner cost model. **Escape hatch**: if HLL accuracy is insufficient for cost-model correctness, fall back to exact NDV sampling and defer sketch integration. | Random insert/update/delete Top-K tests match batch; delete from current top K refills correctly; sketch-union law tests prove idempotence under reorder and duplicate replay. |
+| v0.22 | Recursion with monotone partial progress | Recursive PlanNodes, nested timestamp scheduler, semi-naive and DRed strategies, convergence detection, safety caps; monotone (insert-only) recursive terms publish `complete_through` via `WeightAdd/v1`'s monotone declaration. **Escape hatch**: if DRed proves unsound under concurrent deletes, restrict to monotone-only recursion and reject non-monotone terms with `RS-1007`. | Transitive closure and hierarchy examples converge; cyclic graph tests produce correct deltas; a monotone reachability view emits partial progress before all shards reach the cluster frontier. |
 | v0.23 | Bootstrap and snapshot mode | Snapshot sources, streamed bootstrap epochs, bootstrap frontier, reconciliation after connector position loss. | 100M-row equivalent synthetic snapshot matches batch; restart during bootstrap does not duplicate or skip rows. |
 | v0.24 | View-on-view DAG | `ViewRef`, upstream view CDC, cadence inheritance, diamond consistency (structural via frontier meet — no explicit group API), cycle detection. | Five-level DAG and diamond topology converge under continuous input; cycles are rejected at compile time. |
 | v0.25 | Lateral, SRF, UDF, and approximate-aggregate surface | Lateral functions/subqueries, row-scoped recomputation, scalar UDF hooks, UDAF interface sketch; `APPROX_COUNT_DISTINCT(v)` exposed via `HyperLogLog/v1`, `APPROX_MEMBERSHIP(v)` via `BloomUnion/v1`. | JSON/unnest/generate_series style examples match batch; `APPROX_*` aggregates pass sketch-union law tests; UDAF requirements (including a future `MergeLaw` annotation slot) are documented before implementation. |
@@ -197,6 +200,24 @@ without that proof, the version is not done.
 | v0.53 | Cold-tier Parquet/Iceberg sink with law metadata | Iceberg v2 cold-tier sink writer (DESIGN.md §13.6): `CREATE SINK ... TO ICEBERG` with `snapshot_interval_epochs`/`snapshot_interval_ms`, Parquet data files with column stats, manifest files and manifest lists, atomic `metadata.json` commit, `should_flush`-gated buffering with pending rows staged in shard SlateDB, exactly-once via idempotent file keys; cold-tier snapshots embed `(law_id, law_version)` per CRDT column and write *finalized* values (folded counters, register winners, set memberships) so external readers never see raw operands. `ViewReader` `TwoTier` variant functional: gateway can merge cold snapshot + hot LSM tail. Cold snapshot GC (§13.6.2.1). | Cold-tier sink writes valid Iceberg v2 table readable by DuckDB `iceberg_scan`; full-scan query over a 100M-row view uses cold tier and completes 10x faster than hot-only LSM scan; snapshot GC keeps ≤ `cold_snapshot_retention_count` snapshots per view; crash mid-flush produces no orphan data files; a CRDT column read via DuckDB shows the finalized value. |
 | v0.54 | Catalog registration and Iceberg REST catalog server | Catalog registration backends (§13.6.5): `filesystem` (self-contained, already functional), `glue`, `rest`, `hive`, `ducklake`. Native Iceberg REST catalog server (§13.7) on gateway HTTP port 8181: `/iceberg/v1/` serves namespaces, tables, snapshots backed by control-plane metadata. Auth token/mTLS passed through. | Spark/Trino/DuckDB discover views by name via `catalog.uri=http://rockstream:8181/iceberg/v1`; Glue catalog shows table within 30s of snapshot commit; `CATALOG_WARN` state surfaces cleanly when external catalog is unreachable; catalog API failures never block IVM. |
 | v0.55 | Cold-tier soak, Delta Lake, law-version upgrade replay, and mixed optimistic transaction soak | Delta Lake cold-tier sink variant (`CREATE SINK ... TO DELTA`), cold-tier + hot tail merge correctness soak (randomized inserts/updates/deletes, compare cold+hot read vs. hot-only accumulated state); cold-tier law-version upgrade replay test (cold snapshot at law v1 + hot tail at law v2 must read consistently); snapshot interval tuning, cost-accounting (cold-tier storage bytes in `EXPLAIN INCREMENTAL ESTIMATE` and quota system); **mixed optimistic transaction soak**: mixed exact-key + CRDT validation under randomized concurrent writes, transaction envelope recovery from cold + hot tail, row-version metadata preserved in cold snapshots, compaction safety for pending/committed transaction operands; decision gate — if simulation finds no partial visibility and abort rates are explainable, promote optimistic subset to pre-1.0 documented behavior, otherwise keep experimental. | 7-day cold-tier soak with continuous writes shows no merge divergence; Delta `_delta_log/` is readable by DuckDB `delta_scan`; `EXPLAIN INCREMENTAL ESTIMATE` reports cold-tier storage cost within 20% of actual; cold-snapshot bytes count against pipeline `state_budget_gb`; law-version upgrade replay test passes for every registered law that declares cross-version compatibility; mixed optimistic transaction abort rate is < 5% under representative contention; no partial-visibility leaks observed over 7-day soak; `crdt_txn_pending_visible_total` stays at zero when atomic visibility is enabled. |
+
+---
+
+## Documentation Budget
+
+Phase-boundary versions (v0.27, v0.36, v0.45, v0.52) each include a mandatory
+documentation pass. The documentation deliverable for each boundary is:
+
+| Version | Documentation scope |
+|---|---|
+| v0.27 | IVM operator reference: every operator in the catalog with its arrangement layout, merge-law annotation, and `EXPLAIN` output format. |
+| v0.36 | Distributed architecture guide: frontier protocol, checkpoint protocol, recovery budgets, shuffle transport, and cluster bootstrap walkthrough. |
+| v0.45 | Connector developer guide: Tier 1 and Tier 2 contracts, SDK usage, DLQ configuration, and end-to-end example connector. |
+| v0.52 | Operator runbook: deployment playbooks, monitoring dashboards, upgrade procedures, disaster recovery drills, and troubleshooting flowcharts. |
+
+Each documentation deliverable is listed as an explicit exit criterion in the
+corresponding version's sign-off checklist. A version is not accepted until
+the documentation is reviewed and merged.
 
 ---
 
