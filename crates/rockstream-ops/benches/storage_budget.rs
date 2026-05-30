@@ -113,7 +113,30 @@ fn azure_store() -> Option<Arc<dyn ObjectStore>> {
     }
 
     match builder.build() {
-        Ok(store) => Some(Arc::new(store)),
+        Ok(store) => {
+            // Probe connectivity with a 10-second timeout.
+            // builder.build() only validates config — the first real TCP connection
+            // happens here.  If the container doesn't exist or the account is
+            // unreachable this will time out instead of hanging forever.
+            let store: Arc<dyn ObjectStore> = Arc::new(store);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let probe: Arc<dyn ObjectStore> = Arc::clone(&store);
+            let probe_result = rt.block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                probe.head(&object_store::path::Path::from("_bench_probe")),
+            ));
+            match probe_result {
+                Err(_) => {
+                    eprintln!(
+                        "[storage_budget] Azure connectivity timed out (10s) — check that \
+                         container '{container}' exists and account '{account}' is reachable. \
+                         Skipping Azure benches."
+                    );
+                    None
+                }
+                Ok(_) => Some(store), // 404 or actual object — both confirm connectivity
+            }
+        }
         Err(e) => {
             eprintln!("[storage_budget] Azure build error: {e} — check credentials and account");
             None
