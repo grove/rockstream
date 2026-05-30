@@ -19,7 +19,14 @@ tracing = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 tokio = { workspace = true }
+object_store = { workspace = true, features = ["azure"] }
+rockstream-storage = { workspace = true }
+slatedb = { workspace = true }
 
 [[bench]]
 name = "operator_throughput"
+harness = false
+
+[[bench]]
+name = "storage_budget"
 harness = false
