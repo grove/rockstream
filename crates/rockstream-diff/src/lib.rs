@@ -228,6 +228,23 @@ impl DiffCtx {
                 });
                 id
             }
+            PlanNode::ViewRef { view_name } => {
+                let id = self.alloc_id();
+                nodes.push(OpNode {
+                    id,
+                    kind: OpKind::ViewRef {
+                        view_name: view_name.clone(),
+                    },
+                    // ViewRef is structurally a source at the physical level:
+                    // it reads CDC deltas from an upstream materialized view.
+                    // No local arrangement; cadence inheritance and frontier
+                    // meet are handled by the scheduler.
+                    merge_law: None,
+                    not_merge_safe_reason: Some(NotMergeSafeReason::Stateless),
+                    inputs: vec![],
+                });
+                id
+            }
             PlanNode::Recursion {
                 base,
                 step,

@@ -19,6 +19,7 @@ pub mod recursive_oracle;
 pub mod set_op_oracle;
 pub mod top_k_oracle;
 pub mod tumble_oracle;
+pub mod view_dag_oracle;
 pub mod window_oracle;
 
 #[cfg(test)]

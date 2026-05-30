@@ -4,6 +4,7 @@
 //! physical `OpNode` graph used for execution. Each `PlanNode` carries enough
 //! metadata for the planner to attach merge-law annotations.
 
+pub mod dag;
 pub mod explain;
 
 use rockstream_types::ids::OperatorId;
@@ -139,6 +140,25 @@ pub enum PlanNode {
         source_name: String,
         /// Maximum number of rows to emit per bootstrap epoch.
         batch_size: usize,
+    },
+    /// View-reference operator (v0.24).
+    ///
+    /// Reads from an existing named materialized view, treating it as an
+    /// upstream CDC source.  The downstream view inherits the upstream view's
+    /// epoch cadence via topological scheduling (cadence inheritance):
+    /// the downstream epoch N completes only after the upstream has completed
+    /// epoch N.
+    ///
+    /// Diamond consistency is guaranteed structurally by the frontier meet:
+    /// when two paths through the view DAG both feed into a common downstream
+    /// view, that view advances only when all upstream paths have completed
+    /// the same epoch.
+    ///
+    /// Cycles in the view DAG are rejected at compile time by
+    /// [`rockstream_plan::dag::detect_cycle`], which returns `RS-1011`.
+    ViewRef {
+        /// Name of the upstream materialized view.
+        view_name: String,
     },
 }
 
@@ -322,6 +342,16 @@ pub enum OpKind {
         source_name: String,
         /// Maximum rows per bootstrap epoch.
         batch_size: usize,
+    },
+    /// View-reference operator (v0.24).
+    ///
+    /// Reads CDC output from an upstream materialized view.  This is
+    /// structurally identical to a `Source` at the physical level — the
+    /// upstream view pushes deltas to this operator each epoch.  Cadence
+    /// inheritance and frontier meet are handled by the scheduler.
+    ViewRef {
+        /// Name of the upstream materialized view.
+        view_name: String,
     },
 }
 
