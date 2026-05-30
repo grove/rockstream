@@ -225,6 +225,16 @@ fn encode_node(
                 "step": encode_node(step, law_for, &format!("{path}/recursion_step")),
             })
         }
+        PlanNode::Snapshot {
+            source_name,
+            batch_size,
+        } => {
+            serde_json::json!({
+                "type": "Snapshot",
+                "source_name": source_name,
+                "batch_size": batch_size,
+            })
+        }
     }
 }
 
@@ -531,6 +541,21 @@ fn decode_node(v: &Value, registry: &LawRegistry, path: &str) -> Result<PlanNode
                 step: Box::new(step),
                 max_iterations,
                 monotone,
+            })
+        }
+        "Snapshot" => {
+            let source_name = v["source_name"]
+                .as_str()
+                .ok_or_else(|| {
+                    CatalogError::Codec(format!("{path}: Snapshot missing 'source_name'"))
+                })?
+                .to_owned();
+            let batch_size = v["batch_size"].as_u64().ok_or_else(|| {
+                CatalogError::Codec(format!("{path}: Snapshot missing 'batch_size'"))
+            })? as usize;
+            Ok(PlanNode::Snapshot {
+                source_name,
+                batch_size,
             })
         }
         other => Err(CatalogError::Codec(format!(

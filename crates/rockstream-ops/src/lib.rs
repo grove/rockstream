@@ -18,6 +18,7 @@ pub mod recursive;
 pub mod row_codec;
 pub mod scheduler;
 pub mod set_ops;
+pub mod snapshot;
 pub mod task;
 pub mod top_k;
 pub mod tumble;

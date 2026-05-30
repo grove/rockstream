@@ -207,6 +207,27 @@ impl DiffCtx {
                 });
                 id
             }
+            PlanNode::Snapshot {
+                source_name,
+                batch_size,
+            } => {
+                let id = self.alloc_id();
+                nodes.push(OpNode {
+                    id,
+                    kind: OpKind::Snapshot {
+                        source_name: source_name.clone(),
+                        batch_size: *batch_size,
+                    },
+                    // Snapshot is a stateless insert-only source: rows are
+                    // emitted as positive-weight Z-set entries with no
+                    // arrangement.  WeightAdd/v1 governs the downstream
+                    // accumulation of snapshot rows.
+                    merge_law: None,
+                    not_merge_safe_reason: Some(NotMergeSafeReason::Stateless),
+                    inputs: vec![],
+                });
+                id
+            }
             PlanNode::Recursion {
                 base,
                 step,

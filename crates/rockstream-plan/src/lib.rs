@@ -124,6 +124,22 @@ pub enum PlanNode {
         /// Whether this recursion is restricted to monotone (insert-only) terms.
         monotone: bool,
     },
+    /// Snapshot source operator (v0.23).
+    ///
+    /// Delivers an existing relation as a sequence of insert-only bootstrap
+    /// epochs.  Each epoch emits at most `batch_size` rows as positive-weight
+    /// Z-set entries.  Once all rows have been delivered the operator reports
+    /// `is_complete()` (the bootstrap frontier is reached).
+    ///
+    /// On connector position loss the caller may invoke `resume_from(N)` to
+    /// skip the first `N` already-committed rows and re-deliver from row `N`
+    /// onwards without duplication.
+    Snapshot {
+        /// Name of the source relation being snapshotted.
+        source_name: String,
+        /// Maximum number of rows to emit per bootstrap epoch.
+        batch_size: usize,
+    },
 }
 
 /// Policy for late-arriving rows in time-window operators.
@@ -295,6 +311,17 @@ pub enum OpKind {
         max_iterations: usize,
         /// Whether this operator is restricted to monotone (insert-only) terms.
         monotone: bool,
+    },
+    /// Snapshot source operator (v0.23).
+    ///
+    /// Emits a pre-existing relation row-by-row in insert-only bootstrap
+    /// epochs.  `batch_size` controls the maximum rows per epoch.  Once all
+    /// rows have been emitted the bootstrap frontier is reached.
+    Snapshot {
+        /// Name of the source relation being snapshotted.
+        source_name: String,
+        /// Maximum rows per bootstrap epoch.
+        batch_size: usize,
     },
 }
 

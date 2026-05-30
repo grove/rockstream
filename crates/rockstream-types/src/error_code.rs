@@ -80,6 +80,8 @@ pub const RS_1007: ErrorCode = ErrorCode::new(1007);
 pub const RS_1008: ErrorCode = ErrorCode::new(1008);
 /// Non-monotone delta rejected in monotone recursion (DRed escape hatch).
 pub const RS_1009: ErrorCode = ErrorCode::new(1009);
+/// Bootstrap interrupted; connector position lost and cannot resume.
+pub const RS_1010: ErrorCode = ErrorCode::new(1010);
 
 // 2xxx: Gateway / query
 /// View not found.
@@ -134,6 +136,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         1007 => "View is already paused",
         1008 => "View is not paused",
         1009 => "Non-monotone delta rejected in monotone recursion",
+        1010 => "Bootstrap interrupted; connector position lost",
         2001 => "View not found",
         2002 => "Query timeout",
         2003 => "Unsupported isolation level",
