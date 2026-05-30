@@ -78,6 +78,22 @@ fn azure_store() -> Option<Arc<dyn ObjectStore>> {
     let container =
         std::env::var("AZURE_STORAGE_CONTAINER").unwrap_or_else(|_| "rockstream-bench".to_string());
 
+    // Pre-validate credentials to fail fast (builder.build() can hang).
+    let has_key_auth = std::env::var("AZURE_STORAGE_ACCOUNT_KEY").is_ok();
+    let has_sp_auth = std::env::var("AZURE_CLIENT_ID").is_ok()
+        && std::env::var("AZURE_CLIENT_SECRET").is_ok()
+        && std::env::var("AZURE_TENANT_ID").is_ok();
+
+    if !has_key_auth && !has_sp_auth {
+        eprintln!(
+            "[storage_budget] Azure account '{account}' configured but no credentials found. \
+             Set either:\n  \
+             - AZURE_STORAGE_ACCOUNT_KEY (Storage Account Key auth), or\n  \
+             - AZURE_CLIENT_ID + AZURE_CLIENT_SECRET + AZURE_TENANT_ID (Service Principal)"
+        );
+        return None;
+    }
+
     let mut builder = object_store::azure::MicrosoftAzureBuilder::new()
         .with_account(&account)
         .with_container_name(&container);
@@ -85,25 +101,21 @@ fn azure_store() -> Option<Arc<dyn ObjectStore>> {
     // Storage-account-key auth (takes precedence).
     if let Ok(key) = std::env::var("AZURE_STORAGE_ACCOUNT_KEY") {
         builder = builder.with_access_key(key);
-    } else if let (Ok(client_id), Ok(secret), Ok(tenant)) = (
-        std::env::var("AZURE_CLIENT_ID"),
-        std::env::var("AZURE_CLIENT_SECRET"),
-        std::env::var("AZURE_TENANT_ID"),
-    ) {
-        // Service-principal auth.
+    } else {
+        // Service-principal auth (already validated above).
+        let client_id = std::env::var("AZURE_CLIENT_ID").unwrap();
+        let secret = std::env::var("AZURE_CLIENT_SECRET").unwrap();
+        let tenant = std::env::var("AZURE_TENANT_ID").unwrap();
         builder = builder
             .with_client_id(client_id)
             .with_client_secret(secret)
             .with_tenant_id(tenant);
-    } else {
-        // Neither auth method configured.
-        return None;
     }
 
     match builder.build() {
         Ok(store) => Some(Arc::new(store)),
         Err(e) => {
-            eprintln!("[storage_budget] Azure build error: {e} — skipping Azure benches");
+            eprintln!("[storage_budget] Azure build error: {e} — check credentials and account");
             None
         }
     }
