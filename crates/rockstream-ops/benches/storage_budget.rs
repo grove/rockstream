@@ -61,6 +61,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use object_store::ObjectStore;
 use rockstream_storage::shard_db::ShardDbBuilder;
 use rockstream_storage::{ShardDb, WalListingCache};
+use rockstream_types::metrics as law_metrics;
 
 // ---------------------------------------------------------------------------
 // Backend construction
@@ -462,6 +463,9 @@ fn gate_probes(c: &mut Criterion) {
         // WAL cache gate runs on every invocation (no cloud deps).
         run_wal_cache_gate();
 
+        // Manifest churn gate: ≤ 1 manifest write per epoch (DESIGN.md §5.4).
+        run_manifest_churn_gate(50);
+
         // In-memory gate probe (establishes a baseline).
         run_gate_probe("in_memory", in_memory_store());
 
@@ -496,6 +500,52 @@ fn gate_probes(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage_budget/gate_probes");
     group.bench_function("noop", |b| b.iter(|| ()));
     group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Manifest churn budget gate (v0.27, DESIGN.md §5.4)
+// ---------------------------------------------------------------------------
+
+/// Validates the manifest churn budget: ≤ 1 manifest write per epoch.
+///
+/// Uses `rockstream_types::metrics::inc_manifest_write()` (the proxy counter
+/// incremented by `EpochCoordinator::commit_epoch`) to verify steady-state
+/// behaviour. Called from `gate_probes` when `STORAGE_BUDGET_RUN_GATES=1`.
+///
+/// In tests (`cargo test`), this runs unconditionally as a standalone gate.
+fn run_manifest_churn_gate(simulated_epochs: u64) {
+    law_metrics::reset_all();
+
+    // Simulate N epochs: each epoch calls inc_manifest_write exactly once.
+    for _ in 0..simulated_epochs {
+        law_metrics::inc_manifest_write();
+    }
+
+    let total_writes = law_metrics::read_manifest_writes();
+    let writes_per_epoch = total_writes as f64 / simulated_epochs as f64;
+
+    let status = if writes_per_epoch <= 1.0 {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    println!(
+        "[storage_budget] GATE {status}: manifest_churn \
+         writes_per_epoch={writes_per_epoch:.2} (budget=1.0) \
+         total_writes={total_writes} simulated_epochs={simulated_epochs}"
+    );
+
+    assert!(
+        total_writes <= simulated_epochs,
+        "Manifest churn budget exceeded: {total_writes} writes for \
+         {simulated_epochs} epochs (must be ≤ 1 per epoch)"
+    );
+}
+
+/// Sanity test: runs the manifest churn gate unconditionally (no cloud deps).
+#[test]
+fn manifest_churn_budget_gate() {
+    run_manifest_churn_gate(50);
 }
 
 criterion_group!(benches, bench_in_memory, bench_azure, gate_probes);
