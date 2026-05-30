@@ -12,6 +12,7 @@
 pub mod aggregate_oracle;
 pub mod batch_oracle;
 pub mod bootstrap_oracle;
+pub mod distributed_recursive_oracle;
 pub mod fuzzer_oracle;
 pub mod join_oracle;
 pub mod lateral_srf_oracle;

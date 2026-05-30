@@ -5,6 +5,7 @@
 
 pub mod aggregate;
 pub mod distinct;
+pub mod distributed_recursive;
 pub mod epoch_output;
 pub mod filter;
 pub mod join;
