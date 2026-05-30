@@ -14,6 +14,7 @@ pub mod ids;
 pub mod laws;
 pub mod merge_law;
 pub mod metrics;
+pub mod state_budget;
 pub mod view_lifecycle;
 pub mod workload;
 
