@@ -79,6 +79,7 @@ pub fn explain_op_node(node: &OpNode, depth: u32, level: ExplainLevel) -> Explai
             batch_size,
         } => format!("Snapshot[{source_name},batch={batch_size}]"),
         OpKind::ViewRef { view_name } => format!("ViewRef[{view_name}]"),
+        OpKind::Lateral { func } => format!("Lateral[{func:?}]"),
     };
 
     let shard_info = match level {

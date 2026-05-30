@@ -160,6 +160,23 @@ pub enum PlanNode {
         /// Name of the upstream materialized view.
         view_name: String,
     },
+    /// Lateral / set-returning function operator (v0.25).
+    ///
+    /// Applies a set-returning function (SRF) to each row of the input,
+    /// producing zero or more output rows per input row (row-scoped
+    /// recomputation).  This is the basis for `UNNEST`, `GENERATE_SERIES`,
+    /// and JSON array expansion.
+    ///
+    /// The operator is stateless: it produces output rows deterministically
+    /// from each input row with no arrangement.  Delta maintenance is
+    /// correct because the SRF is applied independently per input row;
+    /// a retracted input row retracts exactly the rows it produced.
+    Lateral {
+        /// The input plan whose rows are expanded by the SRF.
+        input: Box<PlanNode>,
+        /// The set-returning function to apply to each input row.
+        func: LateralFunc,
+    },
 }
 
 /// Policy for late-arriving rows in time-window operators.
@@ -191,6 +208,22 @@ pub enum Expr {
         op: BinaryOp,
         left: Box<Expr>,
         right: Box<Expr>,
+    },
+    /// A scalar user-defined function call (v0.25).
+    ///
+    /// Represents a call to a named scalar UDF with the given argument
+    /// expressions.  Scalar UDFs are stateless: they map each input row
+    /// to a single output value with no arrangement.  The `DiffCtx` treats
+    /// a `ScalarUdf` expression as stateless (same as a map/project node).
+    ///
+    /// Full UDF registration and type resolution is deferred to v0.26+.
+    /// This variant exists to sketch the UDF hook surface and allow the
+    /// UDAF annotation slot (see `UdafSpec`) to be anchored in the IR.
+    ScalarUdf {
+        /// Registered name of the scalar UDF.
+        name: String,
+        /// Argument expressions evaluated from the input row.
+        args: Vec<Expr>,
     },
 }
 
@@ -230,6 +263,115 @@ pub enum AggregateFunc {
     Avg,
     Min,
     Max,
+    /// Approximate distinct-value count using `HyperLogLog/v1` (v0.25).
+    ///
+    /// Returns a probabilistic estimate of the number of distinct values in
+    /// the input column.  Typical error rate: ±3% with 64 HLL registers.
+    /// The merge law is `HyperLogLog/v1` (semilattice, non-invertible);
+    /// retraction-aware correctness requires `ExtremumRequiresRmw`.
+    ApproxCountDistinct,
+    /// Approximate membership test using `BloomUnion/v1` (v0.25).
+    ///
+    /// Accumulates input values into a 256-bit Bloom filter sketch.
+    /// Membership queries are answered with a bounded false-positive rate.
+    /// The merge law is `BloomUnion/v1` (semilattice, non-invertible);
+    /// retraction-aware correctness requires `ExtremumRequiresRmw`.
+    ApproxMembership,
+}
+
+/// Set-returning function (SRF) for the `Lateral` plan node (v0.25).
+///
+/// Each variant describes a function that maps one input row to zero or more
+/// output rows.  The function is evaluated independently for each input row;
+/// a retracted input row retracts exactly the rows it produced.
+///
+/// These are the "JSON/unnest/generate_series style" functions from the v0.25
+/// scope.  More SRF variants will be added as the SQL surface grows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LateralFunc {
+    /// `UNNEST(col)` — expands a column containing an array-like value
+    /// (encoded as a sequence of length-prefixed entries) into one output
+    /// row per element.
+    ///
+    /// `col` is the 0-based index of the array column in the input row.
+    Unnest {
+        /// Column index of the array/list column to expand.
+        col: usize,
+    },
+    /// `GENERATE_SERIES(start, stop, step)` — emits one output row per value
+    /// in the arithmetic sequence `start, start+step, …, stop`.
+    ///
+    /// If `step` is positive and `start > stop`, or `step` is negative and
+    /// `start < stop`, the function produces no output rows.
+    GenerateSeries {
+        /// First value of the series (inclusive).
+        start: i64,
+        /// Last value of the series (inclusive).
+        stop: i64,
+        /// Step between values (must be non-zero).
+        step: i64,
+    },
+    /// `JSON_EXTRACT_ARRAY(col)` — extracts a JSON array from a column and
+    /// emits one output row per JSON element.
+    ///
+    /// Input column is expected to contain a JSON array encoded as UTF-8
+    /// bytes.  Elements are emitted as raw JSON bytes in the output column.
+    JsonExtractArray {
+        /// Column index of the JSON column to expand.
+        col: usize,
+    },
+}
+
+/// UDAF (User-Defined Aggregate Function) interface specification (v0.25).
+///
+/// Documents the requirements that any user-defined aggregate function must
+/// satisfy to be registered in the law catalog.  This sketch is the
+/// "UDAF requirements documented before implementation" deliverable from the
+/// v0.25 scope.
+///
+/// Full UDAF registration (DDL, runtime dispatch, law annotation slot) is
+/// planned for v0.51+ (`CREATE MERGE LAW`).
+///
+/// # Algebraic requirements
+///
+/// For a UDAF to be used with a `MergeLaw` annotation it must satisfy:
+/// - **Associativity**: `agg(agg(a, b), c) = agg(a, agg(b, c))`
+/// - **Commutativity**: `agg(a, b) = agg(b, a)`
+/// - **Identity element**: There exists an empty state `e` such that
+///   `agg(e, a) = a` for all `a`.
+/// - **Invertibility** (optional, for abelian-group law): There exists an
+///   inverse operation `inv(a)` such that `agg(a, inv(a)) = e`.
+///
+/// If invertibility is not provided, the UDAF must be annotated with a
+/// `NotMergeSafeReason` explaining the limitation.
+///
+/// # Wire format contract
+///
+/// The UDAF state must be serializable to a fixed-format byte buffer.
+/// The identity state must be representable as a fixed-size all-zero buffer
+/// for the storage layer to use as a compaction tombstone.
+///
+/// # Annotation slot
+///
+/// When a UDAF is registered with a `MergeLawId`, the planner attaches that
+/// law ID to every `Aggregate` node using this UDAF.  The `EXPLAIN
+/// INCREMENTAL` output will show `merge_law=<UdafName>/v<n>`.
+///
+/// If no `MergeLawId` is provided, the node is annotated with
+/// `not_merge_safe_reason=unknown_udaf_properties`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdafSpec {
+    /// Registered name of the UDAF (e.g. "my_sum").
+    pub name: String,
+    /// Whether this UDAF satisfies the associativity + commutativity +
+    /// identity requirements for a `CommutativeMonoid` merge law.
+    pub is_commutative_monoid: bool,
+    /// Whether this UDAF is idempotent: `agg(a, a) = a`.
+    pub is_idempotent: bool,
+    /// Whether this UDAF provides an inverse operation (abelian group).
+    pub has_inverse: bool,
+    /// Human-readable description of the merge semantics.
+    pub description: String,
 }
 
 /// A window function expression (v0.19).
@@ -352,6 +494,15 @@ pub enum OpKind {
     ViewRef {
         /// Name of the upstream materialized view.
         view_name: String,
+    },
+    /// Lateral / set-returning function operator (v0.25).
+    ///
+    /// Applies a `LateralFunc` to each input row, producing zero or more
+    /// output rows.  The operator is stateless: no arrangement is maintained.
+    /// A retracted input row retracts exactly the output rows it produced.
+    Lateral {
+        /// The set-returning function applied to each input row.
+        func: LateralFunc,
     },
 }
 
