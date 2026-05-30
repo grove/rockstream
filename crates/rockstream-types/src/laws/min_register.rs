@@ -94,10 +94,10 @@ impl LawBundle for MinRegisterV1 {
             .unwrap_or(false)
     }
 
-    fn not_merge_safe_reason(&self) -> Option<&'static str> {
-        // MinRegister is not invertible: you cannot derive a larger min by
-        // merging a higher value. Retractions require a prefix-scan rescan.
-        Some("MinRegister is a semilattice (non-invertible); retractions require rescan")
+    fn not_merge_safe_reason(&self) -> Option<crate::explain::NotMergeSafeReason> {
+        // MinRegister is a semilattice (non-invertible): retractions require a
+        // prefix-scan rescan to compute the new minimum.
+        Some(crate::explain::NotMergeSafeReason::ExtremumRequiresRmw)
     }
 }
 
