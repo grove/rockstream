@@ -15,7 +15,9 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
+datafusion = { workspace = true }
 rockstream-types = { workspace = true }
 rockstream-plan = { workspace = true }
 rockstream-runtime = { workspace = true }
 rockstream-control = { workspace = true }
+rockstream-sql = { workspace = true }
