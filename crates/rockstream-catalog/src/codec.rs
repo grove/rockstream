@@ -22,7 +22,7 @@
 
 use crate::error::CatalogError;
 use rockstream_plan::{
-    AggregateExpr, AggregateFunc, BinaryOp, Expr, PlanNode, WindowExpr, WindowFunc,
+    AggregateExpr, AggregateFunc, BinaryOp, Expr, LateDataPolicy, PlanNode, WindowExpr, WindowFunc,
 };
 use rockstream_types::laws::registry::LawRegistry;
 use rockstream_types::merge_law::{MergeLawId, MergeLawVersion};
@@ -183,6 +183,20 @@ fn encode_node(
                 "input": encode_node(input, law_for, &format!("{path}/window_input")),
             })
         }
+        PlanNode::TumbleWindow {
+            input,
+            time_col,
+            window_size_ms,
+            late_data_policy,
+        } => {
+            serde_json::json!({
+                "type": "TumbleWindow",
+                "time_col": time_col,
+                "window_size_ms": window_size_ms,
+                "late_data_policy": encode_late_data_policy(late_data_policy),
+                "input": encode_node(input, law_for, &format!("{path}/tumble_input")),
+            })
+        }
     }
 }
 
@@ -231,6 +245,38 @@ fn encode_agg_func(func: AggregateFunc) -> &'static str {
         AggregateFunc::Avg => "Avg",
         AggregateFunc::Min => "Min",
         AggregateFunc::Max => "Max",
+    }
+}
+
+fn encode_late_data_policy(policy: &LateDataPolicy) -> Value {
+    match policy {
+        LateDataPolicy::Drop => serde_json::json!({ "kind": "Drop" }),
+        LateDataPolicy::Update => serde_json::json!({ "kind": "Update" }),
+        LateDataPolicy::RouteToSink { sink_name } => {
+            serde_json::json!({ "kind": "RouteToSink", "sink_name": sink_name })
+        }
+    }
+}
+
+fn decode_late_data_policy(v: &Value, path: &str) -> Result<LateDataPolicy, CatalogError> {
+    let kind = v["kind"]
+        .as_str()
+        .ok_or_else(|| CatalogError::Codec(format!("{path}: LateDataPolicy missing 'kind'")))?;
+    match kind {
+        "Drop" => Ok(LateDataPolicy::Drop),
+        "Update" => Ok(LateDataPolicy::Update),
+        "RouteToSink" => {
+            let sink_name = v["sink_name"]
+                .as_str()
+                .ok_or_else(|| {
+                    CatalogError::Codec(format!("{path}: RouteToSink missing 'sink_name'"))
+                })?
+                .to_owned();
+            Ok(LateDataPolicy::RouteToSink { sink_name })
+        }
+        other => Err(CatalogError::Codec(format!(
+            "{path}: unknown LateDataPolicy kind '{other}'"
+        ))),
     }
 }
 
@@ -394,6 +440,22 @@ fn decode_node(v: &Value, registry: &LawRegistry, path: &str) -> Result<PlanNode
             Ok(PlanNode::Window {
                 input: Box::new(input),
                 window_exprs,
+            })
+        }
+        "TumbleWindow" => {
+            let time_col = v["time_col"].as_u64().ok_or_else(|| {
+                CatalogError::Codec(format!("{path}: TumbleWindow missing 'time_col'"))
+            })? as usize;
+            let window_size_ms = v["window_size_ms"].as_i64().ok_or_else(|| {
+                CatalogError::Codec(format!("{path}: TumbleWindow missing 'window_size_ms'"))
+            })?;
+            let late_data_policy = decode_late_data_policy(&v["late_data_policy"], path)?;
+            let input = decode_node(&v["input"], registry, &format!("{path}/tumble_input"))?;
+            Ok(PlanNode::TumbleWindow {
+                input: Box::new(input),
+                time_col,
+                window_size_ms,
+                late_data_policy,
             })
         }
         other => Err(CatalogError::Codec(format!(

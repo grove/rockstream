@@ -163,6 +163,28 @@ impl DiffCtx {
                 });
                 id
             }
+            PlanNode::TumbleWindow {
+                input,
+                time_col: _,
+                window_size_ms,
+                late_data_policy,
+            } => {
+                let input_id = self.diff_node(input, nodes);
+                let id = self.alloc_id();
+                nodes.push(OpNode {
+                    id,
+                    kind: OpKind::TumbleWindow {
+                        window_size_ms: *window_size_ms,
+                        late_data_policy: late_data_policy.clone(),
+                    },
+                    // Watermark state uses MaxRegister/v1 (semilattice,
+                    // idempotent).
+                    merge_law: Some(MAX_REGISTER_ID),
+                    not_merge_safe_reason: None,
+                    inputs: vec![input_id],
+                });
+                id
+            }
         }
     }
 

@@ -441,6 +441,7 @@ mod lowering_tests {
                 OpKind::Union => "Union",
                 OpKind::Sink { .. } => "Sink",
                 OpKind::Window { .. } => "Window",
+                OpKind::TumbleWindow { .. } => "TumbleWindow",
             })
             .collect()
     }
@@ -942,6 +943,7 @@ mod soak_tests {
                 OpKind::Union => "Union",
                 OpKind::Sink { .. } => "Sink",
                 OpKind::Window { .. } => "Window",
+                OpKind::TumbleWindow { .. } => "TumbleWindow",
             })
             .collect();
         assert_eq!(got, expected, "operator kind sequence mismatch");
