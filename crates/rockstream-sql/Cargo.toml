@@ -16,3 +16,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 rockstream-diff = { workspace = true }
 rockstream-runtime = { workspace = true }
+rand = { workspace = true }

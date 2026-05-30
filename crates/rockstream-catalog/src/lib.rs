@@ -787,3 +787,271 @@ mod tests {
         assert!(seen.contains("stateless"), "proof: Stateless is registered");
     }
 }
+
+// ---------------------------------------------------------------------------
+// v0.18 Proof: SQL Alpha soak — join round-trip and all Phase 1 operators
+// ---------------------------------------------------------------------------
+
+/// v0.18 proof tests: SQL Alpha soak.
+///
+/// Proof criteria from ROADMAP.md v0.18:
+/// 1. Join plans round-trip through the catalog codec (encode → decode).
+/// 2. All Phase 1 plan node types (Source, Filter, Project, Map, Aggregate,
+///    Join, Union) are preserved after catalog round-trip.
+/// 3. DiffCtx consistently annotates all operator types across repeated runs
+///    (no divergence between catalog-loaded and in-memory plans).
+#[cfg(test)]
+mod v0_18_proof_tests {
+    use crate::codec;
+    use crate::schema::{ColumnDef, DataType, SchemaVersion};
+    use crate::store::CatalogStore;
+    use rockstream_diff::DiffCtx;
+    use rockstream_plan::{AggregateExpr, AggregateFunc, BinaryOp, Expr, OpKind, PlanNode};
+    use rockstream_types::ids::NamespaceId;
+    use rockstream_types::laws::registry::LawRegistry;
+    use rockstream_types::laws::weight_add::{WEIGHT_ADD_ID, WEIGHT_ADD_VERSION};
+    use rockstream_types::merge_law::{MergeLawId, MergeLawVersion};
+
+    fn ns() -> NamespaceId {
+        NamespaceId(18)
+    }
+
+    fn no_law(_: &PlanNode) -> Option<(MergeLawId, MergeLawVersion)> {
+        None
+    }
+
+    fn weight_add_for_agg(plan: &PlanNode) -> Option<(MergeLawId, MergeLawVersion)> {
+        match plan {
+            PlanNode::Aggregate { .. } => Some((WEIGHT_ADD_ID, WEIGHT_ADD_VERSION)),
+            _ => None,
+        }
+    }
+
+    /// Build a join plan: orders ⋈ products on product_id = id.
+    fn join_plan() -> PlanNode {
+        PlanNode::Join {
+            left: Box::new(PlanNode::Source {
+                name: "orders".into(),
+            }),
+            right: Box::new(PlanNode::Source {
+                name: "products".into(),
+            }),
+            condition: Expr::BinaryOp {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::Column(2)),  // product_id
+                right: Box::new(Expr::Column(0)), // id
+            },
+        }
+    }
+
+    /// Build: Filter → Join → Aggregate (the full SQL Alpha demo path).
+    fn filter_join_agg_plan() -> PlanNode {
+        PlanNode::Aggregate {
+            input: Box::new(PlanNode::Filter {
+                input: Box::new(join_plan()),
+                predicate: Expr::BinaryOp {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expr::Column(1)), // amount
+                    right: Box::new(Expr::Literal(vec![0])),
+                },
+            }),
+            group_by: vec![Expr::Column(0)],
+            aggregates: vec![AggregateExpr {
+                func: AggregateFunc::Sum,
+                input: Expr::Column(1),
+                distinct: false,
+            }],
+        }
+    }
+
+    // ── Proof 1: Join plan round-trips through codec ──────────────────────────
+
+    /// Proof: a `PlanNode::Join` encodes and decodes without data loss.
+    #[test]
+    fn proof_v018_join_plan_round_trips_through_codec() {
+        let plan = join_plan();
+        let registry = LawRegistry::with_builtins();
+        let bytes = codec::encode(&plan, &no_law).unwrap();
+        let decoded = codec::decode(&bytes, &registry).unwrap();
+        assert_eq!(
+            plan, decoded,
+            "proof: PlanNode::Join round-trips through catalog codec"
+        );
+    }
+
+    /// Proof: Filter → Join → Aggregate round-trips through the catalog store
+    /// with correct law annotation.
+    #[test]
+    fn proof_v018_filter_join_aggregate_round_trips_through_store() {
+        let plan = filter_join_agg_plan();
+        let registry = LawRegistry::with_builtins();
+
+        let bytes = codec::encode(&plan, &weight_add_for_agg).unwrap();
+
+        let mut store = CatalogStore::new();
+        let schema = SchemaVersion::new(vec![
+            ColumnDef::required("region", DataType::Utf8),
+            ColumnDef::required("total", DataType::Int64),
+        ]);
+        store
+            .register_view(ns(), "revenue_by_region", schema, None)
+            .unwrap();
+        store.store_plan(ns(), "revenue_by_region", bytes).unwrap();
+
+        let loaded = store
+            .load_plan(ns(), "revenue_by_region", &registry)
+            .unwrap();
+        assert_eq!(
+            plan, loaded,
+            "proof: Filter→Join→Aggregate round-trips through catalog store"
+        );
+    }
+
+    // ── Proof 2: DiffCtx consistency across load/in-memory ───────────────────
+
+    /// Proof: DiffCtx produces identical law annotations for a plan loaded
+    /// from the catalog and the same plan held in memory (no divergence).
+    #[test]
+    fn proof_v018_difctx_no_divergence_across_catalog_load() {
+        let plan = filter_join_agg_plan();
+        let registry = LawRegistry::with_builtins();
+
+        // Encode → decode to simulate catalog round-trip.
+        let bytes = codec::encode(&plan, &weight_add_for_agg).unwrap();
+        let loaded = codec::decode(&bytes, &registry).unwrap();
+
+        // DiffCtx on original plan.
+        let mut ctx1 = DiffCtx::new();
+        let ops1 = ctx1.differentiate(&plan);
+
+        // DiffCtx on catalog-loaded plan.
+        let mut ctx2 = DiffCtx::new();
+        let ops2 = ctx2.differentiate(&loaded);
+
+        assert_eq!(
+            ops1.len(),
+            ops2.len(),
+            "proof: in-memory and catalog-loaded plans produce same operator count"
+        );
+        for (i, (o1, o2)) in ops1.iter().zip(ops2.iter()).enumerate() {
+            assert_eq!(
+                o1.kind, o2.kind,
+                "proof: op {i} kind is identical across catalog load"
+            );
+            assert_eq!(
+                o1.merge_law, o2.merge_law,
+                "proof: op {i} merge_law is identical across catalog load (no divergence)"
+            );
+            assert_eq!(
+                o1.not_merge_safe_reason, o2.not_merge_safe_reason,
+                "proof: op {i} not_merge_safe_reason is identical across catalog load"
+            );
+        }
+    }
+
+    // ── Proof 3: All Phase 1 operators produce consistent DiffCtx output ─────
+
+    /// Proof: running DiffCtx on every Phase 1 operator type twice produces
+    /// identical output (idempotent law annotation).
+    #[test]
+    fn proof_v018_all_phase1_operators_annotated_consistently() {
+        let plans: Vec<(&str, PlanNode)> = vec![
+            ("Source", PlanNode::Source { name: "t".into() }),
+            (
+                "Filter",
+                PlanNode::Filter {
+                    input: Box::new(PlanNode::Source { name: "t".into() }),
+                    predicate: Expr::Column(0),
+                },
+            ),
+            (
+                "Project",
+                PlanNode::Project {
+                    input: Box::new(PlanNode::Source { name: "t".into() }),
+                    columns: vec![Expr::Column(0)],
+                },
+            ),
+            (
+                "Map",
+                PlanNode::Map {
+                    input: Box::new(PlanNode::Source { name: "t".into() }),
+                    func: Expr::Column(0),
+                },
+            ),
+            (
+                "Aggregate(Sum)",
+                PlanNode::Aggregate {
+                    input: Box::new(PlanNode::Source { name: "t".into() }),
+                    group_by: vec![Expr::Column(0)],
+                    aggregates: vec![AggregateExpr {
+                        func: AggregateFunc::Sum,
+                        input: Expr::Column(0),
+                        distinct: false,
+                    }],
+                },
+            ),
+            (
+                "Aggregate(Max)",
+                PlanNode::Aggregate {
+                    input: Box::new(PlanNode::Source { name: "t".into() }),
+                    group_by: vec![Expr::Column(0)],
+                    aggregates: vec![AggregateExpr {
+                        func: AggregateFunc::Max,
+                        input: Expr::Column(0),
+                        distinct: false,
+                    }],
+                },
+            ),
+            (
+                "Join",
+                PlanNode::Join {
+                    left: Box::new(PlanNode::Source { name: "a".into() }),
+                    right: Box::new(PlanNode::Source { name: "b".into() }),
+                    condition: Expr::BinaryOp {
+                        op: BinaryOp::Eq,
+                        left: Box::new(Expr::Column(0)),
+                        right: Box::new(Expr::Column(0)),
+                    },
+                },
+            ),
+            (
+                "Union",
+                PlanNode::Union {
+                    left: Box::new(PlanNode::Source { name: "a".into() }),
+                    right: Box::new(PlanNode::Source { name: "b".into() }),
+                },
+            ),
+        ];
+
+        for (label, plan) in &plans {
+            let mut ctx1 = DiffCtx::new();
+            let ops1 = ctx1.differentiate(plan);
+
+            let mut ctx2 = DiffCtx::new();
+            let ops2 = ctx2.differentiate(plan);
+
+            assert_eq!(
+                ops1.len(),
+                ops2.len(),
+                "{label}: op count must be stable across DiffCtx runs"
+            );
+            for (i, (o1, o2)) in ops1.iter().zip(ops2.iter()).enumerate() {
+                assert_eq!(o1.kind, o2.kind, "{label} op {i}: kind must be stable");
+                assert_eq!(
+                    o1.merge_law, o2.merge_law,
+                    "{label} op {i}: merge_law must be stable (no divergence)"
+                );
+            }
+
+            // Every aggregate must have law or reason.
+            for op in &ops1 {
+                if matches!(op.kind, OpKind::Aggregate) {
+                    assert!(
+                        op.merge_law.is_some() || op.not_merge_safe_reason.is_some(),
+                        "{label}: aggregate must have law or reason"
+                    );
+                }
+            }
+        }
+    }
+}

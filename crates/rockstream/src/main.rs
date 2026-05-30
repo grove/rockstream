@@ -50,6 +50,19 @@ enum Command {
         /// View name to explain (e.g. `sales_by_product`).
         view: String,
     },
+    /// Run a SQL statement and print the IVM plan explain output.
+    ///
+    /// Parses the SQL, lowers it to the RockStream PlanNode IR, and prints
+    /// `EXPLAIN INCREMENTAL` output for the resulting plan.
+    ///
+    /// A built-in demo schema is pre-registered so that queries against
+    /// `orders`, `products`, and `events` tables work out of the box.
+    Sql {
+        /// SQL statement to plan and explain.
+        ///
+        /// Example: `rockstream sql "SELECT region, SUM(amount) FROM orders GROUP BY region"`
+        query: String,
+    },
     /// Print version information.
     Version,
 }
@@ -133,6 +146,9 @@ async fn main() {
             let output = render_explain(&view, &plan);
             print!("{output}");
         }
+        Some(Command::Sql { query }) => {
+            run_sql(&query).await;
+        }
         Some(Command::Version) => {
             println!("rockstream {}", env!("CARGO_PKG_VERSION"));
         }
@@ -141,6 +157,72 @@ async fn main() {
                 "RockStream v{}. Use --help for usage.",
                 env!("CARGO_PKG_VERSION")
             );
+        }
+    }
+}
+
+/// Parse `query` with DataFusion, lower to a RockStream `PlanNode`, and print
+/// `EXPLAIN INCREMENTAL` output.
+///
+/// Pre-registers a built-in demo schema with `orders`, `products`, and
+/// `events` tables so that standard SQL Alpha demo queries work without any
+/// external catalog.
+async fn run_sql(query: &str) {
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use rockstream_sql::SqlFrontend;
+    use std::sync::Arc;
+
+    let ctx = SessionContext::new();
+
+    // Register demo tables for the SQL Alpha demo.
+    let orders_schema = Arc::new(Schema::new(vec![
+        Field::new("region", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+        Field::new("product_id", DataType::Int64, false),
+    ]));
+    let products_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("price", DataType::Int64, false),
+    ]));
+    let events_schema = Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Int64, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    for (name, schema) in [
+        ("orders", orders_schema),
+        ("products", products_schema),
+        ("events", events_schema),
+    ] {
+        let table = MemTable::try_new(schema, vec![vec![]])
+            .unwrap_or_else(|e| panic!("failed to create demo table '{name}': {e}"));
+        ctx.register_table(name, Arc::new(table))
+            .unwrap_or_else(|e| panic!("failed to register demo table '{name}': {e}"));
+    }
+
+    // Plan the query.
+    let df = match ctx.sql(query).await {
+        Ok(df) => df,
+        Err(e) => {
+            eprintln!("SQL planning error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let lp = df.into_unoptimized_plan();
+    let frontend = SqlFrontend::new();
+    match frontend.lower(&lp) {
+        Ok(plan) => {
+            let output = render_explain("query", &plan);
+            print!("{output}");
+        }
+        Err(e) => {
+            eprintln!("IVM lowering error: {e}");
+            std::process::exit(1);
         }
     }
 }
@@ -183,6 +265,16 @@ mod tests {
         match cli.command {
             Some(Command::Explain { view }) => assert_eq!(view, "sales_by_product"),
             _ => panic!("expected Explain command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_sql_subcommand() {
+        let sql = "SELECT region, SUM(amount) FROM orders GROUP BY region";
+        let cli = Cli::try_parse_from(["rockstream", "sql", sql]).unwrap();
+        match cli.command {
+            Some(Command::Sql { query }) => assert_eq!(query, sql),
+            _ => panic!("expected Sql command"),
         }
     }
 }
