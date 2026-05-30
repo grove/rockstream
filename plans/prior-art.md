@@ -34,9 +34,8 @@
 10. [CRDTs and Commutative-Replicated State](#10-crdts-and-commutative-replicated-state)
 11. [Deterministic Simulation Testing](#11-deterministic-simulation-testing)
 12. [Exactly-Once Streaming, Watermarks, and Late Data](#12-exactly-once-streaming-watermarks-and-late-data)
-13. [Coordinator Groups / Lease-Quorum Serializable Transactions](#13-coordinator-groups--lease-quorum-serializable-transactions)
-14. [Self-Adjusting Computation and Reactive Programming](#14-self-adjusting-computation-and-reactive-programming)
-15. [Summary: Defensive Posture by Subsystem](#15-summary-defensive-posture-by-subsystem)
+13. [Self-Adjusting Computation and Reactive Programming](#13-self-adjusting-computation-and-reactive-programming)
+14. [Summary: Defensive Posture by Subsystem](#14-summary-defensive-posture-by-subsystem)
 
 ---
 
@@ -283,28 +282,7 @@ contributors cover the practical implementations.
 
 ---
 
-## 13. Coordinator Groups / Lease-Quorum Serializable Transactions
-
-DESIGN.md §13.10 describes a small Raft-style cohort holding
-lease-quorum for serializable cross-shard transactions on a designated
-subset of base-table shards.
-
-| # | Disclosure | Date | Relevance |
-|---|---|---|---|
-| 13.1 | Lamport, *"The Part-Time Parliament"*, ACM TOCS 1998 (and earlier 1989 tech report). | 1989, 1998 | Foundational Paxos paper. |
-| 13.2 | Ongaro, Ousterhout, *"In Search of an Understandable Consensus Algorithm (Extended Version)"* (Raft), USENIX ATC 2014. | 2014-06 | Public Raft paper. |
-| 13.3 | Corbett et al., *"Spanner: Google's Globally-Distributed Database"*, OSDI 2012. | 2012-10 | Public publication of TrueTime + Paxos for cross-shard serializable transactions. |
-| 13.4 | CockroachDB documentation on range leases and lease holders. | 2015-onwards | Openly described. |
-| 13.5 | TiDB / TiKV percolator-style transactions. | 2016-onwards | Apache 2.0. |
-| 13.6 | etcd, [etcd-io/etcd](https://github.com/etcd-io/etcd). | 2013-onwards | **Apache 2.0** | Production Raft implementation with patent grant. |
-
-**Disposition**: Raft, Paxos, and lease-quorum coordination are 25-year-old
-public-domain consensus techniques. There is no enforceable patent on
-any of them in the form RockStream uses.
-
----
-
-## 14. Self-Adjusting Computation and Reactive Programming
+## 13. Self-Adjusting Computation and Reactive Programming
 
 | # | Disclosure | Date | Relevance |
 |---|---|---|---|
@@ -313,7 +291,7 @@ any of them in the form RockStream uses.
 
 ---
 
-## 15. Summary: Defensive Posture by Subsystem
+## 14. Summary: Defensive Posture by Subsystem
 
 | RockStream Subsystem | Primary Prior Art | Primary Open Reference Implementation | Patent Risk Class (see patents-report.md) |
 |---|---|---|---|
@@ -329,7 +307,6 @@ any of them in the form RockStream uses.
 | CRDT column types | §10 (INRIA 2011) | Riak, Yjs, Automerge | **None** |
 | Deterministic simulation | §11 (FoundationDB, TigerBeetle) | foundationdb (Apache 2.0) | **None** |
 | Watermarks / exactly-once | §12 (Dataflow Model 2015) | Apache Beam (Apache 2.0) | **None** |
-| Coordinator groups (Raft) | §13 (Paxos 1989, Raft 2014) | etcd (Apache 2.0) | **None** |
 
 The single area of meaningful patent risk is the frontier-coordination
 machinery, which is addressed in detail in

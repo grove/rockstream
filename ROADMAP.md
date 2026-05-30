@@ -160,7 +160,7 @@ without that proof, the version is not done.
 | v0.28 | ✅ Done | Control plane and worker discovery | Control service, worker registration (with `capacity_headroom` reporting), topology catalog, bootstrap command, mTLS scaffolding, role flags. | Tier 1 and Tier 2 start flows work; workers join through `--control=<url>`; topology changes are audited; placement algorithm respects reported capacity. |
 | v0.29 | ✅ Done | Shard leasing and scheduling | Shard manager, per-shard SlateDB handles, lease acquisition, writer fencing, distributed operator placement. | Two-writer fence test proves only one writer can commit; killing a worker causes clean lease release/reassignment. |
 | v0.30 | ✅ Done | Direct exchange with planner-driven combiners | gRPC shuffle service, exchange path classifier (`elided` / `loopback` / `direct` / `durable`), worker-level multiplexing, same-worker loopback, pre-shuffle combiners driven **entirely** by planner-attached `MergeLawId` (the v0.4-style hand-coded SUM/COUNT/AVG allowlist is deleted), Arrow serialization, credit backpressure. | 16-shard single-host cluster runs partitioned TPC-H subset with bounded connection count; loopback avoids network calls for co-located exchanges; combiner benchmark documents bytes avoided per registered law and proves uncombined equivalence (CI property test, one entry per law). |
-| v0.31 | | Durable shuffle fallback with law-aware re-merge | Object-store fallback path, coalesced shuffle objects, outbox/inbox metadata, receiver notifications, no LIST hot path; durable receiver re-merges per-target operands via the same `LawBundle`. | Inject receiver failure and large batch; sender falls back durably and receiver catches up without duplicates; durable + direct paths produce bit-identical state across every registered law. |
+| v0.31 | ✅ Done | Durable shuffle fallback with law-aware re-merge | Object-store fallback path, coalesced shuffle objects, outbox/inbox metadata, receiver notifications, no LIST hot path; durable receiver re-merges per-target operands via the same `LawBundle`. | Inject receiver failure and large batch; sender falls back durably and receiver catches up without duplicates; durable + direct paths produce bit-identical state across every registered law. |
 | v0.32 | | Frontier protocol with law-aware partial progress | Antichain type, per-shard frontier reporter, worker-level frontier summaries, separable `--role=frontier`, cluster frontier publication, shuffle GC; monotone laws may publish `complete_through` ahead of cluster frontier. | Multi-input join with uneven sources produces no premature output; aggregator stress test covers thousands of shards × hundreds of operators without direct per-shard subscriptions; a monotone-recursion view emits partial progress with a frontier-tagged completeness token. |
 | v0.33 | | Distributed recursion and skew stress | Exchange inside recursive scopes, inner frontier convergence, skewed inputs, per-shard recompute fallback. | Sharded 10M-edge reachability benchmark converges; stalled inner frontier surfaces a named error. |
 | v0.34 | | Cluster checkpoints | Barrier injection, bounded alignment buffers, per-shard checkpoint creation, atomic cluster checkpoint commit, old checkpoint GC. | Checkpoint under slow input and credit exhaustion never grows unbounded and either succeeds or reports `RECOVERING`. |
@@ -238,8 +238,7 @@ evidence-based:
 - The upgrade path from the previous beta is tested and documented.
 - The public docs state what RockStream is not: not an OLTP Postgres clone, not
   a global cross-shard `SERIALIZABLE` system, not active-active multi-region
-  writes. (Coordinator Group §13.10 provides scoped multi-table SERIALIZABLE
-  for designated base-table shards, which is explicitly in scope for 1.0.)
+  writes.
 - A new operator can debug the system using the docs, dashboard, CLI, audit log,
   and support bundle without reading source code first.
 
@@ -266,7 +265,6 @@ These are explicit places to pause, learn, and possibly reshape the roadmap.
 | Production readiness | v0.52 | Is the system operable by someone who did not build it? | |
 | Data lake integration | v0.55 | Does the cold-tier + catalog story deliver real value, or is feeding external tools sufficient without the cold tier? | |
 | Optimistic transactions | v0.55 | Does the mixed optimistic + CRDT transaction subset work reliably under simulation and soak (no partial visibility, explainable abort rates), or should it stay experimental past 1.0? | |
-| Coordinator Group | v0.55 | Given the optimistic-transaction soak result: is write-skew prevention across 2+ base-table shards a real pilot-customer need? If yes, proceed with Phase 13 (§13.10). If the exact-key subset covers all known cases, defer coordinator group past 1.0. | |
 
 At each gate, the default action is not to accelerate. The default action is to
 remove uncertainty.
@@ -320,10 +318,7 @@ These may be good ideas later, but they dilute the first implementation:
   later, but no version through 1.0 promises that path.
 - Cross-shard `SERIALIZABLE` isolation. Optimistic exact-key guards and CRDT
   blind writes are pre-1.0 (§13.5.1), but a *global* cross-shard coordinator
-  covering every shard remains post-1.0. The **Coordinator Group** (§13.10)
-  — an opt-in, small cohort that holds quorum over a designated base-table
-  shard subset — is the planned 1.0-track path; it requires the v0.55
-  optimistic-transaction soak as a prerequisite gate.
+  covering every shard is an explicit non-goal.
 - Full OLTP compatibility with Postgres.
 - Arbitrary user-defined CRDT merge functions before v0.51. `CREATE MERGE LAW`
   is gated on the built-in catalog (v0.43–v0.45) and the shared property-test

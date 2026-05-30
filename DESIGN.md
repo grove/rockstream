@@ -206,20 +206,6 @@ object storage.
 > observer with object-store read access, with no gateway or coordinator
 > required, and exposing this guarantee to the Iceberg REST catalog (§13.7).
 >
-> **v3.23 adds the Coordinator Group model** (§13.10): a scoped middle ground
-> between `SERIALIZABLE LOCAL` (single shard) and an unimplementable global
-> serializable coordinator. A small opt-in cohort of 3–5 coordinator-group
-> processes holds a lease-quorum over a designated subset of base-table shards,
-> enforcing full cross-shard `SERIALIZABLE` for transactions touching only those
-> shards. Arrangement and view shards remain entirely uncoordinated; the
-> analytical and streaming write path is unaffected. This closes the gap in
-> §13.5.1's "What this is NOT" caveat for applications that need true
-> multi-table serializable isolation on their write-heavy base tables while
-> retaining RockStream's streaming throughput on views. New error codes
-> `RS-2012`–`RS-2013`, `RS-2017`–`RS-2018` added. Version schedule: coordinator
-> group is a post-v0.55 / 1.0-track feature gated on the v0.55 optimistic-
-> transaction soak.
->
 > **v3.24 adds inline views** (§4.3): `CREATE VIEW` (without `MATERIALIZED`)
 > stores a query definition in the catalog and expands it as a macro at query
 > or materialized-view compilation time. No operator state, no arrangement
@@ -357,7 +343,6 @@ object storage.
     - [13.7 Native Iceberg REST Catalog](#137-native-iceberg-rest-catalog)
     - [13.8 Native DuckLake Catalog Server (deferred)](#138-native-ducklake-catalog-server-deferred)
     - [13.9 Secondary Indexes](#139-secondary-indexes)
-    - [13.10 Coordinator Group](#1310-coordinator-group-scoped-multi-shard-serializable-transactions)
 14. [Operations: Deploy, Monitor, Diagnose](#14-operations-deploy-monitor-diagnose)
 15. [Comparison to Prior Art](#15-comparison-to-prior-art)
 16. [Optimality Assessment (v3.7)](#16-optimality-assessment-v37)
@@ -419,10 +404,7 @@ attempting them would compromise the rest of the design:
   extension (v0.51). Optimistic exact-key guarded writes for non-CRDT columns
   and blind commutative writes for CRDT columns are planned pre-1.0 (§13.5.1).
   A *global* cross-shard `SERIALIZABLE` coordinator (one covering every shard)
-  is an explicit non-goal. The targeted alternative is the **Coordinator Group**
-  (§13.10): an opt-in, small cohort of 3–5 processes that holds a lease-quorum
-  over a designated base-table shard subset, leaving arrangement and view shards
-  entirely uncoordinated. See
+  is an explicit non-goal. See
   [ideas/optimistic-locking-crdts.md](ideas/optimistic-locking-crdts.md).
 - **A global write sequence number.** SlateDB's per-DB sequence is local. We
   do not synthesize a cluster-wide sequence on top of it.
@@ -2678,7 +2660,6 @@ streaming workloads.
 | `REPEATABLE READ` | `BEGIN` pins the session to a specific vector frontier; all statements in the transaction see that snapshot. |
 | `SERIALIZABLE` | **Not supported** for cross-shard transactions (requires cross-shard conflict detection; see §1.1). Returns `RS-2003 isolation.serializable_not_supported`. |
 | `SERIALIZABLE LOCAL` | Candidate v0.51: when the planner proves all reads/writes touch one shard, delegates to per-shard SlateDB transaction semantics. |
-| `SERIALIZABLE GROUP` | Post-v0.55: when a `CREATE COORDINATOR GROUP` covers all shards touched by the transaction, the coordinator-group leader enforces full serializable isolation across those shards (§13.10). |
 
 **Optimistic write semantics** (§13.5.1): direct-write transactions may use
 optimistic exact-key guards (`RS-2008` on conflict) and blind CRDT writes
@@ -3429,7 +3410,6 @@ transaction into one of five shapes:
 | `ShardLocalSerializable` | Planner proves all reads/writes touch one shard; delegates to SlateDB transaction. | v0.51 |
 | `BlindCommutative` | All writes are registered CRDT operands with `read_dependent = false`. | v0.43+ |
 | `OptimisticExactKey` | Non-CRDT exact-key writes validated against per-row versions. | v0.51 |
-| `CoordinatorGroupSerializable` | Touches 2+ shards all covered by a declared `COORDINATOR GROUP`; coordinator-group leader enforces full serializable isolation (§13.10). | Post-v0.55 |
 | `MixedCrdtAndOptimisticExactKey` | CRDT writes skip validation; non-CRDT exact-key writes validate. | v0.55 experimental |
 | `Unsupported` | Predicate reads, range reads, cross-shard uniqueness, foreign keys, or any shape requiring general serializability. Returns `RS-2009`. | No |
 
@@ -3475,8 +3455,7 @@ convergence, not as atomic SQL transactions.
 `SERIALIZABLE`. It prevents stale overwrites on tracked exact keys and makes
 CRDT writes coordination-light. Write-skew cycles across shards are not
 detected. Users requiring true cross-shard serializability must use
-`SERIALIZABLE LOCAL` (single-shard), declare a coordinator group for a
-designated base-table shard subset (§13.10), or accept `RS-2009` for shapes
+`SERIALIZABLE LOCAL` (single-shard) or accept `RS-2009` for shapes
 that require a general coordinator.
 
 ---
@@ -4016,130 +3995,6 @@ frontier lag per index.
 
 ---
 
-### 13.10 Coordinator Group (Scoped Multi-Shard Serializable Transactions)
-
-A *global* serializable coordinator — one that sits on every shard's write
-path — is an explicit non-goal (§1.1). The **Coordinator Group** is the targeted
-middle ground: a small, opt-in cohort of 3–5 processes that holds a lease-based
-quorum over a *designated subset* of shards, typically the few base-table shards
-that hold user-mutable data (`accounts`, `users`, `orders`, …). Arrangement
-shards, view shards, and any base-table shards outside the group proceed without
-coordination and are unaffected in throughput or freshness.
-
-```
-┌─────────────────────────────────────────────────┐
-│  Coordinator Group (3–5 processes)              │
-│  lease-quorum over shards 0–2                   │
-│  (base tables: accounts, users, orders, …)      │
-│  enforces SERIALIZABLE for transactions         │
-│  touching only these shards                     │
-└───────────────────┬─────────────────────────────┘
-                    │ coordinates writes
-                    ▼
-        Shards 0–2 (base tables)   ◄─── full SERIALIZABLE here
-                    │
-   ┌────────────────┼──────────────┬──────────────┐
-   │                │              │              │
-Shard 3–100    Shard 101      Shard 102      Shard 103+
-(arrangement / view shards — no coordinator, unaffected throughput)
-```
-
-**Why this works.**
-
-- The coordinator is **not on the path** for the large fan-out of arrangement
-  and view shards. Analytical throughput and view freshness are unaffected.
-- Base tables are naturally few. Keeping them on 2–5 shards is sound schema
-  discipline (§13.5): each `CREATE TABLE` direct-write source gets its own
-  dedicated base-table shard by default.
-- The coordinator group reuses lease-based leader election already present in
-  the frontier aggregator (§3.2), with a dedicated lease key per group.
-
-**Transaction shape.** When the gateway classifies a direct-write transaction
-(§13.5.1) and all touched shards are within a declared coordinator group, the
-shape is `CoordinatorGroupSerializable`. Transactions that mix coordinated and
-non-coordinated shards remain `Unsupported` and return `RS-2009`.
-
-**`CoordinatorGroupSerializable` protocol.**
-
-1. Gateway inspects the write-set. If all touched shards belong to a single
-   declared coordinator group, shape is set to `CoordinatorGroupSerializable`.
-2. Gateway forwards the transaction to the coordinator-group leader via its
-   gRPC endpoint (separate from the control-plane Raft group).
-3. The coordinator leader runs a two-phase-commit round over the group's 3–5
-   members. Each member holds a per-shard conflict table (read/write sets keyed
-   by primary key).
-4. On prepare success, the coordinator injects the validated write batch to each
-   participant shard via the existing direct-write path, stamped with the
-   coordinator epoch.
-5. On conflict, the gateway returns `RS-2008 transaction.optimistic_conflict`
-   with the conflicting shard and key in the error payload.
-
-**Isolation guarantee.** Transactions committed by the coordinator group are
-fully serializable — no write skew, no phantom reads — within the coordinated
-shard set. This is stronger than `OptimisticExactKey` (no write-skew detection
-there) and equivalent to single-shard `SERIALIZABLE LOCAL` but across multiple
-shards.
-
-**Configuration.**
-
-```sql
--- Declare a coordinator group for a named set of base tables
-CREATE COORDINATOR GROUP oltp_core
-  FOR TABLES (accounts, users, orders)
-  WITH (quorum_size = 3, lease_ttl_ms = 5000);
-```
-
-The control plane assigns the smallest valid shard count for the listed tables,
-registers the group in the shard map, and provisions coordinator-group processes
-at deploy time. In `embedded` and `single_worker` deployment modes, the
-coordinator group runs in-process and is essentially free.
-
-**Scope limitations.**
-
-- Only base-table shards may join a coordinator group. Arrangement/view shards
-  are never coordinated.
-- A transaction touching tables from two different coordinator groups, or mixing
-  coordinated and non-coordinated shards, returns `RS-2009`.
-- Coordinator group membership is immutable after creation. Schema changes
-  affecting table shard count require creating a new group and migrating tables
-  (parallel to the plan-replacement blue/green path in §10.4).
-- Cross-group write-skew (write to group A based on a read from non-coordinated
-  shard B) is not detected; this limitation is documented in `EXPLAIN
-  TRANSACTION` output.
-
-**Relationship to OLTP schema design.** The practical pattern:
-
-1. Keep mutable base tables small and on few shards.
-2. Declare a coordinator group covering those shards.
-3. All user-visible OLTP transactions (balance transfers, order inserts, …)
-   become `CoordinatorGroupSerializable`.
-4. Let views and arrangement shards fan out across hundreds of shards for
-   analytical throughput — entirely outside the coordinator path.
-
-This gives the best of both worlds: true OLTP serializable semantics on the
-write surface, streaming HTAP throughput on the read surface.
-
-**Target version**: post-v0.55 / 1.0 feature track. The coordinator group is
-a decision-gate item evaluated after the v0.55 optimistic-transaction soak
-confirms the exact-key subset is well-understood before adding a heavier
-coordination layer.
-
-**Error codes:**
-
-| Code | Name | Meaning |
-|---|---|---|
-| `RS-2501` | `coordinator.leader_unavailable` | Coordinator group leader election in progress; retry after backoff. |
-| `RS-2502` | `coordinator.prepare_conflict` | Two prepares contend for the same key under the group's quorum; one aborts. |
-| `RS-2503` | `coordinator.cross_group_rejected` | Transaction touches shards from more than one coordinator group, or no group covers the shards involved. |
-| `RS-2504` | `coordinator.quorum_lost` | Fewer than quorum members acknowledged the prepare; transaction aborted. |
-
-> The earlier draft used `RS-2012`–`RS-2013`, `RS-2017`–`RS-2018` for these
-> conditions, which collided with the session-layer codes already established
-> in §12.8. The session codes keep their numbers; coordinator-group codes are
-> reassigned to the `RS-25xx` range as documented in §14.14.
-
----
-
 ## 14. Operations: Deploy, Monitor, Diagnose
 
 This section is a contract, not aspiration. Every primitive below has a
@@ -4582,7 +4437,6 @@ out-of-range to prevent accidental collisions with future owner additions.
 | `RS-2200–2299` | Direct-write transactions (optimistic, exact-key) |
 | `RS-2300–2399` | History / `AS OF` / retention |
 | `RS-2400–2499` | Reserved (gateway expansion) |
-| `RS-2500–2599` | Coordinator group (§13.10) |
 | `RS-3000–3499` | Shard / runtime / placement |
 | `RS-3500–3999` | Merge laws / arrangements |
 | `RS-4000–4099` | Control plane / quotas |
@@ -4645,8 +4499,8 @@ overloaded across owner areas; each has been reassigned into its owner's
 range and the prior occupant retained for its original meaning:
 
 - `RS-2012`, `RS-2013`, `RS-2017`, `RS-2018` previously double-booked for
-  both session-state errors and coordinator-group errors. Coordinator-group
-  errors are renumbered into the `RS-25xx` range.
+  session-state errors; these are retained for their original session-layer
+  meanings.
 - `RS-4001` previously denoted both `control.quota_violation` and
   `cold_tier.not_enabled`. Cold-tier moves to `RS-41xx`.
 - `RS-5002` previously denoted both `merge.unknown_law` and

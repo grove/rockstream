@@ -14,10 +14,10 @@ implementation proves the single-shard IVM core works. However, five critical
 architectural vulnerabilities threaten the project's stated goal of "the
 absolute best cloud-native IVM system ever created":
 
-1. **Speculative over-design past the implementation horizon creates false
+   **Speculative over-design past the implementation horizon creates false
    confidence.** DESIGN.md is 3,000+ lines describing v0.55+ features
-   (Coordinator Group, cold-tier Iceberg, DuckLake, multi-shard SERIALIZABLE)
-   while the implementation is at v0.10 — a single-shard engine that processes
+   (cold-tier Iceberg, DuckLake, multi-shard SERIALIZABLE) while the
+   implementation is at v0.10 — a single-shard engine that processes
    `RecordBatch` deltas in memory. The gap between specified and proven creates
    a risk of premature commitment to decisions that should remain open. The
    design freeze directive at v0.10 is correct but is already violated by the
@@ -126,11 +126,6 @@ the local operator's own arrangement reads hit the same LSM.
   IVM pipeline being production-quality — a Phase 10 feature depending on Phase
   1-3 infrastructure. If IVM performance is worse than expected, indexes become
   a liability.
-- The Coordinator Group (Phase 13) is specified in extreme detail but gated
-  behind v0.55. Designing the full protocol now when the prerequisites (frontier
-  protocol, distributed checkpoint, exactly-once) don't exist yet is premature
-  specification. The design may not survive contact with the implementation of
-  its prerequisites.
 
 ### 2.3 ROADMAP.md Analysis
 

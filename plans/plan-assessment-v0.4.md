@@ -209,7 +209,7 @@ The constructive path is clear: add explicit latency classes, formalize stable i
 
 3. **Postgres compatibility risks becoming product sprawl.**
 
-   [DESIGN.md §12.6](../DESIGN.md#L2331) correctly says pgwire is an access layer, not a Postgres clone. But the later additions include direct DML, session read-your-writes, `INSERT RETURNING`, secondary indexes, optimistic transactions, and Coordinator Groups. Each may be justified, but together they pull the product toward HTAP/OLTP complexity. The roadmap should keep IVM freshness as the product wedge and gate OLTP surfaces more aggressively.
+   [DESIGN.md §12.6](../DESIGN.md#L2331) correctly says pgwire is an access layer, not a Postgres clone. But the later additions include direct DML, session read-your-writes, `INSERT RETURNING`, secondary indexes, and optimistic transactions. Each may be justified, but together they pull the product toward HTAP/OLTP complexity. The roadmap should keep IVM freshness as the product wedge and gate OLTP surfaces more aggressively.
 
 4. **Interactive backfill prompts are awkward over pgwire.**
 
@@ -217,7 +217,7 @@ The constructive path is clear: add explicit latency classes, formalize stable i
 
 5. **Operational profiles need clearer packaging.**
 
-   A self-hosted operator should be able to pick: `embedded`, `single-node-production`, `distributed-minimal`, `distributed-secure`, and `data-lake-enabled`. Right now the docs mix optional features (Iceberg REST catalog, Coordinator Group, external connector tier, secrets providers) into one very broad mental model.
+   A self-hosted operator should be able to pick: `embedded`, `single-node-production`, `distributed-minimal`, `distributed-secure`, and `data-lake-enabled`. Right now the docs mix optional features (Iceberg REST catalog, external connector tier, secrets providers) into one very broad mental model.
 
 ### Pillar 5: First-Class Observability
 
@@ -297,22 +297,19 @@ This is the definitive list of contradictions or missing details found across th
 2. **Cold-tier-aware gateway phase mismatch.** DESIGN.md says Phase 9; implementation and roadmap put it at v0.40/Phase 8. See [DESIGN.md §12.7.3](../DESIGN.md#L2488), [IMPLEMENTATION_PLAN.md Phase 8](../IMPLEMENTATION_PLAN.md#L1037), and [ROADMAP.md v0.40](../ROADMAP.md#L164).
 3. **Pipeline terminology remains after v3.25 claims it was removed.** `pipeline` remains in control keys, system tables, CLI text, metrics, and operator mental model. See [DESIGN.md §5.2](../DESIGN.md#L893), [§12.6.1](../DESIGN.md#L2369), [§14.1](../DESIGN.md#L3756), and [§14.7](../DESIGN.md#L3894).
 4. **Namespace is defined as PostgreSQL database, but schema commands remain.** DESIGN.md says there is no schema layer inside a namespace, yet commands use `ALTER SCHEMA`, `SHOW ... FOR SCHEMA`, schema defaults, and dotted names like `demo.orders`. See [DESIGN.md §5.2](../DESIGN.md#L893), [§13.5.0](../DESIGN.md#L2997), [§14.3](../DESIGN.md#L3798), and [§14.10](../DESIGN.md#L4053).
-5. **Error code collisions exist.** `RS-2012` is both session wait timeout and coordinator group missing; `RS-2013` is returning-key-not-found and cross-group transaction; `RS-2017` is shard-stats stale and coordinator leader unavailable; `RS-2018` is session staleness exceeded and coordinator quorum failure; `RS-4001` is quota violation and cold-tier not enabled; `RS-5002` is protocol version unsupported and unknown merge law; `RS-6001` is schema incompatible evolution and deferred data-quality failure. See [DESIGN.md §14.14](../DESIGN.md#L4168), [§13.10](../DESIGN.md#L3631), and [IMPLEMENTATION_PLAN.md Phase 8](../IMPLEMENTATION_PLAN.md#L1037).
-6. **Coordinator Group references a nonexistent section.** [DESIGN.md §13.10](../DESIGN.md#L3631) and [IMPLEMENTATION_PLAN.md Phase 13](../IMPLEMENTATION_PLAN.md#L1747) refer to frontier aggregator lease election as `§3.4`; the actual section is [§3.2](../DESIGN.md#L558).
-7. **Roadmap says cross-shard SERIALIZABLE is after 1.0, but the 1.0 gate says Coordinator Group is in scope.** Compare [ROADMAP.md Things To Keep Out](../ROADMAP.md#L276) with [ROADMAP.md 1.0 Gate](../ROADMAP.md#L196).
-8. **`CREATE VIEW` retention language conflicts with inline-view semantics.** [DESIGN.md §4.3](../DESIGN.md#L770) says `CREATE VIEW` is inline and has no storage. [§5.7](../DESIGN.md#L1085) mentions a "VIEW declared incremental for streaming consumers only," and [IMPLEMENTATION_PLAN.md Phase 9](../IMPLEMENTATION_PLAN.md#L946) says `CREATE VIEW WITH (retention = '7d')`. That should be `CREATE MATERIALIZED VIEW ... WITH (CHANGE_RETENTION=...)` or a separate `SUBSCRIBE` retention setting.
-9. **`FreshnessToken` is scalar, but views may depend on many sources.** [DESIGN.md §12.4](../DESIGN.md#L2233) defines `{ source_id, source_epoch, cluster_frontier_hash }`. A materialized view can depend on multiple connectors and upstream views; the token needs a vector/map or a committed frontier reference.
-10. **Source epoch language conflicts.** [DESIGN.md §8.1.1](../DESIGN.md#L1481) says `source_epoch` is a connector-declared monotonic epoch with an offset map. [§13.1](../DESIGN.md#L2768) says a connector assigns source epoch by packing its native offset into `source_epoch`. These are different models.
-11. **Watermark absence is correct but not operationally bounded.** [DESIGN.md §13.3](../DESIGN.md#L2787) says no watermark means event-time frontier never advances. The spec lacks a DDL-time fail-closed behavior or bounded processing-time fallback.
-12. **Shard partitioning is ambiguous.** Rendezvous hashing in [§7.1](../DESIGN.md#L1365) and midpoint key-range splitting in [§10.6](../DESIGN.md#L1869) cannot both be the primary migration model without an intermediate virtual bucket abstraction.
-13. **Recovery budget lacks the variables that make it true.** [DESIGN.md §11.5](../DESIGN.md#L2024) states time budgets but not max WAL bytes, manifest chain length, SST count, cache-warm requirements, or object-store p99 assumptions.
-14. **Object-store brownout buffer is epoch-bounded, not byte-bounded.** [DESIGN.md §11.7](../DESIGN.md#L2085) must include byte and row limits to satisfy [ROADMAP.md bounded-everything](../ROADMAP.md#L51).
-15. **`rockstream` vs `rockstream_catalog` system schemas diverge.** [DESIGN.md §12.6.1](../DESIGN.md#L2369) defines a `rockstream` schema; [§13.3.1](../DESIGN.md#L2920) and [§14.19](../DESIGN.md#L4318) use `rockstream_catalog`. Pick one or define the split.
-16. **Cold-tier section numbering is inconsistent.** Implementation and roadmap refer to `§13.6.6` for cold snapshot GC, but DESIGN.md has [§13.6.2.1](../DESIGN.md#L3192).
-17. **Coordinator Group scope is too prominent for a post-v0.55 feature.** It is a sophisticated transaction subsystem that could distract from IVM. The spec should keep it behind a clearer post-1.0 or explicit 1.0-track gate.
-18. **The comparison table risks overclaiming before Data Lake GA.** [DESIGN.md §15](../DESIGN.md#L4355) mitigates this with a GA vs Data Lake GA note, which is good. The roadmap and marketing-facing docs must preserve that distinction.
-19. **Window implementation plan does not meet stated latency ambition.** Partition recomputation in [IMPLEMENTATION_PLAN.md IVM-7](../IMPLEMENTATION_PLAN.md#L454) is not compatible with large-partition low-latency windows.
-20. **Hot-path observability starts too late.** [ROADMAP.md v0.47](../ROADMAP.md#L177) bundles most observability, while performance-sensitive operator milestones begin at v0.5-v0.9.
+5. **Error code collisions exist.** `RS-4001` is quota violation and cold-tier not enabled; `RS-5002` is protocol version unsupported and unknown merge law; `RS-6001` is schema incompatible evolution and deferred data-quality failure. See [DESIGN.md §14.14](../DESIGN.md#L4168) and [IMPLEMENTATION_PLAN.md Phase 8](../IMPLEMENTATION_PLAN.md#L1037).
+6. **`CREATE VIEW` retention language conflicts with inline-view semantics.** [DESIGN.md §4.3](../DESIGN.md#L770) says `CREATE VIEW` is inline and has no storage. [§5.7](../DESIGN.md#L1085) mentions a "VIEW declared incremental for streaming consumers only," and [IMPLEMENTATION_PLAN.md Phase 9](../IMPLEMENTATION_PLAN.md#L946) says `CREATE VIEW WITH (retention = '7d')`. That should be `CREATE MATERIALIZED VIEW ... WITH (CHANGE_RETENTION=...)` or a separate `SUBSCRIBE` retention setting.
+7. **`FreshnessToken` is scalar, but views may depend on many sources.** [DESIGN.md §12.4](../DESIGN.md#L2233) defines `{ source_id, source_epoch, cluster_frontier_hash }`. A materialized view can depend on multiple connectors and upstream views; the token needs a vector/map or a committed frontier reference.
+8. **Source epoch language conflicts.** [DESIGN.md §8.1.1](../DESIGN.md#L1481) says `source_epoch` is a connector-declared monotonic epoch with an offset map. [§13.1](../DESIGN.md#L2768) says a connector assigns source epoch by packing its native offset into `source_epoch`. These are different models.
+9. **Watermark absence is correct but not operationally bounded.** [DESIGN.md §13.3](../DESIGN.md#L2787) says no watermark means event-time frontier never advances. The spec lacks a DDL-time fail-closed behavior or bounded processing-time fallback.
+10. **Shard partitioning is ambiguous.** Rendezvous hashing in [§7.1](../DESIGN.md#L1365) and midpoint key-range splitting in [§10.6](../DESIGN.md#L1869) cannot both be the primary migration model without an intermediate virtual bucket abstraction.
+11. **Recovery budget lacks the variables that make it true.** [DESIGN.md §11.5](../DESIGN.md#L2024) states time budgets but not max WAL bytes, manifest chain length, SST count, cache-warm requirements, or object-store p99 assumptions.
+12. **Object-store brownout buffer is epoch-bounded, not byte-bounded.** [DESIGN.md §11.7](../DESIGN.md#L2085) must include byte and row limits to satisfy [ROADMAP.md bounded-everything](../ROADMAP.md#L51).
+13. **`rockstream` vs `rockstream_catalog` system schemas diverge.** [DESIGN.md §12.6.1](../DESIGN.md#L2369) defines a `rockstream` schema; [§13.3.1](../DESIGN.md#L2920) and [§14.19](../DESIGN.md#L4318) use `rockstream_catalog`. Pick one or define the split.
+14. **Cold-tier section numbering is inconsistent.** Implementation and roadmap refer to `§13.6.6` for cold snapshot GC, but DESIGN.md has [§13.6.2.1](../DESIGN.md#L3192).
+15. **The comparison table risks overclaiming before Data Lake GA.** [DESIGN.md §15](../DESIGN.md#L4355) mitigates this with a GA vs Data Lake GA note, which is good. The roadmap and marketing-facing docs must preserve that distinction.
+16. **Window implementation plan does not meet stated latency ambition.** Partition recomputation in [IMPLEMENTATION_PLAN.md IVM-7](../IMPLEMENTATION_PLAN.md#L454) is not compatible with large-partition low-latency windows.
+17. **Hot-path observability starts too late.** [ROADMAP.md v0.47](../ROADMAP.md#L177) bundles most observability, while performance-sensitive operator milestones begin at v0.5-v0.9.
 
 ---
 
@@ -430,7 +427,6 @@ Define a `production_minimal` deployment profile separate from the full data-lak
 - control group, workers, gateway, object storage;
 - Kafka/Postgres connectors;
 - no Iceberg REST catalog;
-- no Coordinator Group;
 - no user-defined merge laws;
 - auth/secrets on;
 - core observability on.
@@ -615,7 +611,6 @@ entry. Ranges are reserved as follows:
 |---|---|
 | RS-1000-RS-1999 | connectors and source decoding |
 | RS-2000-RS-2499 | query gateway, history, isolation, session behavior |
-| RS-2500-RS-2799 | coordinator-group transactions |
 | RS-3000-RS-3499 | shard, storage, recovery, merge operand validation |
 | RS-4000-RS-4499 | control plane, quotas, cold-tier planning |
 | RS-5000-RS-5499 | format, protocol, upgrade compatibility |
