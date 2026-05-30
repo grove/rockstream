@@ -84,6 +84,10 @@ fn kind_label(kind: &OpKind) -> String {
             rank_col,
             partition_by,
         } => format!("TopK[k={k},rank={rank_col},partitions={partition_by:?}]"),
+        OpKind::Recursion {
+            max_iterations,
+            monotone,
+        } => format!("Recursion[max_iter={max_iterations},monotone={monotone}]"),
     }
 }
 

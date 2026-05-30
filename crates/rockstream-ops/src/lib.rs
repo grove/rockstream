@@ -14,6 +14,7 @@ pub mod noop;
 pub mod operator;
 pub mod outer_join;
 pub mod project;
+pub mod recursive;
 pub mod row_codec;
 pub mod scheduler;
 pub mod set_ops;

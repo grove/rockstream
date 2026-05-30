@@ -14,6 +14,7 @@ pub mod batch_oracle;
 pub mod join_oracle;
 pub mod law_harness;
 pub mod min_max_oracle;
+pub mod recursive_oracle;
 pub mod set_op_oracle;
 pub mod top_k_oracle;
 pub mod tumble_oracle;

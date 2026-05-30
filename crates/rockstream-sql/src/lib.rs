@@ -443,6 +443,7 @@ mod lowering_tests {
                 OpKind::Window { .. } => "Window",
                 OpKind::TumbleWindow { .. } => "TumbleWindow",
                 OpKind::TopK { .. } => "TopK",
+                OpKind::Recursion { .. } => "Recursion",
             })
             .collect()
     }
@@ -946,6 +947,7 @@ mod soak_tests {
                 OpKind::Window { .. } => "Window",
                 OpKind::TumbleWindow { .. } => "TumbleWindow",
                 OpKind::TopK { .. } => "TopK",
+                OpKind::Recursion { .. } => "Recursion",
             })
             .collect();
         assert_eq!(got, expected, "operator kind sequence mismatch");
