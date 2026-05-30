@@ -485,7 +485,7 @@ mod tests {
                 // Verify the manager also has the lease.
                 assert!(manager.is_valid_writer(ShardId(42), lease.lease_token));
             }
-            _ => panic!("expected ShardAssigned, got: {:?}", reply),
+            _ => panic!("expected ShardAssigned, got: {reply:?}"),
         }
 
         handle.shutdown();
@@ -523,7 +523,7 @@ mod tests {
                 assert_eq!(shard_id, ShardId(5));
                 assert!(valid, "current token must be valid");
             }
-            _ => panic!("expected FenceAck, got: {:?}", reply),
+            _ => panic!("expected FenceAck, got: {reply:?}"),
         }
 
         // Fence with stale token (simulate worker A being fenced by worker B).
@@ -538,7 +538,7 @@ mod tests {
             ControlMessage::FenceAck { valid, .. } => {
                 assert!(!valid, "stale token must be rejected");
             }
-            _ => panic!("expected FenceAck, got: {:?}", reply2),
+            _ => panic!("expected FenceAck, got: {reply2:?}"),
         }
 
         handle.shutdown();
