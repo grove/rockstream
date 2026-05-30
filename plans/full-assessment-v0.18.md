@@ -1,558 +1,548 @@
-# Post-Phase Assessment: v0.18 SQL Alpha
+# Post-Phase Assessment: v0.18 SQL Alpha / v0.27 Single-Shard Correctness
 
 **Date**: 2026-05-30
-**Assessor scope**: DESIGN.md (v3.28), IMPLEMENTATION_PLAN.md, ROADMAP.md, IVM.md
-**Assessment trigger**: v0.18 SQL Alpha soak complete; Developer Preview decision gate
+**Assessor scope**: DESIGN.md (v3.28), IMPLEMENTATION_PLAN.md, ROADMAP.md
+**Assessment trigger**: v0.18 SQL Scope Control gate passed; v0.27 Single-Shard
+Correctness gate passed; project entering distributed phase (v0.28+)
+**Implementation state**: v0.27.0 shipped (all versions v0.1–v0.27 marked Done)
 
 ---
 
 ## 1. Executive Summary & Core Weaknesses
 
-The v0.18 milestone marks the completion of Phase 2 (Core SQL). The system can
-now lower SQL through DataFusion, compile filter/project/map/aggregate/join/set-op
-plans, annotate them with merge-law metadata, and prove correctness via a
-deterministic fuzzer. This is a credible single-shard SQL IVM engine on paper.
-However, five critical architectural vulnerabilities remain:
+The specification documents remain among the most thorough system design
+documents in the stream-processing space. Since the v0.10 assessment, the
+project has delivered 17 versions (v0.11–v0.27) covering the full SQL frontend,
+inner/outer/semi/anti joins, set operations, window functions, time windows,
+Top-K, recursion, bootstrap, view-on-view DAGs, lateral functions, approximate
+sketches, the TPC-H 22/22 correctness soak, and the single-shard performance
+profile. This is an exceptional implementation pace.
 
-1. **The gap between specification density and implementation mass is widening,
-   not closing.** DESIGN.md is now 5,173 lines (grew ~70% since the v0.10
-   assessment). IMPLEMENTATION_PLAN.md is 1,962 lines. The actual codebase is
-   ~26,000 lines of Rust across all crates. The specification-to-implementation
-   ratio is nearly 1:3.6 by line count — dangerously close to parity. This
-   means the design documents are approaching the complexity of a second
-   codebase that must be maintained in parallel, with drift as the inevitable
-   result. Each new design revision (v3.20–v3.28) adds detail for features 30+
-   versions away while the implementation team is still proving Phase 2 basics.
-   The v0.10 design-freeze directive has not been enforced in practice: the
-   document continues to accumulate speculative sections.
+However, five critical architectural vulnerabilities threaten the project at
+this critical juncture — the transition from single-shard to distributed
+execution:
 
-2. **No real object-store latency has been endured.** Eighteen versions into the
-   project, every test still runs against an in-memory object store or local
-   filesystem. The "SQL Alpha soak" is a fuzzer over plan lowering and explain
-   annotations — it does not exercise SlateDB under real S3/GCS latency
-   profiles. The Phase 0 "storage operational budget" decision gate
-   (post-v0.10) is listed but there is no evidence it was exercised with a
-   cloud object store. The design commits to `target_shard_state_bytes = 20 GB`
-   and `write_amplification_ratio = 10` but these remain theoretical. A system
-   that has never seen a 200ms PUT tail latency cannot claim to be cloud-native.
+1. **The design freeze is systematically violated.** DESIGN.md grew from v3.13
+   (at the v0.10 gate) to v3.28 — 15 major revisions adding coordinator
+   groups, cold-tier Iceberg sinks, DuckLake catalogs, HTAP session
+   ergonomics, secondary indexes, shard column statistics, and more. The
+   ROADMAP.md specifies CI enforcement (`freeze-exception` trailers, 10-line
+   limit on non-exempt PRs), but this enforcement is demonstrably not active.
+   The design document is now 5,200+ lines and continues to function as the
+   primary work product rather than an implementation reference. This creates
+   two risks: (a) premature commitment to decisions that should remain open
+   until the distributed phase reveals real constraints, and (b) cognitive
+   load that makes the document harder to use as a reference during active
+   implementation.
 
-3. **The v0.19–v0.27 Phase 3 scope is enormous and under-sequenced.** Phase 3
-   packs window functions, time windows with watermarks, Top-K, recursion,
-   bootstrap/snapshot, view-on-view DAGs, lateral/SRF/UDF, and a full
-   correctness soak into 9 versions. Each of these is a hard distributed-systems
-   or query-semantics problem in isolation. Recursion alone (v0.22) requires
-   nested timestamps, convergence detection, strategy selection (semi-naive vs.
-   DRed vs. recompute), and safety caps. The plan treats them as equal-effort 10
-   person-week units, but recursion and time-window watermark semantics are
-   demonstrably 2-3x harder than filter/project/map. No fallback sequencing
-   exists if any single milestone proves intractable.
+2. **Escape-hatch outcomes from Phase 3 are not consolidated.** Three escape
+   hatches were exercised: DRed recursion proved unsound under concurrent
+   deletes (v0.22), HOP/SESSION windows were deferred to v0.21 during v0.20,
+   and HLL accuracy was confirmed sufficient (v0.21). These outcomes are
+   recorded in individual sign-offs but are not consolidated in
+   IMPLEMENTATION_PLAN.md or ROADMAP.md as "known limitations entering the
+   distributed phase." DESIGN.md §6.8 still describes DRed as a live strategy
+   option for "monotone mixed insert/delete/update recursion" despite the
+   implementation rejecting non-monotone terms with RS-1009. This is a
+   specification-implementation divergence that will confuse future readers.
 
-4. **The workload/DDL/lifecycle surface area introduced in v0.16–v0.17 is
-   untested under operator load.** `CREATE WORKLOAD`, `FRESHNESS_SLO`,
-   `MEMORY_LIMIT`, `PAUSE/RESUME MATERIALIZED VIEW`, `SHOW VIEW STATUS`,
-   `EXPLAIN INCREMENTAL ESTIMATE`, and the backfill cost-preview prompt all
-   shipped as SQL grammar and catalog entries. But without a distributed runtime,
-   adaptive epoch loop, or actual state-budget enforcement (deferred to Phases
-   3-5), these are type-checked promises with no runtime backing. A user who
-   sets `FRESHNESS_SLO = '100ms'` today gets no enforcement, no degradation
-   signal, and no feedback that the SLO is purely decorative. This creates an
-   expectation gap at the exact moment the project becomes "demo-able to
-   external users."
+3. **The storage operational budget gate is ambiguously validated.** The
+   IMPLEMENTATION_PLAN.md storage gate between Phase 2 and Phase 3 requires
+   validation "on a real S3-compatible endpoint" with "object-store request
+   p99 latencies for PUT/GET/LIST at 1GB and 5GB shard sizes." The v0.27
+   sign-off includes storage budget tests (PUT p99 < 200ms, GET p99 < 100ms),
+   but these run under `SimRuntime` with in-memory object store, not against
+   real S3. The project has not yet confronted real object-store tail latency
+   at multi-GB shard sizes. This is the single highest-risk gap entering the
+   distributed phase, because every distributed mechanism (exchange, frontier,
+   checkpoint, recovery) amplifies object-store costs.
 
-5. **Cross-document drift between IMPLEMENTATION_PLAN and ROADMAP is
-   accumulating.** The ROADMAP declares v0.18 as "SQL Alpha" and "Developer
-   Preview" simultaneously (both listed in the Public Milestones table). The
-   IMPLEMENTATION_PLAN's Phase 2 operability deliverables specify full
-   `EXPLAIN INCREMENTAL VERBOSE/ANALYZE` and source-statistics pipelines, but
-   the v0.18 sign-off proves only basic explain output and a plan-level fuzzer.
-   The `ANALYZE` level explicitly requires "a live worker round-trip" that cannot
-   exist in the current single-shard-no-distributed-runtime architecture.
-   VERBOSE with "shard counts and parallelism" is meaningless when there is one
-   shard and no parallelism selection.
+4. **Phase 4 (distributed) is the largest complexity cliff in the project.**
+   The transition from single-shard to multi-shard introduces: shard leasing
+   and scheduling, gRPC exchange with four path types, rendezvous hashing,
+   distributed operator placement, credit-based backpressure across workers,
+   and distributed recursion. The IMPLEMENTATION_PLAN.md bundles all of this
+   into three versions (v0.28–v0.30), each at 10 person-weeks. The v0.10
+   assessment flagged Phase 8 scope as aggressive; the same concern applies to
+   Phase 4. The control plane (v0.28) alone — worker discovery, topology
+   catalog, mTLS scaffolding, shard manager, lease acquisition, writer fencing
+   — is a full 10-person-week version without any exchange or shuffle work.
+
+5. **Cross-document terminology and reference drift has accumulated.** Multiple
+   small inconsistencies between DESIGN.md, IMPLEMENTATION_PLAN.md, and
+   ROADMAP.md have accrued over the 17-version implementation sprint: the
+   `rockstream sql` CLI subcommand (shipped in v0.18) is absent from
+   DESIGN.md §14.7's CLI surface; error code RS-1009 (recursion rejection) is
+   outside its documented owner range (RS-1000–1499 is connector/source/sink);
+   IMPLEMENTATION_PLAN.md Phase 3 Milestone IVM-10 still describes DRed as a
+   live compiler strategy; the Phase overview table doesn't reflect that all
+   Phase 0–3.5 rows are completed; and the `rockstream explain` command
+   syntax in Phase 1 operability deliverables references an older form than the
+   current `EXPLAIN INCREMENTAL` surface.
 
 ---
 
 ## 2. In-Depth Architectural Critique
 
-### `DESIGN.md` Analysis
+### 2.1 DESIGN.md Analysis
 
-**Strengths:**
-- The latency-class taxonomy (§3.0) is the strongest element in the entire
-  design. The dual-frontier model (`visible_frontier` vs. `durable_frontier`)
-  correctly separates the laptop experience from the distributed promise. This
-  is architecturally rare and correct.
-- Virtual-bucket partitioning (§7.1) with rendezvous hashing is the right
-  abstraction for online resharding. The migration state machine
-  (§10.2, v3.28) is concrete enough to implement without ambiguity.
-- The watermark fail-closed policy (§6.9) is a courageous design choice that
-  prevents the most common silent-data-loss bug in streaming systems.
+**Strengths (since v0.10):**
+- The v3.28 coherence pass successfully resolved error-code collisions,
+  tightened the freshness contract with latency classes (§3.0), specified
+  stable CDC row identity (§6.4), and replaced ambiguous key-range splitting
+  with virtual buckets (§7.1, §10.2).
+- The 10-state bucket migration state machine (§10.2) with per-state timeouts,
+  idempotent transitions, and frontier-gated cleanup is a significant
+  improvement over the v0.10 design's implicit migration model.
+- The arrangement working-set management (§6.12), write amplification budget
+  (§5.4), and exchange path thresholds (§7.2) — all recommendations from the
+  v0.10 assessment — have been incorporated.
+- The CALM epoch-commit invariant (§8.4) giving external tools verifiable
+  snapshot safety is an elegant architectural contribution.
 
-**Weaknesses:**
+**Weaknesses and gaps:**
 
-1. **§3.1 Runtime Profiles are under-specified at the transition boundaries.**
-   The design says "a pipeline can move from `embedded` to `single_worker` to
-   `distributed` by changing placement and shard maps" but does not specify:
-   - How the transition is triggered (operator action? auto-detected?).
-   - Whether existing arrangement state requires migration.
-   - What happens to in-flight epochs during the transition.
-   - Whether `visible_frontier` semantics change mid-flight.
-   This will bite at v0.28 when the first distributed deployment needs to be
-   tested against a pipeline that was created in embedded mode.
+| Area | Issue | Severity |
+|------|-------|----------|
+| §6.8 Recursion | DRed is listed as a strategy for "monotone mixed insert/delete/update recursion" but was proved unsound and deferred in v0.22. The design should reflect the implemented reality: semi-naive only for monotone insert-only; full recomputation fallback for everything else; DRed deferred with RS-1009 rejection. | High |
+| §14.7 CLI | The `rockstream sql "<query>"` subcommand shipped in v0.18 is not listed in §14.7's CLI surface. This is a user-facing feature gap in the design reference. | Medium |
+| §14.14 Error codes | RS-1009 (`recursion.non_monotone_not_supported`) falls in the RS-1000–1499 "Connector / source / sink ingestion" range but is a DDL/compiler error. It should be in the RS-1500–1999 "Schema / DDL validation" range. | Low |
+| §3.1.1 Transitions | Runtime profile transitions are "one direction only: embedded → single_worker → distributed" with no downgrade. This is pragmatic but the explicit rejection should document the workaround (export + recreate). | Low |
+| §17 Simulation | The simulation testing section doesn't address the gap between `SimRuntime` (in-memory object store) and real S3 behavior. Key differences include: S3 conditional writes, LIST-after-PUT consistency variance across providers, and HTTP 429 rate limiting. The simulation should document which S3 behaviors it models and which it doesn't. | Medium |
 
-2. **§5.4 Arrangement segment cache creates an invisible consistency window.**
-   The cache is invalidated "on compaction via manifest-poll." But
-   `manifest_poll_interval` is configurable, meaning a stale cache entry can
-   serve reads for up to one full poll interval after a compaction that rewrites
-   the segment. During this window, a `DbReader`-based join lookup could read
-   stale pre-compaction data. The design notes this is safe because "SST
-   segments are immutable between the checkpoint at which they were created and
-   the compaction that rewrites them" — but a compaction that runs between two
-   manifest polls creates exactly this window. The fix is trivial (version the
-   segment reference in the read plan), but it is not specified.
+**IVM Engine Soundness:**
+The single-shard IVM engine has been thoroughly validated through v0.27:
+TPC-H 22/22, Nexmark subset, random query fuzzer (1 hour+), law-equivalence
+corpus, and per-law RMW-avoidance measurement. The DBSP formalism continues to
+provide correct foundations. The remaining IVM risks are:
 
-3. **§6.12 Arrangement Working Set model is a memory budgeting afterthought.**
-   The formula `operator_cache_mb = MEMORY_LIMIT / operator_count` is a uniform
-   distribution that ignores operator heat. A 50-way join plan with one hot
-   dimension table and 49 cold fact partitions gets 1/50th of cache for the
-   dimension — exactly wrong. The auto-tuner "redistributes proportional to
-   observed access frequency" but this is specified in one sentence with no
-   algorithm, no convergence proof, and no oscillation bound. This will be a
-   production performance cliff.
+- **Partition-based window recomputation** (§6.7) is O(partition_size) per
+  change. The segment-tree optimization for sliding aggregates was deferred.
+  This will become a production concern for large-partition window functions
+  under tight SLOs. The EXPLAIN NOTICE at `partition_recompute_warn_threshold`
+  (default 100k) is correct mitigation documentation, but the optimization
+  itself should be tracked as a Phase 4+ follow-up.
 
-4. **§13.5 Direct-write source connector has an implicit backpressure gap.**
-   The design says `COMMIT` flushes as an atomic Z-set delta via `WriteBatch`
-   to a base-table shard. But there is no described mechanism for the gateway to
-   reject or delay writes when the receiving shard is under checkpoint pressure,
-   migration, or memory exhaustion. The Kafka source has `credits_available()`
-   for this; the direct-write path has no equivalent. Under write storms, this
-   becomes unbounded queue growth inside the gateway.
+- **Recursive DRed deferral** means non-monotone recursive views are rejected.
+  This is a SQL coverage gap that should be prominently documented in the
+  "SQL reference" planned for Phase 10, not buried in an error code.
 
-5. **§12.7 Two-tier view storage design decision notes "cold tier is NOT a
-   Phase 9 deliverable" but the `ViewReader` trait ships in Phase 8.** This is
-   correct forward-engineering, but the `TwoTier` variant that returns
-   `RS-4101 cold_tier.not_enabled` creates a user-visible error code for a
-   feature that won't exist for 8+ versions. Any tool that enumerates error
-   codes or auto-completes strategies will surface this dead path, creating
-   confusion. A simpler approach: define `ViewReadStrategy` as
-   `#[non_exhaustive]` with only `HotOnly` until the cold tier actually ships.
+### 2.2 IMPLEMENTATION_PLAN.md Analysis
 
-### `IMPLEMENTATION_PLAN.md` Analysis
+**Strengths (since v0.10):**
+- Every version from v0.11 through v0.27 has been delivered with concrete
+  sign-off evidence, testable exit criteria, and oracle-backed correctness
+  proof.
+- The escape-hatch pattern (define Plan A, specify Plan B fallback, document
+  which was chosen) is excellent engineering discipline demonstrated in v0.20
+  (TUMBLE only) and v0.22 (DRed deferred).
+- The storage operational budget gate between Phase 2 and Phase 3 was a
+  direct incorporation of the v0.10 assessment recommendation.
+- Phase 4 exit criteria now require "4 hosts × 4 shards minimum, real network"
+  — another v0.10 recommendation successfully incorporated.
 
-**Strengths:**
-- The MergeLaw contract landing as IVM-0 (v0.5) alongside IVM-1 is
-  architecturally sound. The shared property-test harness catching
-  associativity/commutativity/idempotence violations early prevents
-  the category of bugs that Materialize spent years debugging in its
-  differential-dataflow arrangements.
-- The per-phase operability callouts are genuinely useful. The "error-code
-  registry from day one" constraint has measurably improved code quality
-  (every error in the codebase has an RS-XXXX code).
-- The Phase 3.5 correctness soak before distribution is the single most
-  important sequencing decision in the plan. It correctly prevents
-  distribution from compounding undetected IVM bugs.
+**Weaknesses and gaps:**
 
-**Weaknesses:**
+| Area | Issue | Severity |
+|------|-------|----------|
+| Phase overview table | The table maps phases to ROADMAP versions but doesn't indicate completion status. Phases 0–3.5 are all complete; the table should show this. | Low |
+| Phase 3 IVM-10 (Recursion) | Still lists "DRed for monotone mixed insert/delete/update recursion" as a compiler strategy without noting the v0.22 escape-hatch outcome. The escape hatch section at the end correctly describes the fallback, but the main description is misleading. | High |
+| Storage budget gate | The gate documentation says "This is not a new roadmap version — it is a gate that must be passed as part of the v0.19 entry criteria." The current formulation doesn't specify whether the gate was satisfied with SimRuntime or real object storage. | High |
+| Phase 4 scope | v0.28 (control plane + worker discovery), v0.29 (shard leasing + scheduling), and v0.30 (exchange + combiners) are individually underscoped at 10 person-weeks each. v0.28 alone includes: control service, worker registration with capacity reporting, topology catalog, bootstrap command, mTLS scaffolding, and role flags. This is infrastructure that requires careful security engineering (mTLS), integration testing, and operational validation. | Medium |
+| Escape-hatch tracking | No consolidated section tracks which escape hatches were triggered and their implications for later phases. DRed deferral affects Phase 4 (distributed recursion falls back to semi-naive only). HOP/SESSION deferral was resolved in v0.21. These should be summarized before Phase 4 begins. | Medium |
 
-1. **Phase 2 "Exit criteria" mismatch with actual v0.18 proof.** The Phase 2
-   exit criteria state:
-   > "TPC-H Q1, Q3, Q5, Q6, Q11, Q21 all pass parity vs. DataFusion batch."
+### 2.3 ROADMAP.md Analysis
 
-   The v0.18 sign-off proves: lowering, explain, catalog round-trip, and a
-   plan-structure fuzzer. There is no batch-parity proof for any TPC-H query.
-   Either the exit criteria should be moved to a later version within Phase 2,
-   or the Phase 2 boundary should be redrawn. Currently, v0.18 claims Phase 2
-   completion but has not met the Phase 2 exit criteria.
+**Strengths (since v0.10):**
+- Decision gates at v0.18 (SQL scope control) and v0.27 (Single-shard
+  correctness) are both passed. The evidence from sign-offs supports this.
+- The Developer Preview milestone was placed at v0.27 (not v0.18 as the v0.10
+  assessment suggested, but the later placement aligns better with the
+  project's actual demo-ability timeline).
+- The version-effort variance caveat ("Foundation versions typically
+  under-budget; gateway/connector versions typically over-budget") was added
+  per the v0.10 recommendation.
+- The storage operational budget decision gate was added after v0.10.
 
-2. **Phase 4 exchange path classifier assumes stable peer topology.** The
-   exchange path selection (`elided`/`loopback`/`direct`/`durable`) is decided
-   per-batch at runtime. But the decision depends on "receiver reachable" —
-   which under network partitions can oscillate rapidly. A batch sent via direct
-   that is not ACKed must be re-sent via durable, but the outbox entry was
-   already written for direct. The plan does not specify the state machine for
-   path upgrade/downgrade mid-epoch. This will be the #1 correctness bug in
-   Phase 4 if not addressed proactively.
+**Weaknesses and gaps:**
 
-3. **Phase 6 fault tolerance specifies recovery budgets (5s/30s/60s) without
-   specifying what is measured.** Is "failure detection ≤ 5s" measured from the
-   moment the worker process dies, or from the moment the control plane's
-   heartbeat timer expires? Is "pipeline freshness recovery ≤ 60s" measured to
-   the first new epoch commit, or to the frontier reaching the pre-failure
-   position? These ambiguities will cause the chaos test to pass or fail
-   depending on interpretation.
-
-4. **Phase 8 packs too many independent features into one version (v0.43).**
-   The v0.43 deliverables include: direct-write DML, CRDT column types,
-   idempotency-key enforcement, optimistic transaction metadata hooks, session
-   read-your-writes, INSERT RETURNING, max-staleness sessions, zero-downtime
-   view replacement, write fences, background DDL, and schema-level lifecycle.
-   This is at minimum 3 separate 10-person-week versions compressed into one.
-   Any single feature here (e.g., INSERT RETURNING with post-commit point-read)
-   has non-trivial interactions with the frontier model that deserve their own
-   proof.
-
-5. **Phase 12 (Cold Tier) has no specified fallback if SlateDB's compaction
-   model conflicts with Iceberg's snapshot model.** The cold tier writes Iceberg
-   v2 tables from checkpoint data. But if a compaction rewrites the SSTs that a
-   cold-tier snapshot was reading mid-write, the snapshot writer sees a stale
-   segment. The plan assumes checkpoint pinning prevents this, but the
-   interaction between SlateDB checkpoint lifetime and Iceberg snapshot flush
-   latency is not bounded. A slow Parquet write (large partition, S3 throttle)
-   could exceed the checkpoint retention window.
-
-### `ROADMAP.md` Analysis
-
-**Strengths:**
-- The "Evidence over dates" philosophy and the decision gates are genuinely
-  rare in the industry. The explicit "no" criteria for the v0.55 coordinator
-  group gate prevent premature commitment.
-- The design-freeze directive after v0.10 with CI enforcement (`freeze-exception`
-  trailer, 10-line-net threshold) is the correct mechanism.
-- The "Things To Keep Out Until After 1.0" list is honest and correctly scoped.
-  The temptation to add active-active multi-region writes is explicitly named
-  and resisted.
-
-**Weaknesses:**
-
-1. **The "Developer Preview" milestone at v0.18 is premature given the
-   implementation state.** The roadmap says: "Single-shard SQL engine demo-able
-   to external users. Blog post + feedback loop." But the implementation can
-   only lower plans and print explain output — it cannot actually execute a SQL
-   query against real data and return results via psql. The `rockstream sql`
-   command prints an explain plan, not query results. Calling this a "Developer
-   Preview" risks external credibility if anyone tries to use it as described.
-
-2. **The parallel work tracks table creates a false sense of parallelizability.**
-   It says "Gateway and pgwire: can start seriously after v0.18." But the gateway
-   requires distributed reads, cross-shard scatter, frontier-pinned snapshots,
-   and session state management. These all depend on Phase 4-5 infrastructure
-   that doesn't exist until v0.32. The "can prototype against single-shard
-   snapshots" qualifier is buried in a note but the table implies v0.18 is a
-   hard start signal.
-
-3. **The common "Definition of Done" requires simulation tests for coordination
-   paths, but Phases 1-2 have no coordination paths.** This means the simulation
-   discipline has been dormant for 14 versions (v0.5–v0.18). The `SimRuntime`
-   exists but its exercise has been limited to determinism checks, not adversarial
-   fault injection. When Phase 4 arrives and suddenly needs simulation-proven
-   coordination, the team will have forgotten how to write effective simulation
-   tests.
-
-4. **No version budget accounts for the documentation debt.** The roadmap
-   specifies "a blog post" at v0.18, an "operator's guide" and "SQL reference"
-   at v0.52, and "deployment playbooks" alongside. But no version budget includes
-   documentation as a first-class deliverable with its own proof. The risk: v0.52
-   arrives and the documentation sprint consumes an entire version budget,
-   delaying production beta.
+| Area | Issue | Severity |
+|------|-------|----------|
+| Decision gate status | The decision gates table lists gates at v0.4, v0.10, v0.18, v0.27 but doesn't record their outcomes. Past gates should be marked with their result and date. | Medium |
+| Design freeze enforcement | The freeze directive ("every DESIGN.md commit should be small and targeted") and CI enforcement ("freeze-exception trailer, 10-line limit") are specified but demonstrably not enforced — DESIGN.md has had 15 major revisions since v0.10. Either enforce the freeze or update the directive to acknowledge that the design is a living document through the single-shard phase, with the freeze taking effect at v0.27. | High |
+| Completed-version annotations | Advanced IVM versions (v0.19–v0.27) are correctly marked Done with scope, but several lack escape-hatch outcome annotations. v0.20 should note "Escape hatch applied: TUMBLE only; HOP/SESSION deferred." v0.22 should note "Escape hatch applied: DRed deferred; non-monotone terms rejected with RS-1009." | Medium |
+| Parallel work tracks | The table says "Gateway and pgwire: Can start seriously after v0.18." With v0.18 passed, this track is now eligible. But the gateway design (§12.6) depends on the distributed exchange (Phase 4) for multi-shard reads. The table should clarify that gateway prototyping against single-shard snapshots can start now, but full multi-shard gateway requires Phase 5 (frontier protocol). | Low |
 
 ---
 
 ## 3. Concrete Improvement Proposals
 
-### 3.1 Enforce the Design Freeze with a Hard Document Split
+### 3.1 Enforce the Design Freeze Starting Now (v0.27)
 
-**Problem**: DESIGN.md at 5,173 lines is unmaintainable as a single document.
-The design-freeze directive is violated by its own mass.
+**Problem:** The design freeze was specified for v0.10 but 15 major revisions
+have been merged since. The freeze has no practical enforcement.
 
-**Proposal**: Split DESIGN.md into:
-- `DESIGN.md` — Principles, topology, storage layout, operator catalog, exchange,
-  frontier protocol, epoch commit (§1–§9). ~2,500 lines. Frozen after v0.10.
-- `DESIGN-GATEWAY.md` — Query serving, isolation, subscribe, HTAP ergonomics
-  (§12). ~800 lines. Frozen after v0.40.
-- `DESIGN-CONNECTORS.md` — Connector contracts, cold tier, catalog server,
-  coordinator group (§13). ~1,000 lines. Frozen after v0.45.
-- `DESIGN-OPS.md` — Operations, deployment, observability, security (§14–§17).
-  ~800 lines. Frozen after v0.47.
+**Proposal:** Update ROADMAP.md to acknowledge the freeze was deferred to v0.27
+(the natural single-shard correctness boundary) and enforce it from this point:
 
-Each split document carries its own `freeze-exception` CI gate tied to the
-version at which it stabilizes. This makes the freeze enforceable rather than
-aspirational.
+- The CI enforcement described in ROADMAP.md (freeze-exception trailer,
+  10-line limit) activates on the commit following the v0.27 merge.
+- DESIGN.md and IVM.md become implementation references only.
+- New design decisions required for v0.28+ are tracked as GitHub issues with
+  targeted, small corrections — never as numbered "v3.X" revision passes.
 
-### 3.2 Add a "Cloud Soak" Version Between v0.10 and v0.19
+### 3.2 Consolidate Escape-Hatch Outcomes
 
-**Problem**: No version exercises real object-store latency.
+**Problem:** Escape-hatch results are scattered across sign-offs and not
+reflected in the specification documents.
 
-**Proposal**: Insert **v0.18.1** (or rename the next version) as a "Storage
-Operational Budget" version that:
-- Runs the v0.18 SQL Alpha soak against S3-compatible storage (MinIO with
-  simulated latency or actual S3).
-- Measures and records: PUT p50/p95/p99, GET p50/p95/p99, LIST p50/p95/p99,
-  manifest write cadence, WAL listing cost, compaction debt at 1GB/5GB/10GB
-  shard sizes.
-- Proves that `min_epoch_ms` floor prevents manifest churn below a budget.
-- Establishes the first concrete numbers for `write_amplification_ratio`.
-- Provides the evidence needed for the "Storage operational budget" decision
-  gate that is currently listed but unenforced.
+**Proposal:** Add an "Escape Hatches Exercised" section to IMPLEMENTATION_PLAN.md
+after Phase 3.5, and update DESIGN.md to match:
 
-**Exit criteria**: All operator-hot-path latencies stay within 2x of in-memory
-baseline at shard sizes up to 5GB on real object store.
+| Version | Escape Hatch | Outcome | Impact on Later Phases |
+|---------|-------------|---------|----------------------|
+| v0.20 | HOP/SESSION windows | Applied: TUMBLE only in v0.20; HOP/SESSION shipped in v0.21. | Resolved — no impact. |
+| v0.21 | HLL accuracy | Not triggered: accuracy sufficient. | No impact. |
+| v0.22 | DRed recursion | Applied: DRed proved unsound under concurrent deletes. Non-monotone terms rejected with RS-1009. | Phase 4 distributed recursion uses semi-naive only. Non-monotone recursive views remain unsupported. |
 
-### 3.3 Decompose Phase 3 into Risk-Ordered Sub-Phases
+Update DESIGN.md §6.8 to replace "DRed for monotone mixed insert/delete/update
+recursion" with "DRed deferred (proved unsound in v0.22); non-monotone terms
+rejected with RS-1009."
 
-**Problem**: Phase 3 treats recursion and lateral subqueries as equal effort to
-window functions.
+### 3.3 Resolve the Storage Budget Gate Ambiguity
 
-**Proposal**: Reorder Phase 3 by descending risk and add explicit escape hatches:
+**Problem:** The storage gate requires real object-store validation but it's
+unclear whether this has been done.
 
-| Version | Focus | Risk | Escape hatch |
-|---|---|---|---|
-| v0.19 | Window functions (partition recompute) | Medium | Segment-tree deferred; partition-size NOTICE is sufficient |
-| v0.20 | Time windows + watermarks | **High** | If watermark contract proves too restrictive, allow `WATERMARK = PROCESSING_TIME` as default with explicit opt-in to fail-closed |
-| v0.21 | Top-K | Low | N/A |
-| v0.22 | Bootstrap/snapshot | Medium | Sequential bootstrap sufficient; streamed can be v0.22.1 |
-| v0.23 | View-on-view DAG | Medium | Chain only; diamond deferred until frontier meet is proven |
-| v0.24 | Recursion (semi-naive only) | **High** | DRed and full-recompute fallback are v0.24.1; ship monotone-only first |
-| v0.25 | Lateral/SRF/UDF + UDAF hooks | Medium | UDAFs are interface-only; implementation deferred |
-| v0.26–v0.27 | Correctness soak + performance | Low | N/A |
+**Proposal:** Add a note to the storage budget gate documentation in
+IMPLEMENTATION_PLAN.md that explicitly states: "The v0.27 storage budget tests
+validated budgets under `SimRuntime` with in-memory object store. Real S3
+validation at 1GB+ shard sizes is required before Phase 4 v0.30 (exchange)
+ships." This resolves the ambiguity without adding a new roadmap version.
 
-The key change: recursion and time-windows get explicit "monotone-only first"
-escape hatches. If DRed proves intractable in a 10-week budget, the roadmap
-does not stall.
+### 3.4 Add `rockstream sql` to the Design CLI Surface
 
-### 3.4 Add Write-Path Backpressure to the Direct-Write Gateway
+**Problem:** The `rockstream sql "<query>"` subcommand shipped in v0.18 is
+missing from DESIGN.md §14.7.
 
-**Problem**: The direct-write connector has no admission control.
+**Proposal:** Add to §14.7:
 
-**Proposal**: The gateway maintains a per-shard write-credit budget (modeled on
-the source connector's `credits_available()` signal). `COMMIT` blocks if the
-target shard's pending write bytes exceed `direct_write_buffer_limit_bytes`
-(default 64 MB). The blocked session receives a `NOTICE` after 1s and an error
-(`RS-2019 write.shard_backpressure`) after `direct_write_timeout_ms` (default
-30s). This mirrors Kafka's `linger.ms` + `buffer.memory` backpressure model.
+```
+rockstream sql    "<query>"               # parse, lower, and print EXPLAIN
+                                          # INCREMENTAL against the catalog
+```
 
-Add to DESIGN.md §13.5 and IMPLEMENTATION_PLAN.md Phase 8 (v0.43).
+### 3.5 Fix Error Code RS-1009 Range Assignment
 
-### 3.5 Make the Simulation Discipline Continuous from v0.9
+**Problem:** RS-1009 is used for `recursion.non_monotone_not_supported` but
+falls in the RS-1000–1499 "Connector / source / sink" range.
 
-**Problem**: `SimRuntime` is dormant between v0.3 and v0.28.
+**Proposal:** Reassign to RS-1509 (`recursion.non_monotone_not_supported`) in
+the RS-1500–1999 "Schema / DDL validation" range. Update the error code
+registry in `rockstream-types` and the IMPLEMENTATION_PLAN.md reference.
 
-**Proposal**: Starting at v0.9 (epoch commit and replay), every version must
-include at least one `SimRuntime`-driven fault-injection test that exercises the
-version's new correctness boundary:
-- v0.9: kill-inject mid-commit (already exists).
-- v0.13–v0.15: kill-inject mid-join-arrangement-write, verify replay produces
-  identical join output.
-- v0.16–v0.18: inject catalog-corruption (missing law version), verify
-  `RS-5002` fires and the pipeline refuses to attach.
+### 3.6 Document Simulation Fidelity Boundaries
 
-This keeps the simulation muscle exercised so Phase 4 doesn't start cold.
+**Problem:** The simulation testing section (§17) doesn't distinguish between
+behaviors modeled by `SimRuntime` and real S3 behaviors that are not modeled.
 
-### 3.6 Redefine "Developer Preview" Scope Honestly
+**Proposal:** Add a §17.8 "Simulation Fidelity Boundaries" subsection:
 
-**Problem**: v0.18 is not demo-able to external users as currently implemented.
+| Behavior | Modeled by SimRuntime | Real S3 |
+|----------|----------------------|---------|
+| Latency distribution | Uniform random (configurable) | Long-tailed, prefix-dependent |
+| Conditional writes (If-Match) | Yes (in-memory CAS) | Yes (S3 conditional writes) |
+| LIST consistency after PUT | Immediate | Strong (since Dec 2020 for S3; varies for other providers) |
+| Rate limiting (HTTP 429) | Via `buggify!()` injection | Provider-specific, prefix-scoped |
+| Partial object writes | Not modeled | Can occur on large PUTs |
 
-**Proposal**: Redefine the milestones:
+Behaviors not modeled by `SimRuntime` must be covered by integration tests
+against real object storage (MinIO minimum) at the Phase 4 and Phase 6 gates.
 
-| Milestone | Version | Actual meaning |
-|---|---|---|
-| SQL Alpha | v0.18 | Core SQL lowers correctly; explain and fuzzer prove structure. Internal milestone. |
-| Developer Preview | v0.27 | Single-shard SQL engine runs end-to-end queries; external blog post appropriate. |
-| SQL Beta | v0.36 | Multi-shard SQL with exactly-once; external pilot possible. |
+### 3.7 Update Phase Overview Table Completion Status
 
-This aligns expectations with implementation reality and prevents premature
-external exposure that damages credibility.
+**Problem:** The IMPLEMENTATION_PLAN.md phase overview table doesn't show which
+phases are completed.
 
-### 3.7 Budget Documentation as a Version Deliverable
+**Proposal:** Add a "Status" column:
 
-**Problem**: No version budget accounts for docs.
+| Phase | ROADMAP versions | Status | Focus |
+|-------|-----------------|--------|-------|
+| 0 | v0.1–v0.4 | ✅ Complete | Repository, simulation, storage, no-op pipeline |
+| 1 | v0.5–v0.10 | ✅ Complete | Single-shard IVM core (IVM-1 … IVM-3) |
+| 2 | v0.11–v0.18 | ✅ Complete | SQL frontend, joins, set ops (IVM-4 … IVM-6) |
+| 3 | v0.19–v0.26 | ✅ Complete | Advanced operators (IVM-7 … IVM-12) |
+| 3.5 | v0.27 | ✅ Complete | IVM correctness soak (IVM-13) |
+| 4 | v0.28–v0.30 | Not started | Multi-shard execution and exchange |
 
-**Proposal**: Every phase boundary version (v0.10, v0.18, v0.27, v0.36, v0.45,
-v0.52) includes a 2-person-week documentation deliverable in its scope:
-- v0.18: Internal architecture overview (for contributors).
-- v0.27: SQL dialect reference (what works, what doesn't, with examples).
-- v0.36: Distributed deployment quickstart (3 workers, MinIO, end-to-end).
-- v0.45: Connector development guide.
-- v0.52: Full operator guide + runbook.
+### 3.8 Annotate Decision Gate Outcomes
 
-Add these to the ROADMAP common Definition of Done for phase-boundary versions.
+**Problem:** ROADMAP.md decision gates don't record their outcomes.
+
+**Proposal:** Add an "Outcome" column to the decision gates table:
+
+| Gate | After | Question | Outcome |
+|------|-------|----------|---------|
+| Architecture sanity | v0.4 | Do SlateDB, the runtime abstraction, and local developer ergonomics still fit the design? | ✅ Passed. Confirmed. |
+| IVM kernel confidence | v0.10 | Is the core delta engine simple enough to debug, and does replay work cleanly? | ✅ Passed. Full assessment in plans/full-assessment-v0.10.md. |
+| Storage operational budget | v0.10 | Do SlateDB operational budgets hold at 5GB+ shard sizes on real object storage? | ⚠ Partial — validated under SimRuntime. Real S3 validation pending. |
+| SQL scope control | v0.18 | Are we still building the right SQL subset first, or have edge cases started to dominate? | ✅ Passed. SQL Alpha soak clean. |
+| Single-shard correctness | v0.27 | Is the IVM engine correct and fast enough to justify distribution work? | ✅ Passed. TPC-H 22/22, fuzzer, law-equivalence corpus clean. |
 
 ---
 
 ## 4. Markdown Diff / Remediation Recommendations
 
-### 4.1 DESIGN.md — Add Runtime Profile Transition Specification
+### 4.1 DESIGN.md §6.8 — Update Recursion to Reflect DRed Deferral
 
-**Location**: After §3.1 "Runtime Profiles: Tiny to Massive"
+In the compiler strategy selection area of §6.8, replace text describing DRed
+as a live strategy option with:
 
-Add a new subsection `§3.1.1 Profile Transitions`:
+> **DRed (delete-and-rederive) was evaluated in v0.22 and proved unsound under
+> concurrent deletes; non-monotone recursive terms are rejected with `RS-1509
+> recursion.non_monotone_not_supported`.** DRed may be revisited as a future
+> optimization once the distributed recursion surface (Phase 4) stabilizes.
+> The implemented strategies are: semi-naive for monotone insert-only recursion;
+> full recomputation fallback for non-monotone terms.
 
-```markdown
-### 3.1.1 Runtime Profile Transitions
+### 4.2 DESIGN.md §14.7 — Add `rockstream sql` Subcommand
 
-A pipeline transitions between runtime profiles via a control-plane command
-(`ALTER PIPELINE ... SET RUNTIME_PROFILE = 'distributed'`). Transitions are
-**epoch-aligned**: the control plane waits for the current epoch to commit,
-quiesces the pipeline (no new source data accepted), re-plans operator
-placement, and resumes at the next epoch. State is not migrated — it remains
-in the same SlateDB shards on the same object-store prefix. Only the
-placement map and exchange topology change.
+Add after `rockstream debug    arrangement ...`:
 
-Transitions are valid in one direction only: `embedded → single_worker →
-distributed`. Downgrade is not supported; operators must destroy and recreate
-the pipeline at a lower profile. This prevents the ambiguity of merging
-multiple distributed shards back into one embedded shard.
-
-The `visible_frontier` semantics do NOT change mid-pipeline. A pipeline
-created in `embedded` mode that transitions to `distributed` retains its
-`visible_frontier` on the originating worker; distributed reads use
-`durable_frontier`. The transition command emits a `NOTICE` explaining
-this semantic change.
+```
+rockstream sql    "<query>"               # parse, lower to PlanNode IR, and print
+                                          # EXPLAIN INCREMENTAL against the catalog
 ```
 
-### 4.2 IMPLEMENTATION_PLAN.md — Correct Phase 2 Exit Criteria
+### 4.3 DESIGN.md §14.14 — Fix RS-1009 Range
 
-**Location**: Phase 2 exit criteria block
+Move RS-1009 from the connector range to the DDL range. In the canonical
+registry, replace:
 
-Replace:
-```markdown
-- TPC-H Q1, Q3, Q5, Q6, Q11, Q21 all pass parity vs. DataFusion batch.
+```
+RS-1009  recursion.non_monotone_not_supported
 ```
 
-With:
-```markdown
-- TPC-H Q1, Q3, Q5, Q6, Q11, Q21 all pass *plan-level* parity: lowered
-  PlanNode graph is structurally equivalent to the expected join/aggregate/
-  set-op topology. Batch-execution parity (actual row-level output equality)
-  is deferred to Phase 3.5's TPC-H 22/22 correctness soak.
+with (in the RS-1500–1999 Schema / DDL validation section):
+
+```
+RS-1509  recursion.non_monotone_not_supported
 ```
 
-### 4.3 ROADMAP.md — Clarify Milestone Definitions
+### 4.4 DESIGN.md §17 — Add Simulation Fidelity Boundaries
 
-**Location**: Public Milestones table
+Add a new §17.8 "Simulation Fidelity Boundaries" subsection documenting
+the gap between SimRuntime's in-memory object store and real S3 behavior,
+per the table in §3.6.
 
-Replace the current v0.18 row:
+### 4.5 IMPLEMENTATION_PLAN.md — Update Phase Overview with Status
+
+Add a Status column to the Phase overview table showing completion state for
+Phases 0–3.5 (all ✅ Complete).
+
+### 4.6 IMPLEMENTATION_PLAN.md — Annotate IVM-10 DRed Deferral
+
+In Phase 3, Milestone IVM-10 (Recursion), update the compiler strategy
+selection to note that DRed was deferred:
+
+> **v0.22 outcome**: DRed proved unsound under concurrent deletes.
+> Non-monotone recursive terms are rejected with RS-1509. Only semi-naive
+> (monotone insert-only) and full recomputation are implemented.
+
+### 4.7 IMPLEMENTATION_PLAN.md — Add Escape-Hatch Summary After Phase 3.5
+
+Add a new section after the Phase 3.5 exit criteria:
+
 ```markdown
-| Developer Preview | v0.18 | Single-shard SQL engine demo-able to external users. Blog post + feedback loop. |
-| SQL Alpha | v0.18 | Core SQL views, joins, set ops, and `EXPLAIN` work on one shard. |
+### Escape Hatches Exercised (Phase 0–3.5 Summary)
+
+| Version | Escape Hatch | Outcome | Impact on Later Phases |
+|---------|-------------|---------|----------------------|
+| v0.20 | HOP/SESSION windows deferred | Applied: TUMBLE only in v0.20. HOP/SESSION shipped in v0.21 — resolved. | None. |
+| v0.21 | HLL accuracy fallback | Not triggered: HLL accuracy sufficient for cost-model correctness. | None. |
+| v0.22 | DRed recursion unsound | Applied: DRed proved unsound under concurrent deletes. Non-monotone terms rejected with RS-1509. | Phase 4 distributed recursion uses semi-naive only. Non-monotone recursive views remain unsupported. DRed is a candidate future optimization. |
 ```
 
-With:
-```markdown
-| SQL Alpha (internal) | v0.18 | SQL compilation, plan lowering, explain, and deterministic soak pass. Internal validation gate — not externally demo-able. |
-| Developer Preview | v0.27 | Single-shard SQL engine runs end-to-end with real data. First external demo and blog post. |
-```
+### 4.8 IMPLEMENTATION_PLAN.md — Clarify Storage Budget Gate Scope
 
-### 4.4 IMPLEMENTATION_PLAN.md — Add Storage Budget Version
+Add a note to the storage budget gate section:
 
-**Location**: Between Phase 2 (v0.18) and Phase 3 (v0.19) sections
+> **v0.27 status**: storage budget tests validated under `SimRuntime` with
+> in-memory object store. The PUT p99 < 200ms and GET p99 < 100ms gates pass
+> in-memory. Real S3 validation at 1GB+ shard sizes is required as a Phase 4
+> entry condition before v0.30 (exchange) ships.
 
-Add:
-```markdown
-### Storage Operational Budget Gate (between Phase 2 and Phase 3)
+### 4.9 ROADMAP.md — Update Design Freeze Directive
 
-Before Phase 3 begins, the project must prove that the SlateDB operational
-budgets specified in DESIGN.md §5.4 hold under real object-store latency
-at shard sizes exceeding 1 GB. This is not a new roadmap version — it is a
-gate that must be passed as part of the v0.19 entry criteria.
+Replace the current design freeze text to acknowledge deferral to v0.27:
 
-**Gate evidence required:**
-- Object-store request p99 latencies for PUT/GET/LIST at 1GB and 5GB shard
-  sizes on a real S3-compatible endpoint.
-- Manifest write cadence measured under steady-state (100k rows/s source)
-  and bursty (1M rows/s for 10s) load.
-- WAL listing cache hit ratio > 99% under sustained operation.
-- `write_amplification_ratio` measured and recorded.
-- `min_epoch_ms` floor demonstrably prevents manifest churn.
+> **Design freeze after v0.27.** The design freeze was originally specified for
+> v0.10 but was deferred through the single-shard implementation phase
+> (v0.11–v0.27) to allow design refinements informed by implementation
+> experience. As of v0.27, DESIGN.md has stabilized at v3.28. From this point
+> forward, new sections may not be added to DESIGN.md or IVM.md unless they are
+> required to unblock a specific coded milestone.
 
-If any budget is exceeded by >2x the specified target, the project must
-file a tracking issue and either adjust the target or implement a mitigation
-before advancing past v0.19.
-```
+### 4.10 ROADMAP.md — Record Decision Gate Outcomes
 
-### 4.5 DESIGN.md — Specify Direct-Write Backpressure
+Update the decision gates table to include outcome annotations for passed
+gates (v0.4, v0.10, v0.18, v0.27), per the table in §3.8.
 
-**Location**: §13.5 (Internal Source Connector section)
+### 4.11 ROADMAP.md — Annotate Escape Hatches in Version Table
 
-Add after the `ROLLBACK` paragraph:
-```markdown
-**Write admission control.** The gateway tracks per-shard pending write bytes
-(`direct_write_pending_bytes{shard_id}`). When pending bytes exceed
-`direct_write_buffer_limit_bytes` (default 64 MB per shard), new `COMMIT`
-operations on sessions targeting that shard are blocked with a
-`RS-2019 write.shard_backpressure` NOTICE after `direct_write_notice_ms`
-(default 1000 ms) and rejected with the same error code after
-`direct_write_timeout_ms` (default 30000 ms). This prevents unbounded
-write-buffer growth when downstream IVM processing or object-store writes
-cannot keep pace with application writes.
+In the Advanced IVM version table, add escape-hatch annotations to v0.20
+and v0.22:
 
-The admission signal is the shard's `credits_available()` equivalent for the
-internal source: when the shard's uncommitted epoch buffer exceeds the limit,
-credits are exhausted and writes queue. This mirrors the Kafka source's
-credit-based flow control from §13.3.
-```
-
-### 4.6 ROADMAP.md — Add Simulation Continuity Requirement
-
-**Location**: Common Definition of Done section
-
-Add bullet:
-```markdown
-- Any version that introduces a new durable state transition (arrangement
-  write, epoch commit, catalog mutation, checkpoint creation) includes at
-  least one `SimRuntime` fault-injection test exercising kill/restart across
-  that transition. The simulation discipline is continuous from v0.9, not
-  deferred to Phase 4.
-```
+- v0.20 Scope: add "**Escape hatch applied**: TUMBLE only implemented;
+  HOP/SESSION deferred to v0.21."
+- v0.22 Scope: add "**Escape hatch applied**: DRed proved unsound under
+  concurrent deletes; non-monotone terms rejected with RS-1509."
 
 ---
 
-## 5. Risk Matrix (Post-v0.18)
+## 5. Cross-Document Alignment Findings
 
-| Risk | Likelihood | Impact | Mitigation |
-|---|---|---|---|
-| Phase 3 recursion proves intractable in 10pw | Medium | High — blocks all subsequent phases | Ship monotone-only (§3.3); DRed as follow-up |
-| SlateDB compaction debt exceeds budget at 10GB+ | Medium | High — invalidates shard-size target | Add storage budget gate (§3.2) before Phase 3 |
-| MergeLaw abstraction proves over-engineered | Low | Medium — refactor cost in Phase 4 | Payoff starts at v0.30; re-evaluate at CRDT gate |
-| External "Developer Preview" demo damages credibility | High | Medium — perception, not technical | Redefine milestone (§3.6); no blog until v0.27 |
-| Simulation atrophy between v0.3 and v0.28 | High | High — Phase 4 correctness risk | Continuous simulation from v0.9 (§3.5) |
-| v0.43 scope creep delays Phase 8 by 2-3x | High | Medium — schedule pressure | Split v0.43 into 3 versions (CRDT, OLTP ergonomics, view lifecycle) |
-
----
-
-## 6. Positive Observations
-
-For balance, five things the specification documents do exceptionally well:
-
-1. **The error-code taxonomy with CI enforcement** is best-in-class. No
-   production streaming system (Flink, Kafka Streams, Materialize, RisingWave)
-   has this discipline. It will pay dividends in support and debugging from
-   day one.
-
-2. **The decision-gate framework** with explicit "default action is not to
-   accelerate" is structurally resistant to premature optimization pressure.
-   This is the single most important cultural artifact in the project.
-
-3. **The explicit non-goals list** prevents scope creep by naming temptations.
-   "Not an OLTP Postgres clone" and "no global write sequence number" are
-   particularly important boundaries that other projects (Materialize, CockroachDB)
-   learned the hard way.
-
-4. **The connector contract's `credits_available()` + `should_flush()`
-   separation** solves the small-files problem for Iceberg/Delta sinks without
-   breaking exactly-once semantics. This is a novel contribution.
-
-5. **The MergeLaw `not_merge_safe_reason` closed enum** makes the system
-   self-documenting: operators can inspect exactly why a given operator cannot
-   use combiners or pushdown, rather than guessing. No existing system exposes
-   this level of algebraic introspection to the user.
+| # | Finding | Documents | Severity | Recommendation |
+|---|---------|-----------|----------|----------------|
+| 1 | DESIGN.md §6.8 lists DRed as a live strategy; IMPLEMENTATION_PLAN IVM-10 does the same; but v0.22 sign-off documents DRed deferral. Specification-implementation divergence. | DESIGN × IMPL × Sign-off | High | Update both documents per §4.1, §4.6. |
+| 2 | ROADMAP.md design freeze says "after v0.10" but DESIGN.md went through 15 revisions since v0.10. The directive is not enforced. | ROADMAP × DESIGN | High | Update freeze to "after v0.27" per §4.9. |
+| 3 | IMPLEMENTATION_PLAN.md Phase overview table has no completion status column. All Phase 0–3.5 entries are complete but unmarked. | IMPL | Medium | Add Status column per §4.5. |
+| 4 | `rockstream sql` subcommand (v0.18) is absent from DESIGN.md §14.7 CLI surface. | DESIGN × IMPL | Medium | Add per §4.2. |
+| 5 | RS-1009 (recursion rejection) is in the RS-1000–1499 connector range, not the RS-1500–1999 DDL range where it belongs. | DESIGN × IMPL | Low | Reassign to RS-1509 per §4.3. |
+| 6 | ROADMAP decision gates have no recorded outcomes. Gates at v0.4, v0.10, v0.18, v0.27 have all passed but the table doesn't show this. | ROADMAP | Medium | Add outcomes per §4.10. |
+| 7 | ROADMAP escape-hatch outcomes not annotated on version rows. v0.20 and v0.22 exercised escape hatches but the version descriptions don't note this. | ROADMAP | Medium | Add annotations per §4.11. |
+| 8 | Storage budget gate status is ambiguous — validated under SimRuntime but gate requires "real S3-compatible endpoint." | IMPL × ROADMAP | High | Resolve per §4.8. |
 
 ---
 
-## 7. Conclusion
+## 6. Scaling Spectrum Assessment
 
-The v0.18 milestone represents a credible single-shard SQL compilation and
-analysis engine. The theoretical foundations (DBSP, frontier algebra, merge laws)
-are sound. The sequencing philosophy (correctness before scale, simulation from
-the beginning, operability as a phase deliverable) is architecturally mature.
+### Single-Process Ergonomics (Grade: A-)
 
-The primary risk at this juncture is not technical unsoundness — it is the
-growing gap between specification ambition and implementation reality. The
-project must resist the temptation to specify the v0.55 world in detail while
-the v0.19 world remains unbuilt. The design freeze should be enforced
-aggressively, the milestone definitions should be honest about what has been
-proven, and the next 9 versions (Phase 3) should be risk-ordered with explicit
-escape hatches for the hard problems (recursion, time-window watermarks).
+Significant improvement since v0.10:
 
-The single most impactful action the project can take before v0.19 is to run
-the existing test suite against a real object store and record the numbers.
-Everything else in the design depends on SlateDB being fast enough at scale.
-That assumption is currently unvalidated.
+- The `rockstream sql "<query>"` subcommand (v0.18) provides a zero-setup
+  way to explore SQL lowering and explain output.
+- The `GENERATE ROWS` source enables a working materialized view in under
+  two minutes with no external dependencies.
+- The embedded runtime profile correctly elides distributed overhead.
+- Error codes with `RS-XXXX` are consistently applied.
+- The v0.27 performance profile demonstrates ≥10x IVM-vs-batch speedup at 1%
+  change rate.
+
+The one remaining concern is cognitive load: the developer story requires
+understanding Z-set semantics, epoch boundaries, and frontier vocabulary to
+interpret `EXPLAIN INCREMENTAL` output. This is inherent to the domain but
+could be mitigated with a "Getting Started" tutorial that explains these
+concepts in 5 minutes.
+
+### Cloud-Native Distributed Scale (Grade: B)
+
+The architecture remains sound in principle. The v0.10 concerns are largely
+addressed in the design (arrangement working-set management, exchange
+thresholds, write amplification budgets). However:
+
+- **The distributed phase is entirely unproven.** All 27 versions have run
+  single-shard. The multi-shard exchange, frontier protocol, checkpoint
+  coordination, and recovery mechanisms exist only as design sections.
+- **Object-store request amplification is the real scaling bottleneck.** The
+  v0.27 storage budget tests validate per-shard costs, but the cluster-wide
+  cost is `per_shard_cost × shard_count`. At 1000 shards with 100ms epochs,
+  the cluster produces 10,000 object-store writes/second sustained. This is
+  within S3's documented limits but leaves no margin for spikes.
+- **The frontier aggregator's scalability** with "thousands of shards ×
+  hundreds of operators" is specified but unvalidated. Phase 5 must prove
+  this or the architecture has a hidden centralization bottleneck.
+
+---
+
+## 7. Performance Engineering Assessment
+
+### Throughput
+
+The v0.27 benchmarks demonstrate:
+- Filter throughput: ≥1M rows/s (in-memory), ≥500k rows/s (local FS)
+- GROUP BY SUM: ≥200k rows/s (in-memory), ≥100k rows/s (local FS)
+- GROUP BY MIN: ≥100k rows/s (in-memory), ≥50k rows/s (local FS)
+- IVM vs batch speedup: ≥10x at 1% change rate
+
+These numbers meet the Phase 1 targets. The Phase 3.5 targets (≥10x vs
+batch for TPC-H at 1% change rate) are also met.
+
+### Latency
+
+The embedded latency class validation (p95 `commit_to_visible_ms` < 5ms for
+trivial workloads) is specified but the v0.27 sign-off focuses on throughput
+benchmarks, not latency. The latency-class taxonomy (§3.0) is well-designed
+but needs quantitative validation before Phase 4.
+
+### Resource Utilization
+
+The per-law RMW-avoidance ratio is a strong signal:
+- `WeightAdd/v1` and `SumCount/v1`: 100% avoidance (abelian group)
+- `MaxRegister/v1` and `MinRegister/v1`: 0% avoidance (requires RMW)
+- `HyperLogLog/v1` and `BloomUnion/v1`: 0% avoidance (requires RMW)
+
+The 100% avoidance for the hot-path aggregate laws validates the merge-law
+architecture's performance claim. The 0% for semilattice laws is expected and
+correctly documented.
+
+---
+
+## 8. Operability Assessment
+
+### Day-0 Experience (Grade: A)
+
+Excellent. `rockstream start --storage=./data` + `CREATE SOURCE FROM GENERATE
+ROWS` + `CREATE MATERIALIZED VIEW` is a compelling zero-dependency onboarding
+story. The `rockstream sql` subcommand adds a lightweight exploration mode.
+
+### Day-1 Operations (Grade: B+)
+
+`EXPLAIN INCREMENTAL` with three levels (default, VERBOSE, ANALYZE) is
+well-specified. The backfill cost preview prompt prevents accidental expensive
+deployments. Workload DDL with SLO-driven configuration is intuitive. Named
+degraded states with audit trail are production-ready discipline.
+
+### Day-2 Operations (Grade: Incomplete)
+
+The observability stack (metrics, tracing, dashboards, support bundle) is
+extensively specified but ships primarily in Phase 10 (v0.47). Core hot-path
+metrics ship in v0.10/v0.11, which is correct, but the full operational
+toolkit (OTEL traces, admin CLI, IVM debugger, dashboard templates) is
+20+ versions away from the current state.
+
+---
+
+## 9. Final Recommendations
+
+The project is at a critical inflection point. The single-shard IVM engine is
+proven correct and performant. The next 10 versions (v0.28–v0.37) introduce
+the distributed execution layer that will determine whether the architecture
+delivers on its promise. Five actions should be taken before v0.28 begins:
+
+1. **Enforce the design freeze now.** DESIGN.md at v3.28 is comprehensive
+   enough for the distributed phase. New decisions should be GitHub issues
+   with targeted corrections, not document revisions. Activate the CI
+   enforcement described in ROADMAP.md.
+
+2. **Run the storage budget benchmarks against real object storage.** The
+   v0.27 benchmarks against SimRuntime are necessary but not sufficient.
+   Before Phase 4 begins, run the same suite against MinIO over a real
+   network at 1GB and 5GB shard sizes. Record the results. This is a
+   one-day effort that could prevent a multi-month rearchitecture.
+
+3. **Update DESIGN.md, IMPLEMENTATION_PLAN.md, and ROADMAP.md** to reflect
+   the escape-hatch outcomes, decision gate results, and phase completion
+   status documented in this assessment. These documents are the project's
+   institutional memory; they must reflect reality.
+
+4. **Split Phase 4 if scope exceeds budget.** v0.28 (control plane + worker
+   discovery) is individually substantial. If it exceeds 10 person-weeks,
+   split rather than rush. The roadmap philosophy ("split before rushing")
+   explicitly endorses this.
+
+5. **Track the DRed deferral and sliding-window segment-tree as formal
+   follow-up issues.** These are not blockers but they are SQL coverage
+   gaps that prospective users will notice. They should be visible in the
+   project's issue tracker, not buried in sign-off files.
