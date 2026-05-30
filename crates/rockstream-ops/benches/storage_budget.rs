@@ -385,7 +385,18 @@ fn bench_in_memory(c: &mut Criterion) {
     bench_get_1kib(c, "in_memory", store);
 }
 
+/// Benchmark: PUT 1 KiB to Azure (if configured and gates enabled).
+/// Skipped if STORAGE_BUDGET_RUN_GATES is not set to avoid hanging on credential validation.
 fn bench_azure(c: &mut Criterion) {
+    let run_gates = std::env::var("STORAGE_BUDGET_RUN_GATES")
+        .ok()
+        .map(|s| s == "1")
+        .unwrap_or(false);
+
+    if !run_gates {
+        return;
+    }
+
     match azure_store() {
         Some(store) => {
             bench_put_1kib(c, "azure", store.clone());
