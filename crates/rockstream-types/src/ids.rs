@@ -55,6 +55,11 @@ define_id!(
     LeaseToken, u64, "lease"
 );
 
+define_id!(
+    /// Identifies a workload (resource and SLO grouping).
+    WorkloadId, u64, "workload"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

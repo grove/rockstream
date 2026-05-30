@@ -11,13 +11,23 @@
 //! In v0.12 the backing store is in-memory (HashMap). The interface is
 //! designed to be backed by `ShardDb` in a later version without changing
 //! the public API.
+//!
+//! ## v0.16 additions
+//!
+//! - `CatalogEntry` gains `state`, `workload_name`, `depends_on`, and
+//!   `backfill_started_epoch` fields.
+//! - `CatalogStore` gains workload-management methods, `pause_view`,
+//!   `resume_view`, `show_view_status`, and `show_backfill_status`.
 
 use crate::compat::check_schema_change;
 use crate::error::CatalogError;
 use crate::schema::SchemaVersion;
+use crate::workload_store::WorkloadStore;
 use rockstream_plan::PlanNode;
 use rockstream_types::ids::NamespaceId;
 use rockstream_types::laws::registry::LawRegistry;
+use rockstream_types::view_lifecycle::{BackfillStatus, ViewState, ViewStatus};
+use rockstream_types::workload::WorkloadDef;
 use std::collections::HashMap;
 
 /// The kind of catalog entry.
@@ -42,6 +52,14 @@ pub struct CatalogEntry {
     pub schema: SchemaVersion,
     /// Raw persisted plan bytes (present only for views).
     pub plan_bytes: Option<Vec<u8>>,
+    /// Lifecycle state (only meaningful for views).
+    pub state: ViewState,
+    /// Name of the assigned workload (only meaningful for views).
+    pub workload_name: Option<String>,
+    /// Names of sources/views this view directly depends on.
+    pub depends_on: Vec<String>,
+    /// Epoch from which the current backfill started (only set during backfill).
+    pub backfill_started_epoch: Option<u64>,
 }
 
 /// Key type for catalog lookup.
@@ -60,6 +78,8 @@ struct CatalogKey {
 #[derive(Debug, Default)]
 pub struct CatalogStore {
     entries: HashMap<CatalogKey, CatalogEntry>,
+    /// Workload registry and namespace defaults (v0.16).
+    workloads: WorkloadStore,
 }
 
 impl CatalogStore {
@@ -94,6 +114,10 @@ impl CatalogStore {
                 kind: EntryKind::Source,
                 schema,
                 plan_bytes: None,
+                state: ViewState::Running,
+                workload_name: None,
+                depends_on: Vec::new(),
+                backfill_started_epoch: None,
             },
         );
         Ok(())
@@ -103,6 +127,10 @@ impl CatalogStore {
     ///
     /// Returns `CatalogError::AlreadyExists` if a source or view with the
     /// same name already exists in the namespace.
+    ///
+    /// `depends_on` lists the names of sources/views this view reads from.
+    /// `workload_name` optionally assigns the view to a named workload
+    /// (falls back to the namespace default if `None`).
     pub fn register_view(
         &mut self,
         namespace_id: NamespaceId,
@@ -110,7 +138,36 @@ impl CatalogStore {
         schema: SchemaVersion,
         plan_bytes: Option<Vec<u8>>,
     ) -> Result<(), CatalogError> {
+        self.register_view_with_options(namespace_id, name, schema, plan_bytes, vec![], None)
+    }
+
+    /// Register a new view with explicit dependency and workload metadata.
+    ///
+    /// This is the full-featured variant used by v0.16 DDL. `register_view`
+    /// delegates here with empty `depends_on` and `None` workload.
+    pub fn register_view_with_options(
+        &mut self,
+        namespace_id: NamespaceId,
+        name: impl Into<String>,
+        schema: SchemaVersion,
+        plan_bytes: Option<Vec<u8>>,
+        depends_on: Vec<String>,
+        workload_name: Option<String>,
+    ) -> Result<(), CatalogError> {
         let name = name.into();
+        // Validate workload if provided, otherwise fall back to namespace default.
+        let resolved_workload = match &workload_name {
+            Some(wl) => {
+                if self.workloads.get_workload(namespace_id, wl).is_none() {
+                    return Err(CatalogError::WorkloadNotFound { name: wl.clone() });
+                }
+                Some(wl.clone())
+            }
+            None => self
+                .workloads
+                .get_namespace_default(namespace_id)
+                .map(str::to_owned),
+        };
         let key = CatalogKey {
             namespace_id,
             name: name.clone(),
@@ -126,6 +183,10 @@ impl CatalogStore {
                 kind: EntryKind::View,
                 schema,
                 plan_bytes,
+                state: ViewState::Running,
+                workload_name: resolved_workload,
+                depends_on,
+                backfill_started_epoch: None,
             },
         );
         Ok(())
@@ -227,6 +288,207 @@ impl CatalogStore {
     /// Returns true if the catalog is empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    // ─── v0.16: Workload DDL ─────────────────────────────────────────────────
+
+    /// Create a workload in the namespace — `CREATE WORKLOAD`.
+    ///
+    /// Returns `RS-1006` if a workload with that name already exists.
+    pub fn create_workload(
+        &mut self,
+        namespace_id: NamespaceId,
+        def: WorkloadDef,
+    ) -> Result<(), CatalogError> {
+        self.workloads.create_workload(namespace_id, def)
+    }
+
+    /// Retrieve a workload definition by name.
+    pub fn get_workload(&self, namespace_id: NamespaceId, name: &str) -> Option<&WorkloadDef> {
+        self.workloads.get_workload(namespace_id, name)
+    }
+
+    /// Drop a workload — validates that no views are still assigned to it.
+    ///
+    /// Returns `RS-1005` if the workload does not exist.
+    /// Returns `CatalogError::AlreadyExists` if views still reference it
+    /// (caller should treat this as a dependency error).
+    pub fn drop_workload(
+        &mut self,
+        namespace_id: NamespaceId,
+        name: &str,
+    ) -> Result<WorkloadDef, CatalogError> {
+        // Check for dependent views.
+        let in_use = self.entries.values().any(|e| {
+            e.namespace_id == namespace_id
+                && e.kind == EntryKind::View
+                && e.workload_name.as_deref() == Some(name)
+        });
+        if in_use {
+            return Err(CatalogError::AlreadyExists {
+                name: format!("workload '{name}' is still referenced by one or more views"),
+            });
+        }
+        self.workloads.drop_workload(namespace_id, name)
+    }
+
+    /// Set the namespace-level default workload —
+    /// `ALTER NAMESPACE ... SET DEFAULT WORKLOAD`.
+    ///
+    /// Returns `RS-1005` if the named workload does not exist.
+    pub fn set_namespace_default_workload(
+        &mut self,
+        namespace_id: NamespaceId,
+        workload_name: &str,
+    ) -> Result<(), CatalogError> {
+        self.workloads
+            .set_namespace_default(namespace_id, workload_name)
+    }
+
+    /// Get the current namespace-level default workload name.
+    pub fn get_namespace_default_workload(&self, namespace_id: NamespaceId) -> Option<&str> {
+        self.workloads.get_namespace_default(namespace_id)
+    }
+
+    /// Assign a workload to an existing view —
+    /// `ALTER MATERIALIZED VIEW ... SET WORKLOAD = <name>`.
+    ///
+    /// Returns `RS-1005` if the workload does not exist.
+    /// Returns `CatalogError::NotFound` if the view does not exist.
+    pub fn assign_workload_to_view(
+        &mut self,
+        namespace_id: NamespaceId,
+        view_name: &str,
+        workload_name: &str,
+    ) -> Result<(), CatalogError> {
+        if self
+            .workloads
+            .get_workload(namespace_id, workload_name)
+            .is_none()
+        {
+            return Err(CatalogError::WorkloadNotFound {
+                name: workload_name.to_owned(),
+            });
+        }
+        let key = CatalogKey {
+            namespace_id,
+            name: view_name.to_owned(),
+        };
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .ok_or_else(|| CatalogError::NotFound {
+                name: view_name.to_owned(),
+            })?;
+        entry.workload_name = Some(workload_name.to_owned());
+        Ok(())
+    }
+
+    // ─── v0.16: View Lifecycle ────────────────────────────────────────────────
+
+    /// Pause a materialized view — `PAUSE MATERIALIZED VIEW <name>`.
+    ///
+    /// Returns `RS-1007` if the view is already paused.
+    /// Returns `CatalogError::NotFound` if the view does not exist.
+    pub fn pause_view(
+        &mut self,
+        namespace_id: NamespaceId,
+        view_name: &str,
+    ) -> Result<(), CatalogError> {
+        let key = CatalogKey {
+            namespace_id,
+            name: view_name.to_owned(),
+        };
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .ok_or_else(|| CatalogError::NotFound {
+                name: view_name.to_owned(),
+            })?;
+        if entry.state == ViewState::Paused {
+            return Err(CatalogError::ViewAlreadyPaused {
+                name: view_name.to_owned(),
+            });
+        }
+        entry.state = ViewState::Paused;
+        Ok(())
+    }
+
+    /// Resume a paused materialized view — `RESUME MATERIALIZED VIEW <name>`.
+    ///
+    /// Returns `RS-1008` if the view is not paused.
+    /// Returns `CatalogError::NotFound` if the view does not exist.
+    pub fn resume_view(
+        &mut self,
+        namespace_id: NamespaceId,
+        view_name: &str,
+    ) -> Result<(), CatalogError> {
+        let key = CatalogKey {
+            namespace_id,
+            name: view_name.to_owned(),
+        };
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .ok_or_else(|| CatalogError::NotFound {
+                name: view_name.to_owned(),
+            })?;
+        if entry.state != ViewState::Paused {
+            return Err(CatalogError::ViewNotPaused {
+                name: view_name.to_owned(),
+            });
+        }
+        entry.state = ViewState::Running;
+        Ok(())
+    }
+
+    // ─── v0.16: SHOW commands ─────────────────────────────────────────────────
+
+    /// Return a status row for every view in the namespace —
+    /// `SHOW VIEW STATUS FOR NAMESPACE`.
+    pub fn show_view_status(&self, namespace_id: NamespaceId) -> Vec<ViewStatus> {
+        self.entries
+            .values()
+            .filter(|e| e.namespace_id == namespace_id && e.kind == EntryKind::View)
+            .map(|e| {
+                let workload = e
+                    .workload_name
+                    .as_deref()
+                    .and_then(|wn| self.workloads.get_workload(namespace_id, wn));
+                ViewStatus::new(
+                    namespace_id,
+                    &e.name,
+                    e.state.clone(),
+                    workload,
+                    e.depends_on.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Return backfill progress for a single view —
+    /// `SHOW BACKFILL STATUS FOR MATERIALIZED VIEW <name>`.
+    ///
+    /// Returns `CatalogError::NotFound` if the view does not exist.
+    pub fn show_backfill_status(
+        &self,
+        namespace_id: NamespaceId,
+        view_name: &str,
+    ) -> Result<BackfillStatus, CatalogError> {
+        let entry = self
+            .entries
+            .get(&CatalogKey {
+                namespace_id,
+                name: view_name.to_owned(),
+            })
+            .ok_or_else(|| CatalogError::NotFound {
+                name: view_name.to_owned(),
+            })?;
+        Ok(BackfillStatus {
+            view_name: entry.name.clone(),
+            state: entry.state.clone(),
+            backfill_started_epoch: entry.backfill_started_epoch,
+        })
     }
 }
 
