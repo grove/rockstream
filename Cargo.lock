@@ -3588,7 +3588,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "clap",
  "datafusion",
@@ -3604,7 +3604,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-catalog"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "rockstream-diff",
  "rockstream-plan",
@@ -3616,14 +3616,14 @@ dependencies = [
 
 [[package]]
 name = "rockstream-cli"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "rockstream-types",
 ]
 
 [[package]]
 name = "rockstream-connectors"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "async-trait",
  "rand 0.8.6",
@@ -3634,7 +3634,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-control"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "rockstream-types",
  "serde",
@@ -3645,7 +3645,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-diff"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "rockstream-plan",
  "rockstream-types",
@@ -3653,19 +3653,20 @@ dependencies = [
 
 [[package]]
 name = "rockstream-gateway"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "rockstream-types",
 ]
 
 [[package]]
 name = "rockstream-ops"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "arrow",
  "async-trait",
  "criterion",
  "datafusion",
+ "rockstream-plan",
  "rockstream-sim",
  "rockstream-types",
  "tokio",
@@ -3674,12 +3675,13 @@ dependencies = [
 
 [[package]]
 name = "rockstream-oracle"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "arrow",
  "datafusion",
  "object_store 0.12.5",
  "proptest",
+ "rockstream-catalog",
  "rockstream-diff",
  "rockstream-ops",
  "rockstream-plan",
@@ -3691,14 +3693,14 @@ dependencies = [
 
 [[package]]
 name = "rockstream-plan"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "rockstream-types",
 ]
 
 [[package]]
 name = "rockstream-runtime"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "async-trait",
  "object_store 0.12.5",
@@ -3719,7 +3721,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sim"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3731,7 +3733,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-sql"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "datafusion",
  "rand 0.8.6",
@@ -3745,7 +3747,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-storage"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "bytes",
  "object_store 0.12.5",
@@ -3759,7 +3761,7 @@ dependencies = [
 
 [[package]]
 name = "rockstream-types"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "arrow",
  "serde",

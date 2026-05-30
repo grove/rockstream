@@ -11,6 +11,7 @@ arrow = { workspace = true }
 datafusion = { workspace = true }
 rockstream-types = { workspace = true }
 serde_json = { workspace = true }
+rockstream-plan = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -19,4 +20,5 @@ rockstream-diff = { workspace = true }
 rockstream-ops = { workspace = true }
 rockstream-plan = { workspace = true }
 rockstream-storage = { workspace = true }
+rockstream-catalog = { workspace = true }
 object_store = { workspace = true }

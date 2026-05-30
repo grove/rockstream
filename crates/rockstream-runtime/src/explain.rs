@@ -74,6 +74,7 @@ fn kind_label(kind: &OpKind) -> String {
         OpKind::Join => "Join".to_string(),
         OpKind::Union => "Union".to_string(),
         OpKind::Sink { name } => format!("Sink({name})"),
+        OpKind::Window { strategy } => format!("Window[{strategy:?}]"),
     }
 }
 

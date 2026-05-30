@@ -37,6 +37,8 @@ pub enum NotMergeSafeReason {
     UnknownUdafProperties,
     /// Operator has no arrangement state (stateless linear operator).
     Stateless,
+    /// Window ranking functions recompute the entire partition; not merge-safe.
+    PartitionRecomputation,
 }
 
 impl NotMergeSafeReason {
@@ -47,6 +49,7 @@ impl NotMergeSafeReason {
             Self::ClampNotALaw => "clamp_not_a_law",
             Self::UnknownUdafProperties => "unknown_udaf_properties",
             Self::Stateless => "stateless",
+            Self::PartitionRecomputation => "partition_recomputation",
         }
     }
 
@@ -60,6 +63,7 @@ impl NotMergeSafeReason {
             Self::ClampNotALaw,
             Self::UnknownUdafProperties,
             Self::Stateless,
+            Self::PartitionRecomputation,
         ]
     }
 }
