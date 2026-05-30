@@ -56,6 +56,38 @@ pub enum PlanNode {
         input: Box<PlanNode>,
         window_exprs: Vec<WindowExpr>,
     },
+    /// Tumbling time-window operator (v0.20).
+    ///
+    /// Groups rows into fixed-size, non-overlapping time windows of
+    /// `window_size_ms` milliseconds. Windows close when the event-time
+    /// watermark advances past the window end. `time_col` is the index of
+    /// the column containing the event timestamp (i64 milliseconds, big-endian
+    /// 8 bytes). Late rows (arriving after window close) are handled per
+    /// `late_data_policy`. Watermark advances are tracked via `MaxRegister/v1`
+    /// (semilattice, idempotent).
+    TumbleWindow {
+        input: Box<PlanNode>,
+        /// Column index holding the event timestamp (i64 ms, BE 8 bytes).
+        time_col: usize,
+        /// Duration of each tumbling window in milliseconds.
+        window_size_ms: i64,
+        /// Policy for rows that arrive after the window has closed.
+        late_data_policy: LateDataPolicy,
+    },
+}
+
+/// Policy for late-arriving rows in time-window operators.
+///
+/// A row is "late" if its event timestamp falls within a window that has
+/// already been closed by the watermark.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LateDataPolicy {
+    /// Silently discard the late row. The closed window output is unchanged.
+    Drop,
+    /// Retract the previous window output and re-emit including the late row.
+    Update,
+    /// Route the late row to a named side-channel sink.
+    RouteToSink { sink_name: String },
 }
 
 /// A scalar expression in the plan IR.
@@ -183,6 +215,14 @@ pub enum OpKind {
     Sink { name: String },
     /// Window function operator (v0.19).
     Window { strategy: WindowStrategy },
+    /// Tumbling time-window operator (v0.20).
+    ///
+    /// Watermark state tracked via `MaxRegister/v1`; output emitted once per
+    /// window when the watermark advances past the window end.
+    TumbleWindow {
+        window_size_ms: i64,
+        late_data_policy: LateDataPolicy,
+    },
 }
 
 #[cfg(test)]

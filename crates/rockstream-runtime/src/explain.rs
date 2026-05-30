@@ -75,6 +75,10 @@ fn kind_label(kind: &OpKind) -> String {
         OpKind::Union => "Union".to_string(),
         OpKind::Sink { name } => format!("Sink({name})"),
         OpKind::Window { strategy } => format!("Window[{strategy:?}]"),
+        OpKind::TumbleWindow {
+            window_size_ms,
+            late_data_policy,
+        } => format!("TumbleWindow[{window_size_ms}ms,{late_data_policy:?}]"),
     }
 }
 

@@ -61,6 +61,10 @@ pub fn explain_op_node(node: &OpNode, depth: u32, level: ExplainLevel) -> Explai
         OpKind::Union => "Union".to_string(),
         OpKind::Sink { name } => format!("Sink[{name}]"),
         OpKind::Window { strategy } => format!("Window[{strategy:?}]"),
+        OpKind::TumbleWindow {
+            window_size_ms,
+            late_data_policy,
+        } => format!("TumbleWindow[{window_size_ms}ms,{late_data_policy:?}]"),
     };
 
     let shard_info = match level {
