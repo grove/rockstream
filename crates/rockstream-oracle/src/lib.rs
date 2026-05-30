@@ -12,13 +12,17 @@
 pub mod aggregate_oracle;
 pub mod batch_oracle;
 pub mod bootstrap_oracle;
+pub mod fuzzer_oracle;
 pub mod join_oracle;
 pub mod lateral_srf_oracle;
+pub mod law_equiv_oracle;
 pub mod law_harness;
 pub mod min_max_oracle;
+pub mod nexmark_oracle;
 pub mod recursive_oracle;
 pub mod set_op_oracle;
 pub mod top_k_oracle;
+pub mod tpch_oracle;
 pub mod tumble_oracle;
 pub mod view_dag_oracle;
 pub mod window_oracle;
