@@ -414,15 +414,22 @@ fn bench_in_memory(c: &mut Criterion) {
     bench_get_1kib(c, "in_memory", store);
 }
 
-/// Benchmark: PUT 1 KiB to Azure (if configured and gates enabled).
-/// Skipped if STORAGE_BUDGET_RUN_GATES is not set to avoid hanging on credential validation.
+/// Benchmark: PUT/GET 1 KiB on Azure Criterion loops (explicit opt-in).
+/// Disabled by default because Criterion sampling over network storage can take
+/// many minutes and is not required for gate evidence.
+///
+/// Enable with: `STORAGE_BUDGET_RUN_AZURE_CRITERION=1`.
 fn bench_azure(c: &mut Criterion) {
-    let run_gates = std::env::var("STORAGE_BUDGET_RUN_GATES")
+    let run_azure_criterion = std::env::var("STORAGE_BUDGET_RUN_AZURE_CRITERION")
         .ok()
         .map(|s| s == "1")
         .unwrap_or(false);
 
-    if !run_gates {
+    if !run_azure_criterion {
+        println!(
+            "[storage_budget] Azure Criterion benches disabled by default. \
+             Set STORAGE_BUDGET_RUN_AZURE_CRITERION=1 to enable."
+        );
         return;
     }
 
@@ -468,8 +475,10 @@ fn gate_probes(c: &mut Criterion) {
     }
 
     // Dummy Criterion bench so Criterion does not complain about an empty group.
+    // Keep it a strict no-op; running gate logic inside Criterion's sampling loop
+    // causes repeated logging and can look like a hang.
     let mut group = c.benchmark_group("storage_budget/gate_probes");
-    group.bench_function("wal_cache_noop", |b| b.iter(|| run_wal_cache_gate()));
+    group.bench_function("noop", |b| b.iter(|| ()));
     group.finish();
 }
 
