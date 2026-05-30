@@ -121,10 +121,16 @@ fn azure_store() -> Option<Arc<dyn ObjectStore>> {
             let store: Arc<dyn ObjectStore> = Arc::new(store);
             let rt = tokio::runtime::Runtime::new().unwrap();
             let probe: Arc<dyn ObjectStore> = Arc::clone(&store);
-            let probe_result = rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                probe.head(&object_store::path::Path::from("_bench_probe")),
-            ));
+            // Probe connectivity with a 10-second timeout.
+            // tokio::time::timeout must be called *inside* the async block so it
+            // runs within the runtime context (creating the Sleep timer requires it).
+            let probe_result = rt.block_on(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    probe.head(&object_store::path::Path::from("_bench_probe")),
+                )
+                .await
+            });
             match probe_result {
                 Err(_) => {
                     eprintln!(
