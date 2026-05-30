@@ -74,6 +74,26 @@ pub enum PlanNode {
         /// Policy for rows that arrive after the window has closed.
         late_data_policy: LateDataPolicy,
     },
+    /// Top-K operator (v0.21).
+    ///
+    /// Maintains the top-`k` rows ranked by the column at `rank_col` (i64
+    /// big-endian; descending: highest value = rank 1).  Optional
+    /// `partition_by` columns create independent Top-K groups.
+    ///
+    /// Internally tracks `k + epsilon` rows as a buffer (epsilon = k) to
+    /// handle the delete-refill path without a full state rescan.  When a
+    /// ranked row is deleted the next-best row from the buffer fills its
+    /// slot.  When a new row outranks the current k-th row a delta swap
+    /// is emitted (retract the displaced row, insert the new row).
+    TopK {
+        input: Box<PlanNode>,
+        /// Number of top rows to maintain per partition.
+        k: usize,
+        /// Column index to rank by (i64 BE; descending: highest = rank 1).
+        rank_col: usize,
+        /// Column indices to partition by.  Empty = single global partition.
+        partition_by: Vec<usize>,
+    },
 }
 
 /// Policy for late-arriving rows in time-window operators.
@@ -222,6 +242,16 @@ pub enum OpKind {
     TumbleWindow {
         window_size_ms: i64,
         late_data_policy: LateDataPolicy,
+    },
+    /// Top-K operator (v0.21).
+    ///
+    /// Emits the top-`k` rows per partition ranked by `rank_col` (i64 BE;
+    /// descending).  Delta swaps are emitted when the ranked set changes.
+    /// The `k + epsilon` buffer (epsilon = k) backs the delete-refill path.
+    TopK {
+        k: usize,
+        rank_col: usize,
+        partition_by: Vec<usize>,
     },
 }
 

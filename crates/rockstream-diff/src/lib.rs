@@ -185,6 +185,28 @@ impl DiffCtx {
                 });
                 id
             }
+            PlanNode::TopK {
+                input,
+                k,
+                rank_col,
+                partition_by,
+            } => {
+                let input_id = self.diff_node(input, nodes);
+                let id = self.alloc_id();
+                nodes.push(OpNode {
+                    id,
+                    kind: OpKind::TopK {
+                        k: *k,
+                        rank_col: *rank_col,
+                        partition_by: partition_by.clone(),
+                    },
+                    // Row weight state uses WeightAdd/v1 (abelian group).
+                    merge_law: Some(WEIGHT_ADD_ID),
+                    not_merge_safe_reason: None,
+                    inputs: vec![input_id],
+                });
+                id
+            }
         }
     }
 

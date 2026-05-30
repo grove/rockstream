@@ -28,6 +28,7 @@ impl LawRegistry {
         reg.register(Arc::new(super::SumCountV1));
         reg.register(Arc::new(super::MaxRegisterV1));
         reg.register(Arc::new(super::MinRegisterV1));
+        reg.register(Arc::new(super::HyperLogLogV1));
         reg
     }
 
@@ -84,11 +85,12 @@ mod tests {
     #[test]
     fn registry_with_builtins() {
         let reg = LawRegistry::with_builtins();
-        assert_eq!(reg.len(), 4);
+        assert_eq!(reg.len(), 5);
         assert!(reg.contains(WEIGHT_ADD_ID));
         assert!(reg.contains(crate::laws::sum_count::SUM_COUNT_ID));
         assert!(reg.contains(crate::laws::max_register::MAX_REGISTER_ID));
         assert!(reg.contains(crate::laws::min_register::MIN_REGISTER_ID));
+        assert!(reg.contains(crate::laws::hyper_log_log::HLL_ID));
     }
 
     #[test]
@@ -102,18 +104,21 @@ mod tests {
         assert_eq!(max_law.name(), "MaxRegister");
         let min_law = reg.get(crate::laws::min_register::MIN_REGISTER_ID).unwrap();
         assert_eq!(min_law.name(), "MinRegister");
+        let hll_law = reg.get(crate::laws::hyper_log_log::HLL_ID).unwrap();
+        assert_eq!(hll_law.name(), "HyperLogLog");
     }
 
     #[test]
     fn descriptors_lists_all() {
         let reg = LawRegistry::with_builtins();
         let descs = reg.descriptors();
-        assert_eq!(descs.len(), 4);
+        assert_eq!(descs.len(), 5);
         let names: std::collections::HashSet<_> = descs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains("WeightAdd"));
         assert!(names.contains("SumCount"));
         assert!(names.contains("MaxRegister"));
         assert!(names.contains("MinRegister"));
+        assert!(names.contains("HyperLogLog"));
     }
 
     #[test]
