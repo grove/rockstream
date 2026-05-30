@@ -92,6 +92,16 @@ pub const RS_1513: ErrorCode = ErrorCode::new(1513);
 pub const RS_1601: ErrorCode = ErrorCode::new(1601);
 /// Cluster checkpoint recovery in progress; pipeline is in RECOVERING state (v0.34).
 pub const RS_1602: ErrorCode = ErrorCode::new(1602);
+/// Pipeline freshness recovery is slower than the 60s SLO; RECOVERING_SLOW state (v0.35).
+pub const RS_1603: ErrorCode = ErrorCode::new(1603);
+
+// 17xx: Lease management
+/// Shard is already leased by a different worker; acquire rejected (v0.29).
+pub const RS_1701: ErrorCode = ErrorCode::new(1701);
+/// Stale lease token; worker has been fenced out (v0.29).
+pub const RS_1702: ErrorCode = ErrorCode::new(1702);
+/// Shard has no active lease (v0.29).
+pub const RS_1703: ErrorCode = ErrorCode::new(1703);
 
 // 2xxx: Gateway / query
 /// View not found.
@@ -152,6 +162,10 @@ pub fn description(code: ErrorCode) -> &'static str {
         1513 => "Distributed recursion max-iteration cap exceeded without convergence",
         1601 => "Checkpoint alignment buffer overflowed; bounded buffer capacity exceeded",
         1602 => "Cluster checkpoint recovery in progress",
+        1603 => "Pipeline freshness recovery SLO exceeded; RECOVERING_SLOW state",
+        1701 => "Shard is already leased by a different worker",
+        1702 => "Stale lease token; worker has been fenced out",
+        1703 => "Shard has no active lease",
         2001 => "View not found",
         2002 => "Query timeout",
         2003 => "Unsupported isolation level",
@@ -203,6 +217,10 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         1513 => "Increase max_iterations or restructure the recursive query to converge faster.",
         1601 => "Reduce input rate or increase checkpoint alignment buffer capacity; check for slow shards holding up barrier propagation.",
         1602 => "Wait for recovery to complete; monitor shard reassignment and frontier progress via SHOW VIEW STATUS.",
+        1603 => "Recovery is exceeding SLO; check worker health, storage latency, and frontier progress. Escalate if recovery does not complete within expected bounds.",
+        1701 => "Check worker assignments; another worker holds the lease. Use force-acquire if the holder is dead.",
+        1702 => "Worker has been fenced out; acquire a new lease before retrying.",
+        1703 => "No lease exists for this shard; acquire a lease before operating on it.",
         _ => "See documentation for this error code.",
     }
 }
@@ -241,7 +259,7 @@ mod tests {
         let codes = [
             RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
             RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_4001, RS_4002, RS_5001, RS_5002,
-            RS_1512, RS_1513, RS_1601, RS_1602,
+            RS_1512, RS_1513, RS_1601, RS_1602, RS_1603, RS_1701, RS_1702, RS_1703,
         ];
         for code in codes {
             assert_ne!(
