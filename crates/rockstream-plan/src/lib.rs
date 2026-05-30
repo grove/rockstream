@@ -4,8 +4,14 @@
 //! physical `OpNode` graph used for execution. Each `PlanNode` carries enough
 //! metadata for the planner to attach merge-law annotations.
 
+pub mod explain;
+
 use rockstream_types::ids::OperatorId;
 use rockstream_types::merge_law::MergeLawId;
+
+/// Re-exported for backward compatibility — `NotMergeSafeReason` is now
+/// defined in `rockstream_types::explain`.
+pub use rockstream_types::explain::NotMergeSafeReason;
 
 /// A logical plan node in the IVM plan IR.
 ///
@@ -142,34 +148,6 @@ pub enum OpKind {
     Union,
     /// Emit to output sink.
     Sink { name: String },
-}
-
-/// Closed enum of reasons an operator does not support merge-safe reads.
-///
-/// Used in `EXPLAIN INCREMENTAL` output. The set is fixed at compile time
-/// per the v0.5 contract — new reasons require a version bump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NotMergeSafeReason {
-    /// MIN/MAX require read-modify-write for correctness.
-    ExtremumRequiresRmw,
-    /// INTERSECT/EXCEPT use weight clamping, not a law.
-    ClampNotALaw,
-    /// User-defined aggregate with unknown algebraic properties.
-    UnknownUdafProperties,
-    /// Operator has no arrangement (stateless).
-    Stateless,
-}
-
-impl NotMergeSafeReason {
-    /// Convert to the canonical string used in `EXPLAIN` output.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::ExtremumRequiresRmw => "extremum_requires_rmw",
-            Self::ClampNotALaw => "clamp_not_a_law",
-            Self::UnknownUdafProperties => "unknown_udaf_properties",
-            Self::Stateless => "stateless",
-        }
-    }
 }
 
 #[cfg(test)]

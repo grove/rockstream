@@ -138,9 +138,9 @@ pub trait LawBundle: Send + Sync + 'static {
     /// Used by `TombstoneGc` compaction to reclaim space.
     fn is_identity(&self, value: &[u8]) -> bool;
 
-    /// A short reason string if this law does NOT support merge-safe reads
-    /// (i.e., read-modify-write can be avoided). Returns `None` if it does.
-    fn not_merge_safe_reason(&self) -> Option<&'static str> {
+    /// A reason if this law does NOT support merge-safe reads
+    /// (i.e., read-modify-write cannot be avoided). Returns `None` if it does.
+    fn not_merge_safe_reason(&self) -> Option<crate::explain::NotMergeSafeReason> {
         None
     }
 }

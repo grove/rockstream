@@ -565,4 +565,225 @@ mod tests {
             "proof: cannot drop a workload while views are assigned to it"
         );
     }
+
+    // ── v0.17 Proof: Explain and estimates ───────────────────────────────────
+
+    use rockstream_plan::explain::{explain_op_node, format_explain_text};
+    use rockstream_plan::{OpKind, OpNode};
+    use rockstream_types::explain::{
+        BackfillCostEstimate, ConfidenceLabel, ExplainLawAnnotation, ExplainLevel,
+        NotMergeSafeReason, OperatorStats, ShardInfo, BACKFILL_CONFIRMATION_THRESHOLD_BYTES,
+    };
+    use rockstream_types::ids::OperatorId;
+    use rockstream_types::merge_law::{CompactionPolicy, DuplicatePolicy, MergeLawClass};
+
+    /// Proof: the explain formatter correctly annotates merge-safe (✓) and
+    /// unsafe (✗) operators. Stateless operators show ⚠.
+    #[test]
+    fn proof_explain_annotates_merge_safe_and_unsafe_operators() {
+        let agg_node = OpNode {
+            id: OperatorId(2),
+            kind: OpKind::Aggregate,
+            merge_law: Some(WEIGHT_ADD_ID),
+            not_merge_safe_reason: None,
+            inputs: vec![OperatorId(1)],
+        };
+        let filter_node = OpNode {
+            id: OperatorId(1),
+            kind: OpKind::Filter,
+            merge_law: None,
+            not_merge_safe_reason: None,
+            inputs: vec![OperatorId(0)],
+        };
+        let max_node = OpNode {
+            id: OperatorId(3),
+            kind: OpKind::Aggregate,
+            merge_law: Some(WEIGHT_ADD_ID),
+            not_merge_safe_reason: Some(NotMergeSafeReason::ExtremumRequiresRmw),
+            inputs: vec![OperatorId(1)],
+        };
+
+        let agg_row = explain_op_node(&agg_node, 0, ExplainLevel::Default);
+        let filter_row = explain_op_node(&filter_node, 1, ExplainLevel::Default);
+        let max_row = explain_op_node(&max_node, 0, ExplainLevel::Default);
+
+        assert_eq!(
+            agg_row.annotation.merge_safe_indicator(),
+            '✓',
+            "proof: Aggregate with WeightAdd is merge-safe (✓)"
+        );
+        assert_eq!(
+            filter_row.annotation.merge_safe_indicator(),
+            '⚠',
+            "proof: stateless Filter shows warning (⚠)"
+        );
+        assert_eq!(
+            max_row.annotation.merge_safe_indicator(),
+            '✗',
+            "proof: MAX operator is not merge-safe (✗)"
+        );
+
+        let rows = vec![agg_row, filter_row];
+        let text = format_explain_text(&rows, ExplainLevel::Default);
+        assert!(text.contains('✓'), "proof: explain text contains ✓");
+        assert!(text.contains('⚠'), "proof: explain text contains ⚠");
+    }
+
+    /// Proof: `BackfillCostEstimate` fires the confirmation prompt when the
+    /// estimated state size exceeds 1 GB, and does not fire below that.
+    #[test]
+    fn proof_backfill_cost_estimate_triggers_confirmation_above_1gb() {
+        assert_eq!(
+            BACKFILL_CONFIRMATION_THRESHOLD_BYTES, 1_000_000_000,
+            "proof: threshold is exactly 1 GB"
+        );
+
+        let large = BackfillCostEstimate {
+            estimated_state_bytes: 2_500_000_000, // 2.5 GB
+            estimated_rows: 200_000_000,
+            estimated_duration_ms: 90_000,
+            confidence: ConfidenceLabel::Medium,
+            source_name: "large_events".to_string(),
+        };
+        assert!(
+            large.requires_confirmation(),
+            "proof: 2.5 GB backfill requires confirmation"
+        );
+        let prompt = large.confirmation_prompt();
+        assert!(
+            prompt.contains("large_events"),
+            "proof: prompt contains source name"
+        );
+        assert!(
+            prompt.contains("WITHOUT CONFIRMATION"),
+            "proof: prompt mentions bypass keyword"
+        );
+
+        let small = BackfillCostEstimate {
+            estimated_state_bytes: 999_999_999, // just under threshold
+            estimated_rows: 1_000_000,
+            estimated_duration_ms: 2_000,
+            confidence: ConfidenceLabel::High,
+            source_name: "small_source".to_string(),
+        };
+        assert!(
+            !small.requires_confirmation(),
+            "proof: sub-1 GB backfill does not require confirmation"
+        );
+    }
+
+    /// Proof: EXPLAIN INCREMENTAL VERBOSE output includes shard count and
+    /// parallelism for every operator.
+    #[test]
+    fn proof_verbose_explain_includes_shard_and_parallelism() {
+        let node = OpNode {
+            id: OperatorId(1),
+            kind: OpKind::Aggregate,
+            merge_law: Some(WEIGHT_ADD_ID),
+            not_merge_safe_reason: None,
+            inputs: vec![OperatorId(0)],
+        };
+        let row = explain_op_node(&node, 0, ExplainLevel::Verbose);
+        assert!(
+            row.shard_info.is_some(),
+            "proof: VERBOSE level populates shard_info"
+        );
+        let line = row.format_line(ExplainLevel::Verbose);
+        assert!(
+            line.contains("shards="),
+            "proof: VERBOSE line includes shard count"
+        );
+        assert!(
+            line.contains("parallelism="),
+            "proof: VERBOSE line includes parallelism"
+        );
+        assert!(
+            line.contains("frontier="),
+            "proof: VERBOSE line includes frontier epoch"
+        );
+    }
+
+    /// Proof: EXPLAIN INCREMENTAL ANALYZE output includes p99 latency and
+    /// rows/s statistics when OperatorStats are present.
+    #[test]
+    fn proof_analyze_explain_includes_p99_and_rows_per_s() {
+        let annotation = ExplainLawAnnotation {
+            merge_law: "WeightAdd/v1".to_string(),
+            law_class: MergeLawClass::AbelianGroup,
+            idempotent: false,
+            duplicate_policy: DuplicatePolicy::Merge,
+            compaction: CompactionPolicy::TombstoneGc,
+            combiner: true,
+            partial_pushdown: true,
+            not_merge_safe_reason: None,
+        };
+        let row = rockstream_types::explain::ExplainRow {
+            depth: 0,
+            operator_kind: "Aggregate[SUM]".to_string(),
+            annotation,
+            operator_stats: Some(OperatorStats {
+                rows_per_s: 75_000.0,
+                state_reads: 5000,
+                rmw_ratio: 0.02,
+                p99_latency_ms: 1.8,
+                dlq_entries: 0,
+            }),
+            shard_info: Some(ShardInfo {
+                shard_count: 4,
+                parallelism: 2,
+                frontier_epoch: 99,
+            }),
+        };
+        let line = row.format_line(ExplainLevel::Analyze);
+        assert!(
+            line.contains("p99=1.8ms"),
+            "proof: ANALYZE line includes p99 latency"
+        );
+        assert!(
+            line.contains("rows/s=75000"),
+            "proof: ANALYZE line includes rows/s"
+        );
+    }
+
+    /// Proof: every `NotMergeSafeReason` variant has a non-empty, unique
+    /// snake_case canonical string — CI enumeration test.
+    #[test]
+    fn proof_all_not_merge_safe_reasons_covered() {
+        let all = NotMergeSafeReason::all();
+        assert!(
+            !all.is_empty(),
+            "proof: NotMergeSafeReason::all() is non-empty"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for reason in all {
+            let s = reason.as_str();
+            assert!(
+                !s.is_empty(),
+                "proof: NotMergeSafeReason::{reason:?} has empty string"
+            );
+            assert!(
+                s.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "proof: NotMergeSafeReason::{reason:?} string '{s}' is not snake_case"
+            );
+            assert!(
+                seen.insert(s),
+                "proof: duplicate NotMergeSafeReason string '{s}'"
+            );
+        }
+        // Verify all four v0.17 reasons are registered.
+        assert!(
+            seen.contains("extremum_requires_rmw"),
+            "proof: ExtremumRequiresRmw is registered"
+        );
+        assert!(
+            seen.contains("clamp_not_a_law"),
+            "proof: ClampNotALaw is registered"
+        );
+        assert!(
+            seen.contains("unknown_udaf_properties"),
+            "proof: UnknownUdafProperties is registered"
+        );
+        assert!(seen.contains("stateless"), "proof: Stateless is registered");
+    }
 }

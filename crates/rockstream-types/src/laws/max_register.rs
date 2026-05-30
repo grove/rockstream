@@ -94,10 +94,10 @@ impl LawBundle for MaxRegisterV1 {
             .unwrap_or(false)
     }
 
-    fn not_merge_safe_reason(&self) -> Option<&'static str> {
-        // MaxRegister is not invertible: you cannot derive a smaller max by
-        // merging a lower value. Retractions require a prefix-scan rescan.
-        Some("MaxRegister is a semilattice (non-invertible); retractions require rescan")
+    fn not_merge_safe_reason(&self) -> Option<crate::explain::NotMergeSafeReason> {
+        // MaxRegister is a semilattice (non-invertible): retractions require a
+        // prefix-scan rescan to compute the new maximum.
+        Some(crate::explain::NotMergeSafeReason::ExtremumRequiresRmw)
     }
 }
 
