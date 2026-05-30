@@ -238,8 +238,7 @@ evidence-based:
 - The upgrade path from the previous beta is tested and documented.
 - The public docs state what RockStream is not: not an OLTP Postgres clone, not
   a global cross-shard `SERIALIZABLE` system, not active-active multi-region
-  writes. (Coordinator Group §13.10 provides scoped multi-table SERIALIZABLE
-  for designated base-table shards, which is explicitly in scope for 1.0.)
+  writes.
 - A new operator can debug the system using the docs, dashboard, CLI, audit log,
   and support bundle without reading source code first.
 
@@ -266,7 +265,6 @@ These are explicit places to pause, learn, and possibly reshape the roadmap.
 | Production readiness | v0.52 | Is the system operable by someone who did not build it? | |
 | Data lake integration | v0.55 | Does the cold-tier + catalog story deliver real value, or is feeding external tools sufficient without the cold tier? | |
 | Optimistic transactions | v0.55 | Does the mixed optimistic + CRDT transaction subset work reliably under simulation and soak (no partial visibility, explainable abort rates), or should it stay experimental past 1.0? | |
-| Coordinator Group | v0.55 | Given the optimistic-transaction soak result: is write-skew prevention across 2+ base-table shards a real pilot-customer need? If yes, proceed with Phase 13 (§13.10). If the exact-key subset covers all known cases, defer coordinator group past 1.0. | |
 
 At each gate, the default action is not to accelerate. The default action is to
 remove uncertainty.
@@ -320,10 +318,7 @@ These may be good ideas later, but they dilute the first implementation:
   later, but no version through 1.0 promises that path.
 - Cross-shard `SERIALIZABLE` isolation. Optimistic exact-key guards and CRDT
   blind writes are pre-1.0 (§13.5.1), but a *global* cross-shard coordinator
-  covering every shard remains post-1.0. The **Coordinator Group** (§13.10)
-  — an opt-in, small cohort that holds quorum over a designated base-table
-  shard subset — is the planned 1.0-track path; it requires the v0.55
-  optimistic-transaction soak as a prerequisite gate.
+  covering every shard is an explicit non-goal.
 - Full OLTP compatibility with Postgres.
 - Arbitrary user-defined CRDT merge functions before v0.51. `CREATE MERGE LAW`
   is gated on the built-in catalog (v0.43–v0.45) and the shared property-test
