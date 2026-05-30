@@ -88,6 +88,10 @@ fn kind_label(kind: &OpKind) -> String {
             max_iterations,
             monotone,
         } => format!("Recursion[max_iter={max_iterations},monotone={monotone}]"),
+        OpKind::Snapshot {
+            source_name,
+            batch_size,
+        } => format!("Snapshot[{source_name},batch={batch_size}]"),
     }
 }
 

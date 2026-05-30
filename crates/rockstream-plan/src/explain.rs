@@ -74,6 +74,10 @@ pub fn explain_op_node(node: &OpNode, depth: u32, level: ExplainLevel) -> Explai
             max_iterations,
             monotone,
         } => format!("Recursion[max_iter={max_iterations},monotone={monotone}]"),
+        OpKind::Snapshot {
+            source_name,
+            batch_size,
+        } => format!("Snapshot[{source_name},batch={batch_size}]"),
     };
 
     let shard_info = match level {
