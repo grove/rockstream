@@ -60,6 +60,7 @@ pub fn explain_op_node(node: &OpNode, depth: u32, level: ExplainLevel) -> Explai
         OpKind::Join => "Join".to_string(),
         OpKind::Union => "Union".to_string(),
         OpKind::Sink { name } => format!("Sink[{name}]"),
+        OpKind::Window { strategy } => format!("Window[{strategy:?}]"),
     };
 
     let shard_info = match level {

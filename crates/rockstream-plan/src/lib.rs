@@ -51,6 +51,11 @@ pub enum PlanNode {
         left: Box<PlanNode>,
         right: Box<PlanNode>,
     },
+    /// Window functions (v0.19).
+    Window {
+        input: Box<PlanNode>,
+        window_exprs: Vec<WindowExpr>,
+    },
 }
 
 /// A scalar expression in the plan IR.
@@ -109,6 +114,34 @@ pub enum AggregateFunc {
     Max,
 }
 
+/// A window function expression (v0.19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowExpr {
+    pub func: WindowFunc,
+    pub partition_by: Vec<usize>,
+    pub order_by: Vec<usize>,
+}
+
+/// Window functions supported in v0.19.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Ntile(u64),
+    Lag { offset: usize },
+    Lead { offset: usize },
+    SlidingSum { frame_rows: usize },
+    SlidingAvg { frame_rows: usize },
+}
+
+/// Window operator IVM strategy (v0.19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowStrategy {
+    PartitionRecompute,
+    SlidingAggregate,
+}
+
 /// A physical operator node in the execution graph.
 ///
 /// Each `OpNode` corresponds to a running operator instance with a unique
@@ -148,6 +181,8 @@ pub enum OpKind {
     Union,
     /// Emit to output sink.
     Sink { name: String },
+    /// Window function operator (v0.19).
+    Window { strategy: WindowStrategy },
 }
 
 #[cfg(test)]

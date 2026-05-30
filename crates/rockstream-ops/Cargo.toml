@@ -10,6 +10,7 @@ description = "Operator trait and per-operator implementations for RockStream"
 arrow = { workspace = true }
 datafusion = { workspace = true }
 rockstream-sim = { workspace = true }
+rockstream-plan = { workspace = true }
 rockstream-types = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
@@ -18,7 +19,14 @@ tracing = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 tokio = { workspace = true }
+object_store = { workspace = true, features = ["azure"] }
+rockstream-storage = { workspace = true }
+slatedb = { workspace = true }
 
 [[bench]]
 name = "operator_throughput"
+harness = false
+
+[[bench]]
+name = "storage_budget"
 harness = false

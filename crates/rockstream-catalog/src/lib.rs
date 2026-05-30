@@ -785,6 +785,10 @@ mod tests {
             "proof: UnknownUdafProperties is registered"
         );
         assert!(seen.contains("stateless"), "proof: Stateless is registered");
+        assert!(
+            seen.contains("partition_recomputation"),
+            "proof: PartitionRecomputation is registered (v0.19)"
+        );
     }
 }
 

@@ -21,7 +21,9 @@
 //! optionally `"not_merge_safe_reason"`.
 
 use crate::error::CatalogError;
-use rockstream_plan::{AggregateExpr, AggregateFunc, BinaryOp, Expr, PlanNode};
+use rockstream_plan::{
+    AggregateExpr, AggregateFunc, BinaryOp, Expr, PlanNode, WindowExpr, WindowFunc,
+};
 use rockstream_types::laws::registry::LawRegistry;
 use rockstream_types::merge_law::{MergeLawId, MergeLawVersion};
 use serde::{Deserialize, Serialize};
@@ -171,6 +173,16 @@ fn encode_node(
                 "right": encode_node(right, law_for, &format!("{path}/join_right")),
             })
         }
+        PlanNode::Window {
+            input,
+            window_exprs,
+        } => {
+            serde_json::json!({
+                "type": "Window",
+                "window_exprs": window_exprs.iter().map(encode_window_expr).collect::<Vec<_>>(),
+                "input": encode_node(input, law_for, &format!("{path}/window_input")),
+            })
+        }
     }
 }
 
@@ -219,6 +231,31 @@ fn encode_agg_func(func: AggregateFunc) -> &'static str {
         AggregateFunc::Avg => "Avg",
         AggregateFunc::Min => "Min",
         AggregateFunc::Max => "Max",
+    }
+}
+
+fn encode_window_expr(we: &WindowExpr) -> Value {
+    serde_json::json!({
+        "func": encode_window_func(&we.func),
+        "partition_by": we.partition_by,
+        "order_by": we.order_by,
+    })
+}
+
+fn encode_window_func(func: &WindowFunc) -> Value {
+    match func {
+        WindowFunc::RowNumber => serde_json::json!({ "kind": "RowNumber" }),
+        WindowFunc::Rank => serde_json::json!({ "kind": "Rank" }),
+        WindowFunc::DenseRank => serde_json::json!({ "kind": "DenseRank" }),
+        WindowFunc::Ntile(n) => serde_json::json!({ "kind": "Ntile", "n": n }),
+        WindowFunc::Lag { offset } => serde_json::json!({ "kind": "Lag", "offset": offset }),
+        WindowFunc::Lead { offset } => serde_json::json!({ "kind": "Lead", "offset": offset }),
+        WindowFunc::SlidingSum { frame_rows } => {
+            serde_json::json!({ "kind": "SlidingSum", "frame_rows": frame_rows })
+        }
+        WindowFunc::SlidingAvg { frame_rows } => {
+            serde_json::json!({ "kind": "SlidingAvg", "frame_rows": frame_rows })
+        }
     }
 }
 
@@ -345,6 +382,20 @@ fn decode_node(v: &Value, registry: &LawRegistry, path: &str) -> Result<PlanNode
                 condition,
             })
         }
+        "Window" => {
+            let window_exprs = v["window_exprs"].as_array().ok_or_else(|| {
+                CatalogError::Codec(format!("{path}: Window missing 'window_exprs'"))
+            })?;
+            let window_exprs = window_exprs
+                .iter()
+                .map(|e| decode_window_expr(e, path))
+                .collect::<Result<Vec<_>, _>>()?;
+            let input = decode_node(&v["input"], registry, &format!("{path}/window_input"))?;
+            Ok(PlanNode::Window {
+                input: Box::new(input),
+                window_exprs,
+            })
+        }
         other => Err(CatalogError::Codec(format!(
             "{path}: unknown node type '{other}'"
         ))),
@@ -441,6 +492,74 @@ fn decode_agg_expr(v: &Value, path: &str) -> Result<AggregateExpr, CatalogError>
         input,
         distinct,
     })
+}
+
+fn decode_window_expr(v: &Value, path: &str) -> Result<WindowExpr, CatalogError> {
+    let func = decode_window_func(&v["func"], path)?;
+    let partition_by = v["partition_by"]
+        .as_array()
+        .ok_or_else(|| CatalogError::Codec(format!("{path}: WindowExpr missing 'partition_by'")))?
+        .iter()
+        .map(|n| {
+            n.as_u64()
+                .ok_or_else(|| CatalogError::Codec(format!("{path}: partition_by not u64")))
+                .map(|x| x as usize)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let order_by = v["order_by"]
+        .as_array()
+        .ok_or_else(|| CatalogError::Codec(format!("{path}: WindowExpr missing 'order_by'")))?
+        .iter()
+        .map(|n| {
+            n.as_u64()
+                .ok_or_else(|| CatalogError::Codec(format!("{path}: order_by not u64")))
+                .map(|x| x as usize)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(WindowExpr {
+        func,
+        partition_by,
+        order_by,
+    })
+}
+
+fn decode_window_func(v: &Value, path: &str) -> Result<WindowFunc, CatalogError> {
+    let kind = v["kind"]
+        .as_str()
+        .ok_or_else(|| CatalogError::Codec(format!("{path}: WindowFunc missing 'kind'")))?;
+    match kind {
+        "RowNumber" => Ok(WindowFunc::RowNumber),
+        "Rank" => Ok(WindowFunc::Rank),
+        "DenseRank" => Ok(WindowFunc::DenseRank),
+        "Ntile" => Ok(WindowFunc::Ntile(v["n"].as_u64().ok_or_else(|| {
+            CatalogError::Codec(format!("{path}: Ntile missing 'n'"))
+        })?)),
+        "Lag" => Ok(WindowFunc::Lag {
+            offset: v["offset"]
+                .as_u64()
+                .ok_or_else(|| CatalogError::Codec(format!("{path}: Lag missing 'offset'")))?
+                as usize,
+        }),
+        "Lead" => Ok(WindowFunc::Lead {
+            offset: v["offset"]
+                .as_u64()
+                .ok_or_else(|| CatalogError::Codec(format!("{path}: Lead missing 'offset'")))?
+                as usize,
+        }),
+        "SlidingSum" => Ok(WindowFunc::SlidingSum {
+            frame_rows: v["frame_rows"].as_u64().ok_or_else(|| {
+                CatalogError::Codec(format!("{path}: SlidingSum missing 'frame_rows'"))
+            })? as usize,
+        }),
+        "SlidingAvg" => Ok(WindowFunc::SlidingAvg {
+            frame_rows: v["frame_rows"].as_u64().ok_or_else(|| {
+                CatalogError::Codec(format!("{path}: SlidingAvg missing 'frame_rows'"))
+            })? as usize,
+        }),
+        other => Err(CatalogError::Codec(format!(
+            "{path}: unknown WindowFunc kind '{other}'"
+        ))),
+    }
 }
 
 #[cfg(test)]

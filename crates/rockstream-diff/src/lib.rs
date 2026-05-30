@@ -5,10 +5,13 @@
 //! one or more physical operators with merge-law annotations attached by
 //! the differentiator.
 
-use rockstream_plan::{AggregateFunc, NotMergeSafeReason, OpKind, OpNode, PlanNode};
+use rockstream_plan::{
+    AggregateFunc, NotMergeSafeReason, OpKind, OpNode, PlanNode, WindowFunc, WindowStrategy,
+};
 use rockstream_types::ids::OperatorId;
 use rockstream_types::laws::max_register::MAX_REGISTER_ID;
 use rockstream_types::laws::min_register::MIN_REGISTER_ID;
+use rockstream_types::laws::sum_count::SUM_COUNT_ID;
 use rockstream_types::laws::weight_add::WEIGHT_ADD_ID;
 use rockstream_types::merge_law::MergeLawId;
 
@@ -127,6 +130,36 @@ impl DiffCtx {
                     merge_law: None,
                     not_merge_safe_reason: Some(NotMergeSafeReason::Stateless),
                     inputs: vec![left_id, right_id],
+                });
+                id
+            }
+            PlanNode::Window {
+                input,
+                window_exprs,
+            } => {
+                let input_id = self.diff_node(input, nodes);
+                let id = self.alloc_id();
+                let has_sliding = window_exprs.iter().any(|we| {
+                    matches!(
+                        we.func,
+                        WindowFunc::SlidingSum { .. } | WindowFunc::SlidingAvg { .. }
+                    )
+                });
+                let (strategy, law, reason) = if has_sliding {
+                    (WindowStrategy::SlidingAggregate, Some(SUM_COUNT_ID), None)
+                } else {
+                    (
+                        WindowStrategy::PartitionRecompute,
+                        None,
+                        Some(NotMergeSafeReason::PartitionRecomputation),
+                    )
+                };
+                nodes.push(OpNode {
+                    id,
+                    kind: OpKind::Window { strategy },
+                    merge_law: law,
+                    not_merge_safe_reason: reason,
+                    inputs: vec![input_id],
                 });
                 id
             }
