@@ -39,6 +39,9 @@ pub enum NotMergeSafeReason {
     Stateless,
     /// Window ranking functions recompute the entire partition; not merge-safe.
     PartitionRecomputation,
+    /// Non-monotone recursive operator: DRed strategy requires read-modify-write.
+    /// The escape hatch rejects non-monotone deltas at runtime with RS-1009.
+    RecursionDredRequired,
 }
 
 impl NotMergeSafeReason {
@@ -50,6 +53,7 @@ impl NotMergeSafeReason {
             Self::UnknownUdafProperties => "unknown_udaf_properties",
             Self::Stateless => "stateless",
             Self::PartitionRecomputation => "partition_recomputation",
+            Self::RecursionDredRequired => "recursion_dred_required",
         }
     }
 
@@ -64,6 +68,7 @@ impl NotMergeSafeReason {
             Self::UnknownUdafProperties,
             Self::Stateless,
             Self::PartitionRecomputation,
+            Self::RecursionDredRequired,
         ]
     }
 }

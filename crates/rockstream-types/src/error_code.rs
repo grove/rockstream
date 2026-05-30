@@ -78,6 +78,8 @@ pub const RS_1006: ErrorCode = ErrorCode::new(1006);
 pub const RS_1007: ErrorCode = ErrorCode::new(1007);
 /// View is not paused.
 pub const RS_1008: ErrorCode = ErrorCode::new(1008);
+/// Non-monotone delta rejected in monotone recursion (DRed escape hatch).
+pub const RS_1009: ErrorCode = ErrorCode::new(1009);
 
 // 2xxx: Gateway / query
 /// View not found.
@@ -131,6 +133,7 @@ pub fn description(code: ErrorCode) -> &'static str {
         1006 => "Workload already exists",
         1007 => "View is already paused",
         1008 => "View is not paused",
+        1009 => "Non-monotone delta rejected in monotone recursion",
         2001 => "View not found",
         2002 => "Query timeout",
         2003 => "Unsupported isolation level",

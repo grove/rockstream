@@ -70,6 +70,10 @@ pub fn explain_op_node(node: &OpNode, depth: u32, level: ExplainLevel) -> Explai
             rank_col,
             partition_by,
         } => format!("TopK[k={k},rank={rank_col},partitions={partition_by:?}]"),
+        OpKind::Recursion {
+            max_iterations,
+            monotone,
+        } => format!("Recursion[max_iter={max_iterations},monotone={monotone}]"),
     };
 
     let shard_info = match level {

@@ -211,6 +211,20 @@ fn encode_node(
                 "input": encode_node(input, law_for, &format!("{path}/topk_input")),
             })
         }
+        PlanNode::Recursion {
+            base,
+            step,
+            max_iterations,
+            monotone,
+        } => {
+            serde_json::json!({
+                "type": "Recursion",
+                "max_iterations": max_iterations,
+                "monotone": monotone,
+                "base": encode_node(base, law_for, &format!("{path}/recursion_base")),
+                "step": encode_node(step, law_for, &format!("{path}/recursion_step")),
+            })
+        }
     }
 }
 
@@ -501,6 +515,22 @@ fn decode_node(v: &Value, registry: &LawRegistry, path: &str) -> Result<PlanNode
                 k,
                 rank_col,
                 partition_by,
+            })
+        }
+        "Recursion" => {
+            let max_iterations = v["max_iterations"].as_u64().ok_or_else(|| {
+                CatalogError::Codec(format!("{path}: Recursion missing 'max_iterations'"))
+            })? as usize;
+            let monotone = v["monotone"].as_bool().ok_or_else(|| {
+                CatalogError::Codec(format!("{path}: Recursion missing 'monotone'"))
+            })?;
+            let base = decode_node(&v["base"], registry, &format!("{path}/recursion_base"))?;
+            let step = decode_node(&v["step"], registry, &format!("{path}/recursion_step"))?;
+            Ok(PlanNode::Recursion {
+                base: Box::new(base),
+                step: Box::new(step),
+                max_iterations,
+                monotone,
             })
         }
         other => Err(CatalogError::Codec(format!(

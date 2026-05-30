@@ -94,6 +94,36 @@ pub enum PlanNode {
         /// Column indices to partition by.  Empty = single global partition.
         partition_by: Vec<usize>,
     },
+    /// Recursive operator (v0.22).
+    ///
+    /// Computes the fixed-point of iterating `step` starting from `base`.
+    /// Semi-naive evaluation: each iteration feeds only the new delta rows
+    /// into `step`, not the entire accumulated relation.
+    ///
+    /// Convergence is detected when the iteration produces no new rows.
+    /// `max_iterations` is a safety cap (typically 1024) that prevents
+    /// infinite loops on non-convergent non-monotone queries.
+    ///
+    /// When `monotone = true`, the relation is insert-only: retractions are
+    /// rejected at runtime with `RS-1009`.  Monotone recursion publishes a
+    /// `complete_through` token once convergence is reached, enabling
+    /// downstream operators to consume partial-progress results safely.
+    ///
+    /// When `monotone = false`, the DRed (Delete and Re-derive) strategy is
+    /// required.  If DRed proves unsound under concurrent deletes the escape
+    /// hatch is active: non-monotone deltas are rejected with `RS-1009` and
+    /// the operator reports `not_merge_safe_reason=recursion_dred_required`.
+    Recursion {
+        /// The base relation providing the initial facts.
+        base: Box<PlanNode>,
+        /// The step relation: maps the current accumulated output back as
+        /// input to derive new rows.  Typically a self-join or filter.
+        step: Box<PlanNode>,
+        /// Safety cap on the number of semi-naive iterations per epoch.
+        max_iterations: usize,
+        /// Whether this recursion is restricted to monotone (insert-only) terms.
+        monotone: bool,
+    },
 }
 
 /// Policy for late-arriving rows in time-window operators.
@@ -252,6 +282,19 @@ pub enum OpKind {
         k: usize,
         rank_col: usize,
         partition_by: Vec<usize>,
+    },
+    /// Recursive operator (v0.22).
+    ///
+    /// Runs semi-naive fixed-point iteration until convergence or
+    /// `max_iterations` is reached.  `monotone = true` enables
+    /// `complete_through` partial-progress publication; `monotone = false`
+    /// activates the DRed escape hatch (`not_merge_safe_reason =
+    /// recursion_dred_required`) and rejects retractions at runtime.
+    Recursion {
+        /// Safety cap on semi-naive iterations per epoch.
+        max_iterations: usize,
+        /// Whether this operator is restricted to monotone (insert-only) terms.
+        monotone: bool,
     },
 }
 

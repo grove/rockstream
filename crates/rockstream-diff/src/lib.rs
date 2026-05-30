@@ -207,6 +207,38 @@ impl DiffCtx {
                 });
                 id
             }
+            PlanNode::Recursion {
+                base,
+                step,
+                max_iterations,
+                monotone,
+            } => {
+                let base_id = self.diff_node(base, nodes);
+                let step_id = self.diff_node(step, nodes);
+                let id = self.alloc_id();
+                // Monotone recursion: WeightAdd/v1 (abelian group, insert-only
+                // terms).  complete_through is published once converged.
+                // Non-monotone: DRed escape hatch — still WeightAdd/v1 for the
+                // arrangement, but flagged with RecursionDredRequired because
+                // retractions require read-modify-write and are rejected at
+                // runtime with RS-1009.
+                let reason = if *monotone {
+                    None
+                } else {
+                    Some(NotMergeSafeReason::RecursionDredRequired)
+                };
+                nodes.push(OpNode {
+                    id,
+                    kind: OpKind::Recursion {
+                        max_iterations: *max_iterations,
+                        monotone: *monotone,
+                    },
+                    merge_law: Some(WEIGHT_ADD_ID),
+                    not_merge_safe_reason: reason,
+                    inputs: vec![base_id, step_id],
+                });
+                id
+            }
         }
     }
 
