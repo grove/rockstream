@@ -17,6 +17,7 @@ pub mod brownout;
 pub mod buggify;
 pub mod chaos;
 pub mod clock;
+pub mod compaction;
 pub mod coord_faults;
 pub mod fault_model;
 pub mod law_faults;
@@ -25,6 +26,7 @@ pub mod network;
 pub mod object_store;
 pub mod paired_assert;
 pub mod runtime;
+pub mod shard_map;
 pub mod sim;
 pub mod soak;
 pub mod tokio_rt;
@@ -35,6 +37,7 @@ pub use brownout::{BrownoutStatus, ObjectStoreBrownoutGuard, LOCAL_BUFFER_MAX_EP
 pub use buggify::buggify_enabled;
 pub use chaos::{run_chaos_scenario, ChaosConfig, ChaosResult};
 pub use clock::{Clock, SimClock, TokioClock};
+pub use compaction::{apply_tombstone_gc, simulate_donor_cleanup, simulate_split_migration, SimEntry};
 pub use coord_faults::{register_coord_faults, COORD_FAULT_IDS};
 pub use fault_model::{FaultEntry, FaultModel};
 pub use law_faults::{register_law_faults, LAW_FAULT_IDS};
@@ -43,6 +46,7 @@ pub use network::{SimNetwork, SimNetworkHandle};
 pub use object_store::{SimObjectStore, SimObjectStoreHandle};
 pub use paired_assert::paired_assert;
 pub use runtime::{Runtime, Spawner};
+pub use shard_map::{ShardOwnership, ShardRange, SimShardMap};
 pub use sim::SimRuntime;
 pub use soak::{
     build_initial_corpus, LawSeed, RegressionSeed, SeedCorpus, SeedOutcome, SoakRunner,
