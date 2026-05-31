@@ -82,9 +82,15 @@ impl ProactiveSplitter {
         let trigger = self.config.split_trigger_bytes();
         let alert = self.config.alert_threshold_bytes();
         if state_bytes >= alert {
-            SplitDecision::UrgentSplit { shard_id, state_bytes }
+            SplitDecision::UrgentSplit {
+                shard_id,
+                state_bytes,
+            }
         } else if state_bytes >= trigger {
-            SplitDecision::ScheduleSplit { shard_id, state_bytes }
+            SplitDecision::ScheduleSplit {
+                shard_id,
+                state_bytes,
+            }
         } else {
             SplitDecision::None
         }
@@ -123,7 +129,10 @@ impl ProactiveSplitter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrainStepOutcome {
     /// Shard successfully migrated; drain continues.
-    Migrated { shard_id: ShardId, shards_remaining: u32 },
+    Migrated {
+        shard_id: ShardId,
+        shards_remaining: u32,
+    },
     /// All shards have been migrated; worker is now `Decommissioned`.
     Decommissioned { elapsed_ms: u64 },
     /// Drain deadline exceeded; the worker should self-fence.
@@ -209,12 +218,16 @@ impl WorkerDrainCoordinator {
     pub fn step(&mut self, now_ms: u64) -> DrainStepOutcome {
         let elapsed = now_ms.saturating_sub(self.started_at_ms);
         if now_ms >= self.deadline_ms {
-            return DrainStepOutcome::DeadlineExceeded { elapsed_ms: elapsed };
+            return DrainStepOutcome::DeadlineExceeded {
+                elapsed_ms: elapsed,
+            };
         }
         if let Some(shard_id) = self.pending_shards.pop() {
             self.migrated.push(shard_id);
             if self.pending_shards.is_empty() {
-                DrainStepOutcome::Decommissioned { elapsed_ms: elapsed }
+                DrainStepOutcome::Decommissioned {
+                    elapsed_ms: elapsed,
+                }
             } else {
                 DrainStepOutcome::Migrated {
                     shard_id,
@@ -222,7 +235,9 @@ impl WorkerDrainCoordinator {
                 }
             }
         } else {
-            DrainStepOutcome::Decommissioned { elapsed_ms: elapsed }
+            DrainStepOutcome::Decommissioned {
+                elapsed_ms: elapsed,
+            }
         }
     }
 
@@ -258,14 +273,18 @@ pub struct SkewDetector {
 
 impl Default for SkewDetector {
     fn default() -> Self {
-        Self { skew_threshold_factor: 3.0 }
+        Self {
+            skew_threshold_factor: 3.0,
+        }
     }
 }
 
 impl SkewDetector {
     /// Create a detector with a custom skew threshold.
     pub fn new(skew_threshold_factor: f64) -> Self {
-        Self { skew_threshold_factor }
+        Self {
+            skew_threshold_factor,
+        }
     }
 
     /// Analyse a collection of shard load samples.
@@ -323,7 +342,8 @@ impl VirtualBucketHasher {
     fn fnv1a(data: &[u8]) -> u64 {
         const OFFSET: u64 = 14_695_981_039_346_656_037;
         const PRIME: u64 = 1_099_511_628_211;
-        data.iter().fold(OFFSET, |acc, &b| (acc ^ b as u64).wrapping_mul(PRIME))
+        data.iter()
+            .fold(OFFSET, |acc, &b| (acc ^ b as u64).wrapping_mul(PRIME))
     }
 }
 
@@ -350,14 +370,18 @@ pub struct ClusterPressureGauge {
 
 impl Default for ClusterPressureGauge {
     fn default() -> Self {
-        Self { shards_per_worker_ideal: 4 }
+        Self {
+            shards_per_worker_ideal: 4,
+        }
     }
 }
 
 impl ClusterPressureGauge {
     /// Create a gauge with a custom ideal shard count per worker.
     pub fn new(shards_per_worker_ideal: u32) -> Self {
-        Self { shards_per_worker_ideal }
+        Self {
+            shards_per_worker_ideal,
+        }
     }
 
     /// Compute the current `ClusterWorkerPressure` sample.
@@ -371,11 +395,11 @@ impl ClusterPressureGauge {
         total_shards: u32,
         now_ms: u64,
     ) -> ClusterWorkerPressure {
-        let active_workers =
-            workers.iter().filter(|s| s.is_active()).count() as u32;
-        let draining_workers =
-            workers.iter().filter(|s| matches!(s, WorkerLifecycleState::Draining { .. })).count()
-                as u32;
+        let active_workers = workers.iter().filter(|s| s.is_active()).count() as u32;
+        let draining_workers = workers
+            .iter()
+            .filter(|s| matches!(s, WorkerLifecycleState::Draining { .. }))
+            .count() as u32;
         let pressure = if active_workers == 0 {
             f64::INFINITY
         } else {
@@ -428,7 +452,10 @@ mod tests {
         let splitter = ProactiveSplitter::new(cfg);
         let trigger = splitter.trigger_bytes();
         match splitter.evaluate(ShardId(2), trigger) {
-            SplitDecision::ScheduleSplit { shard_id, state_bytes } => {
+            SplitDecision::ScheduleSplit {
+                shard_id,
+                state_bytes,
+            } => {
                 assert_eq!(shard_id, ShardId(2));
                 assert_eq!(state_bytes, trigger);
             }
@@ -525,13 +552,31 @@ mod tests {
         let splitter = ProactiveSplitter::with_defaults();
         let trigger = splitter.trigger_bytes();
         let samples = vec![
-            ShardLoadSample { shard_id: ShardId(1), state_bytes: 100, rows_per_epoch: 10 },
-            ShardLoadSample { shard_id: ShardId(2), state_bytes: trigger, rows_per_epoch: 500 },
-            ShardLoadSample { shard_id: ShardId(3), state_bytes: 200, rows_per_epoch: 20 },
+            ShardLoadSample {
+                shard_id: ShardId(1),
+                state_bytes: 100,
+                rows_per_epoch: 10,
+            },
+            ShardLoadSample {
+                shard_id: ShardId(2),
+                state_bytes: trigger,
+                rows_per_epoch: 500,
+            },
+            ShardLoadSample {
+                shard_id: ShardId(3),
+                state_bytes: 200,
+                rows_per_epoch: 20,
+            },
         ];
         let decisions = splitter.poll_splits(samples);
         assert_eq!(decisions.len(), 1);
-        assert!(matches!(decisions[0], SplitDecision::ScheduleSplit { shard_id: ShardId(2), .. }));
+        assert!(matches!(
+            decisions[0],
+            SplitDecision::ScheduleSplit {
+                shard_id: ShardId(2),
+                ..
+            }
+        ));
     }
 
     // ── WorkerDrainCoordinator tests ────────────────────────────────────────
@@ -546,12 +591,7 @@ mod tests {
         let now_ms = 0_u64;
         let shards: Vec<ShardId> = (1..=4).map(ShardId).collect();
 
-        let mut coord = WorkerDrainCoordinator::new(
-            WorkerId(42),
-            deadline_ms,
-            now_ms,
-            shards,
-        );
+        let mut coord = WorkerDrainCoordinator::new(WorkerId(42), deadline_ms, now_ms, shards);
         assert_eq!(coord.shards_remaining(), 4);
 
         // Each shard migration takes 20s.
@@ -580,12 +620,7 @@ mod tests {
         let now_ms = 0_u64;
         let shards: Vec<ShardId> = (1..=4).map(ShardId).collect();
 
-        let mut coord = WorkerDrainCoordinator::new(
-            WorkerId(99),
-            deadline_ms,
-            now_ms,
-            shards,
-        );
+        let mut coord = WorkerDrainCoordinator::new(WorkerId(99), deadline_ms, now_ms, shards);
         // Each step would take 10s, but deadline is 5s.
         let result = coord.drain_all(now_ms, 10_000_u64);
         assert!(result.is_err(), "expected deadline exceeded");
@@ -593,12 +628,7 @@ mod tests {
 
     #[test]
     fn drain_single_shard_decommissions() {
-        let mut coord = WorkerDrainCoordinator::new(
-            WorkerId(1),
-            60_000,
-            0,
-            vec![ShardId(100)],
-        );
+        let mut coord = WorkerDrainCoordinator::new(WorkerId(1), 60_000, 0, vec![ShardId(100)]);
         match coord.step(1_000) {
             DrainStepOutcome::Decommissioned { elapsed_ms } => {
                 assert_eq!(elapsed_ms, 1_000);
@@ -610,12 +640,13 @@ mod tests {
     #[test]
     fn drain_lifecycle_state_transitions() {
         let shards: Vec<ShardId> = (1..=3).map(ShardId).collect();
-        let mut coord =
-            WorkerDrainCoordinator::new(WorkerId(7), 60_000, 0, shards);
+        let mut coord = WorkerDrainCoordinator::new(WorkerId(7), 60_000, 0, shards);
 
         // Initial state.
         match coord.lifecycle_state() {
-            WorkerLifecycleState::Draining { shards_remaining, .. } => {
+            WorkerLifecycleState::Draining {
+                shards_remaining, ..
+            } => {
                 assert_eq!(shards_remaining, 3);
             }
             other => panic!("unexpected state {other:?}"),
@@ -624,7 +655,9 @@ mod tests {
         // After one step.
         coord.step(1_000);
         match coord.lifecycle_state() {
-            WorkerLifecycleState::Draining { shards_remaining, .. } => {
+            WorkerLifecycleState::Draining {
+                shards_remaining, ..
+            } => {
                 assert_eq!(shards_remaining, 2);
             }
             other => panic!("unexpected state {other:?}"),
@@ -641,10 +674,26 @@ mod tests {
     #[test]
     fn proof_skewed_cluster_detected() {
         let samples = vec![
-            ShardLoadSample { shard_id: ShardId(1), state_bytes: 10_000, rows_per_epoch: 1_000 },
-            ShardLoadSample { shard_id: ShardId(2), state_bytes: 1_000, rows_per_epoch: 100 },
-            ShardLoadSample { shard_id: ShardId(3), state_bytes: 1_000, rows_per_epoch: 100 },
-            ShardLoadSample { shard_id: ShardId(4), state_bytes: 1_000, rows_per_epoch: 100 },
+            ShardLoadSample {
+                shard_id: ShardId(1),
+                state_bytes: 10_000,
+                rows_per_epoch: 1_000,
+            },
+            ShardLoadSample {
+                shard_id: ShardId(2),
+                state_bytes: 1_000,
+                rows_per_epoch: 100,
+            },
+            ShardLoadSample {
+                shard_id: ShardId(3),
+                state_bytes: 1_000,
+                rows_per_epoch: 100,
+            },
+            ShardLoadSample {
+                shard_id: ShardId(4),
+                state_bytes: 1_000,
+                rows_per_epoch: 100,
+            },
         ];
         let detector = SkewDetector::default();
         let report = detector.analyse(samples).expect("non-empty samples");
@@ -694,7 +743,10 @@ mod tests {
 
     #[test]
     fn virtual_bucket_is_stable() {
-        let cfg = VirtualBucketConfig { key_prefix: b"hot-key".to_vec(), bucket_count: 16 };
+        let cfg = VirtualBucketConfig {
+            key_prefix: b"hot-key".to_vec(),
+            bucket_count: 16,
+        };
         let b1 = VirtualBucketHasher::bucket_for(b"hot-key:1234", &cfg);
         let b2 = VirtualBucketHasher::bucket_for(b"hot-key:1234", &cfg);
         assert_eq!(b1, b2, "hash must be stable");
@@ -702,7 +754,10 @@ mod tests {
 
     #[test]
     fn virtual_bucket_in_range() {
-        let cfg = VirtualBucketConfig { key_prefix: b"prefix".to_vec(), bucket_count: 8 };
+        let cfg = VirtualBucketConfig {
+            key_prefix: b"prefix".to_vec(),
+            bucket_count: 8,
+        };
         for i in 0u8..=255 {
             let key = [b'k', i];
             let b = VirtualBucketHasher::bucket_for(&key, &cfg);
@@ -714,7 +769,10 @@ mod tests {
     fn virtual_bucket_distributes_keys() {
         // With 256 keys and 16 buckets, each bucket should receive ~16 keys.
         // We allow a generous ±12 slack for a deterministic FNV hash.
-        let cfg = VirtualBucketConfig { key_prefix: vec![], bucket_count: 16 };
+        let cfg = VirtualBucketConfig {
+            key_prefix: vec![],
+            bucket_count: 16,
+        };
         let mut counts = [0u32; 16];
         for i in 0u8..=255 {
             let bucket = VirtualBucketHasher::bucket_for(&[i], &cfg) as usize;
@@ -722,7 +780,7 @@ mod tests {
         }
         for (b, &c) in counts.iter().enumerate() {
             assert!(
-                c >= 4 && c <= 28,
+                (4..=28).contains(&c),
                 "bucket {b} has {c} keys — distribution too uneven"
             );
         }
@@ -746,7 +804,11 @@ mod tests {
         let p = gauge.sample(&workers, 8, 1000);
         assert_eq!(p.active_workers, 2);
         assert_eq!(p.draining_workers, 0);
-        assert!((p.pressure - 1.0).abs() < 1e-9, "expected pressure 1.0, got {}", p.pressure);
+        assert!(
+            (p.pressure - 1.0).abs() < 1e-9,
+            "expected pressure 1.0, got {}",
+            p.pressure
+        );
 
         // Add 4 more shards → 12 shards, 2 workers → pressure = 12/8 = 1.5 (scale-out)
         let p2 = gauge.sample(&workers, 12, 2000);
@@ -771,7 +833,10 @@ mod tests {
         let gauge = ClusterPressureGauge::new(4);
         let workers = vec![
             WorkerLifecycleState::Active,
-            WorkerLifecycleState::Draining { shards_remaining: 2, started_at_ms: 0 },
+            WorkerLifecycleState::Draining {
+                shards_remaining: 2,
+                started_at_ms: 0,
+            },
         ];
         let p = gauge.sample(&workers, 8, 0);
         // Only 1 active worker; draining worker is excluded from capacity denominator.
@@ -786,7 +851,9 @@ mod tests {
         let gauge = ClusterPressureGauge::new(4);
         let workers = vec![
             WorkerLifecycleState::Active,
-            WorkerLifecycleState::Decommissioned { completed_at_ms: 1000 },
+            WorkerLifecycleState::Decommissioned {
+                completed_at_ms: 1000,
+            },
         ];
         let p = gauge.sample(&workers, 4, 0);
         assert_eq!(p.active_workers, 1);
@@ -812,14 +879,20 @@ mod tests {
 
     #[test]
     fn lifecycle_draining_not_active() {
-        let s = WorkerLifecycleState::Draining { shards_remaining: 2, started_at_ms: 0 };
+        let s = WorkerLifecycleState::Draining {
+            shards_remaining: 2,
+            started_at_ms: 0,
+        };
         assert!(!s.is_active());
         assert!(s.is_draining_or_decommissioned());
     }
 
     #[test]
     fn lifecycle_serde_roundtrip() {
-        let s = WorkerLifecycleState::Draining { shards_remaining: 3, started_at_ms: 12345 };
+        let s = WorkerLifecycleState::Draining {
+            shards_remaining: 3,
+            started_at_ms: 12345,
+        };
         let json = serde_json::to_string(&s).unwrap();
         let decoded: WorkerLifecycleState = serde_json::from_str(&json).unwrap();
         assert_eq!(s, decoded);

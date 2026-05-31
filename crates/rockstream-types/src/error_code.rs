@@ -115,7 +115,8 @@ pub const RS_2003: ErrorCode = ErrorCode::new(2003);
 /// Merge operand malformed (fail-closed: never silently overwrites).
 pub const RS_3009: ErrorCode = ErrorCode::new(3009);
 /// Pipeline blocked due to object store brownout; local buffer exhausted (v0.36, DESIGN.md §11.7).
-pub const RS_3003: ErrorCode = ErrorCode::new(3003);/// Worker drain in progress; new shard assignments rejected (v0.38).
+pub const RS_3003: ErrorCode = ErrorCode::new(3003);
+/// Worker drain in progress; new shard assignments rejected (v0.38).
 pub const RS_3604: ErrorCode = ErrorCode::new(3604);
 /// Shard load factor exceeds skew threshold; adaptive re-sharding scheduled (v0.38).
 pub const RS_3605: ErrorCode = ErrorCode::new(3605);

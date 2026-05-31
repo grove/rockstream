@@ -293,7 +293,10 @@ async fn handle_connection(
             }
             // v0.38 drain / lifecycle messages — acknowledged but not yet
             // fully handled by the control-plane service stub.
-            WorkerMessage::DrainAck { worker_id, shards_remaining } => {
+            WorkerMessage::DrainAck {
+                worker_id,
+                shards_remaining,
+            } => {
                 tracing::info!(
                     %worker_id,
                     shards_remaining,
