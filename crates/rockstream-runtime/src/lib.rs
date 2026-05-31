@@ -19,6 +19,7 @@ pub mod explain;
 pub mod frontier;
 pub mod pipeline;
 pub mod recovery;
+pub mod split;
 pub mod support_bundle;
 
 #[cfg(test)]
