@@ -115,8 +115,12 @@ pub const RS_2003: ErrorCode = ErrorCode::new(2003);
 /// Merge operand malformed (fail-closed: never silently overwrites).
 pub const RS_3009: ErrorCode = ErrorCode::new(3009);
 /// Pipeline blocked due to object store brownout; local buffer exhausted (v0.36, DESIGN.md §11.7).
-pub const RS_3003: ErrorCode = ErrorCode::new(3003);
-
+pub const RS_3003: ErrorCode = ErrorCode::new(3003);/// Worker drain in progress; new shard assignments rejected (v0.38).
+pub const RS_3604: ErrorCode = ErrorCode::new(3604);
+/// Shard load factor exceeds skew threshold; adaptive re-sharding scheduled (v0.38).
+pub const RS_3605: ErrorCode = ErrorCode::new(3605);
+/// Worker drain deadline exceeded; worker self-fenced (v0.38).
+pub const RS_3606: ErrorCode = ErrorCode::new(3606);
 // 4xxx: Connector
 /// Source connection failed.
 pub const RS_4001: ErrorCode = ErrorCode::new(4001);
@@ -175,6 +179,9 @@ pub fn description(code: ErrorCode) -> &'static str {
         2003 => "Unsupported isolation level",
         3003 => "Pipeline blocked: object store brownout, local buffer exhausted",
         3009 => "Merge operand malformed",
+        3604 => "Worker drain in progress; new shard assignments rejected",
+        3605 => "Shard load factor exceeds skew threshold; adaptive re-sharding scheduled",
+        3606 => "Worker drain deadline exceeded; worker self-fenced",
         4001 => "Source connection failed",
         4002 => "Sink write failed",
         5001 => "Incompatible storage format",

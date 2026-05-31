@@ -128,6 +128,9 @@ pub struct WorkerInfo {
     pub registered_at_ms: u64,
     /// Whether the worker is currently considered healthy.
     pub healthy: bool,
+    /// Current lifecycle state of the worker (v0.38).
+    #[serde(default)]
+    pub lifecycle: WorkerLifecycleState,
 }
 
 impl WorkerInfo {
@@ -140,6 +143,7 @@ impl WorkerInfo {
             capacity_headroom: reg.capacity_headroom,
             registered_at_ms: reg.registered_at_ms,
             healthy: true,
+            lifecycle: WorkerLifecycleState::Active,
         }
     }
 
@@ -191,6 +195,187 @@ pub enum ControlMessage {
         /// `true` if `lease_token` is the current active token.
         valid: bool,
     },
+    /// Instructs the worker to begin the drain protocol (v0.38).
+    ///
+    /// The worker must transition to `WorkerLifecycleState::Draining`, stop
+    /// accepting new shard assignments, and hand off all owned shards within
+    /// the specified deadline.
+    BeginDrain(DrainRequest),
+    /// Published by the control plane after all workers have reported their
+    /// pressure samples; consumers (HPA adapters) read this gauge (v0.38).
+    ClusterPressureGauge(ClusterWorkerPressure),
+}
+
+/// Lifecycle state of a worker node (v0.38 drain protocol).
+///
+/// Transitions: `Active` → `Draining` → `Decommissioned`.
+///
+/// Once `Decommissioned`, the control plane stops assigning new shards and
+/// the worker is removed from the topology after a short grace period.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorkerLifecycleState {
+    /// Normal operation — accepts new shard assignments.
+    Active,
+    /// Drain requested — the worker is handing off all owned shards.
+    /// New shard assignments are rejected.  Transitions to `Decommissioned`
+    /// once `shards_remaining == 0`.
+    Draining {
+        /// How many shards are still owned by this worker.
+        shards_remaining: u32,
+        /// Wall-clock time (ms since Unix epoch) when the drain was requested.
+        started_at_ms: u64,
+    },
+    /// All shards have been migrated away; the worker is idle and may exit.
+    Decommissioned {
+        /// Wall-clock time (ms since Unix epoch) when decommission completed.
+        completed_at_ms: u64,
+    },
+}
+
+impl WorkerLifecycleState {
+    /// Returns `true` if the worker is in the `Active` state.
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// Returns `true` if the worker is draining or decommissioned
+    /// (i.e., should not receive new shard assignments).
+    pub fn is_draining_or_decommissioned(&self) -> bool {
+        !self.is_active()
+    }
+}
+
+impl Default for WorkerLifecycleState {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+/// Request from the control plane to a worker to begin draining.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainRequest {
+    /// The worker that should begin draining.
+    pub worker_id: WorkerId,
+    /// Hard deadline by which the drain must complete (ms since Unix epoch).
+    /// Workers that exceed this deadline self-fence and stop committing epochs.
+    pub deadline_ms: u64,
+}
+
+/// Configuration for the proactive splitter (v0.38).
+///
+/// The proactive splitter monitors per-shard state size and triggers a split
+/// *before* the shard reaches the alert threshold, ensuring no freshness SLO
+/// is missed due to an emergency reactive split.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProactiveSplitConfig {
+    /// Target shard state size in bytes.  Once a shard's state exceeds
+    /// `target_shard_state_bytes * split_trigger_fraction` the proactive
+    /// splitter schedules a split.
+    pub target_shard_state_bytes: u64,
+    /// Fraction of `target_shard_state_bytes` at which proactive splitting is
+    /// triggered.  Must be in `(0.0, 1.0]`.  Default: `0.80`.
+    pub split_trigger_fraction: f64,
+    /// Fraction of `target_shard_state_bytes` considered the "alert threshold".
+    /// Proactive splits must start before this threshold to meet the SLO.
+    /// Default: `0.90`.
+    pub alert_threshold_fraction: f64,
+}
+
+impl Default for ProactiveSplitConfig {
+    fn default() -> Self {
+        Self {
+            target_shard_state_bytes: 32 * 1024 * 1024 * 1024, // 32 GiB
+            split_trigger_fraction: 0.80,
+            alert_threshold_fraction: 0.90,
+        }
+    }
+}
+
+impl ProactiveSplitConfig {
+    /// Byte threshold at which a proactive split should be scheduled.
+    pub fn split_trigger_bytes(&self) -> u64 {
+        (self.target_shard_state_bytes as f64 * self.split_trigger_fraction) as u64
+    }
+
+    /// Byte threshold considered the "alert threshold".
+    pub fn alert_threshold_bytes(&self) -> u64 {
+        (self.target_shard_state_bytes as f64 * self.alert_threshold_fraction) as u64
+    }
+}
+
+/// Per-shard load sample used for skew detection (v0.38).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardLoadSample {
+    /// Which shard this sample describes.
+    pub shard_id: ShardId,
+    /// Estimated state size in bytes (arrangement rows × avg row size).
+    pub state_bytes: u64,
+    /// Number of input rows processed in the most recent epoch.
+    pub rows_per_epoch: u64,
+}
+
+/// Result of a skew-detection pass across all shards (v0.38).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkewReport {
+    /// The shard carrying the heaviest load.
+    pub worst_shard: ShardId,
+    /// `worst_shard.state_bytes / median_state_bytes`.
+    /// A ratio > `skew_threshold` means the cluster is skewed.
+    pub load_factor: f64,
+    /// Median shard state size in bytes.
+    pub median_state_bytes: u64,
+    /// Whether the load factor exceeds the configured threshold.
+    pub skewed: bool,
+}
+
+/// Virtual-bucket configuration for hot-key splitting (v0.38).
+///
+/// When a single key accumulates disproportionate state (e.g. a viral hashtag
+/// in a social-graph view), a virtual bucket sub-divides that key across
+/// `bucket_count` logical sub-shards using a stable hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualBucketConfig {
+    /// The hot key prefix (first `prefix_len` bytes) that should be split.
+    pub key_prefix: Vec<u8>,
+    /// How many virtual sub-buckets to create for this prefix.
+    /// Must be a power of two in `[2, 1024]`.
+    pub bucket_count: u16,
+}
+
+/// The `cluster_worker_pressure` metric exposed for infrastructure autoscaling
+/// (e.g. Kubernetes HPA) (v0.38).
+///
+/// Values:
+/// - `< 1.0` — cluster has headroom; scale-in safe
+/// - `1.0`   — ideal steady state
+/// - `> 1.0` — overloaded; add workers
+/// - `>= 2.0` — critical; emergency scale-out
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClusterWorkerPressure {
+    /// Pressure value (dimensionless ratio).
+    pub pressure: f64,
+    /// Number of workers currently in `Active` state.
+    pub active_workers: u32,
+    /// Number of workers currently in `Draining` state.
+    pub draining_workers: u32,
+    /// Total shard count across the cluster.
+    pub total_shards: u32,
+    /// Timestamp when this sample was computed (ms since Unix epoch).
+    pub sampled_at_ms: u64,
+}
+
+impl ClusterWorkerPressure {
+    /// A freshly initialised gauge representing a single idle worker.
+    pub fn idle() -> Self {
+        Self {
+            pressure: 0.0,
+            active_workers: 1,
+            draining_workers: 0,
+            total_shards: 0,
+            sampled_at_ms: 0,
+        }
+    }
 }
 
 /// A message sent from a worker to the control plane.
@@ -218,6 +403,22 @@ pub enum WorkerMessage {
     FenceWrite {
         shard_id: ShardId,
         lease_token: crate::ids::LeaseToken,
+    },
+    /// Worker acknowledges a drain request and reports how many shards it
+    /// still owns (v0.38).
+    DrainAck {
+        worker_id: WorkerId,
+        shards_remaining: u32,
+    },
+    /// Worker reports its updated lifecycle state (v0.38).
+    LifecycleState {
+        worker_id: WorkerId,
+        state: WorkerLifecycleState,
+    },
+    /// Worker reports a per-shard load sample for skew detection (v0.38).
+    ShardLoadReport {
+        worker_id: WorkerId,
+        samples: Vec<ShardLoadSample>,
     },
 }
 
