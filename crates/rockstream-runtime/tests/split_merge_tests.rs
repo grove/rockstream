@@ -27,20 +27,17 @@
 //!    original.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use rockstream_runtime::checkpoint::CheckpointId;
 use rockstream_runtime::split::{MergePhase, ShardMergeOp, ShardSplitOp, SplitPhase};
-use rockstream_sim::{
-    apply_tombstone_gc, simulate_donor_cleanup, simulate_split_migration, SimEntry, SimShardMap,
-};
+use rockstream_sim::{simulate_donor_cleanup, simulate_split_migration, SimEntry, SimShardMap};
 use rockstream_types::ids::ShardId;
 use rockstream_types::laws::or_set::{decode_or_set, encode_or_set, OrSetPair};
 use rockstream_types::laws::{
     MaxRegisterV1, OrSetV1, SumCountV1, WeightAddV1, MAX_REGISTER_ID, OR_SET_ID, SUM_COUNT_ID,
     WEIGHT_ADD_ID,
 };
-use rockstream_types::merge_law::{ArrangementHeader, LawBundle, MergeLawId, MergeLawVersion};
+use rockstream_types::merge_law::{ArrangementHeader, MergeLawId, MergeLawVersion};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
