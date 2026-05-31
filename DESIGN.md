@@ -5115,8 +5115,8 @@ against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
    verifiability property (§8.4) is not tested against LIST staleness.
    Mitigation: add `list_staleness_epochs` fault parameter to
    `SimObjectStore` by v0.38.
-   Status: **[UNMITIGATED]** — informational only; CALM property depends on
-   direct manifest reads, not LIST.
+   Status: **[UNMITIGATED — v0.38 deferred to v0.39]** — informational only;
+   CALM property depends on direct manifest reads, not LIST.
 
 4. **Network packet fragmentation** — TCP segmentation of large shuffle
    frames is not exercised in simulation. Consequence: the `wire_version`

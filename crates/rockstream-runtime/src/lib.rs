@@ -10,6 +10,9 @@
 //! v0.34 adds the cluster checkpoint protocol: barrier injection, bounded
 //! alignment buffers, per-shard checkpoint creation, atomic cluster checkpoint
 //! commit, and old checkpoint GC.
+//!
+//! v0.38 adds the proactive scaling module: proactive splitter, worker drain
+//! coordinator, skew detector, virtual-bucket hasher, and cluster-pressure gauge.
 
 pub mod bench;
 pub mod checkpoint;
@@ -19,6 +22,7 @@ pub mod explain;
 pub mod frontier;
 pub mod pipeline;
 pub mod recovery;
+pub mod scaling;
 pub mod split;
 pub mod support_bundle;
 

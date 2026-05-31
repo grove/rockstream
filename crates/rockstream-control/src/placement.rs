@@ -55,7 +55,9 @@ impl PlacementAlgorithm {
 mod tests {
     use super::*;
     use rockstream_types::ids::WorkerId;
-    use rockstream_types::topology::{CapacityHeadroom, NodeRole, WorkerInfo};
+    use rockstream_types::topology::{
+        CapacityHeadroom, NodeRole, WorkerInfo, WorkerLifecycleState,
+    };
 
     fn make_worker(id: u64, headroom: f64) -> WorkerInfo {
         WorkerInfo {
@@ -65,6 +67,7 @@ mod tests {
             capacity_headroom: CapacityHeadroom::new(headroom),
             registered_at_ms: 0,
             healthy: true,
+            lifecycle: WorkerLifecycleState::Active,
         }
     }
 

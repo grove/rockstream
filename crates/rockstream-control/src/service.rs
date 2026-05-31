@@ -291,6 +291,32 @@ async fn handle_connection(
                 let reply = ControlMessage::FenceAck { shard_id, valid };
                 send_message(&mut writer, &reply).await;
             }
+            // v0.38 drain / lifecycle messages — acknowledged but not yet
+            // fully handled by the control-plane service stub.
+            WorkerMessage::DrainAck {
+                worker_id,
+                shards_remaining,
+            } => {
+                tracing::info!(
+                    %worker_id,
+                    shards_remaining,
+                    "control: drain ack received"
+                );
+            }
+            WorkerMessage::LifecycleState { worker_id, state } => {
+                tracing::info!(
+                    %worker_id,
+                    state = ?state,
+                    "control: worker lifecycle state update"
+                );
+            }
+            WorkerMessage::ShardLoadReport { worker_id, samples } => {
+                tracing::debug!(
+                    %worker_id,
+                    sample_count = samples.len(),
+                    "control: shard load report received"
+                );
+            }
         }
     }
 
