@@ -33,22 +33,28 @@ gates, and the build philosophy, see [ROADMAP.md](ROADMAP.md).
 
 The phase numbers here map to ROADMAP.md roadmap versions as follows:
 
-| Phase | ROADMAP versions | Status | Focus |
-|---|---|---|---|
-| 0 | v0.1–v0.4 | ✅ Complete | Repository, simulation, storage, no-op pipeline |
-| 1 | v0.5–v0.10 | ✅ Complete | Single-shard IVM core (IVM-1 … IVM-3) |
-| 2 | v0.11–v0.18 | ✅ Complete | SQL frontend, joins, set ops (IVM-4 … IVM-6) |
-| 3 | v0.19–v0.26 | ✅ Complete | Advanced operators: windows, recursion, view-on-view (IVM-7 … IVM-12) |
-| 3.5 | v0.27 | ✅ Complete | IVM correctness soak (IVM-13) |
-| 4 | v0.28–v0.30 | Not started | Multi-shard execution and exchange subsystem |
-| 5 | v0.31–v0.32 | Not started | Frontier protocol and progress tracking |
-| 6 | v0.33–v0.36 | Not started | Fault tolerance, exactly-once, chaos |
-| 7 | v0.37–v0.39 | Not started | Elasticity: split, merge, drain, clone |
-| 8 | v0.40–v0.43 | Not started | Postgres query gateway, introspection, freshness, subscribe, direct-write CRDT surface, OLTP session ergonomics |
-| 9 | v0.44–v0.45 | Not started | Connectors and sinks (Tier 1 + Tier 2 contract); OR-Set; CRDT schema metadata |
-| 10 | v0.46–v0.50 | Not started | Auth, observability, auto-tuner, secondary indexes, upgrades, security |
-| 11 | v0.51–v0.52 | Not started | Long soak and production beta handoff |
-| 12 | v0.53–v0.55 | Not started | Cold-tier sink, Iceberg REST catalog, snapshot GC |
+| Phase | ROADMAP versions | Status | Focus | Sign-Off |
+|---|---|---|---|---|
+| 0 | v0.1–v0.4 | ✅ Complete | Repository, simulation, storage, no-op pipeline | — |
+| 1 | v0.5–v0.10 | ✅ Complete | Single-shard IVM core (IVM-1 … IVM-3) | — |
+| 2 | v0.11–v0.18 | ✅ Complete | SQL frontend, joins, set ops (IVM-4 … IVM-6) | — |
+| 3 | v0.19–v0.26 | ✅ Complete | Advanced operators: windows, recursion, view-on-view (IVM-7 … IVM-12) | plans/full-assessment-v0.18.md |
+| 3.5 | v0.27 | ✅ Complete | IVM correctness soak (IVM-13) | sign-offs/v0.27.md |
+| 4 | v0.28–v0.30 | ✅ Done (*) | Multi-shard execution and exchange subsystem | plans/phase4-signoff.md [OUTSTANDING] |
+| 5 | v0.31–v0.32 | ✅ Done (*) | Frontier protocol and progress tracking | plans/phase5-signoff.md [OUTSTANDING] |
+| 6 | v0.33–v0.36 | ✅ Done (*) | Fault tolerance, exactly-once, chaos | plans/full-assessment-v0.36.md |
+| 7 | v0.37–v0.39 | Not started | Elasticity: split, merge, drain, clone | — |
+| 8 | v0.40–v0.43 | Not started | Postgres query gateway, introspection, freshness, subscribe, direct-write CRDT surface, OLTP session ergonomics | — |
+| 9 | v0.44–v0.45 | Not started | Connectors and sinks (Tier 1 + Tier 2 contract); OR-Set; CRDT schema metadata | — |
+| 10 | v0.46–v0.50 | Not started | Auth, observability, auto-tuner, secondary indexes, upgrades, security | — |
+| 11 | v0.51–v0.52 | Not started | Long soak and production beta handoff | — |
+| 12 | v0.53–v0.55 | Not started | Cold-tier sink, Iceberg REST catalog, snapshot GC | — |
+
+> (*) Done with outstanding sign-off items. Phases 4 and 5 lack formal sign-off artifacts
+> for their real-network and real-S3 exit criteria. Until `plans/phase4-signoff.md` and
+> `plans/phase5-signoff.md` are written (with either test results or a documented waiver
+> with compensating simulation controls), the ✅ marks are provisional. These sign-offs
+> are blocking before the Integration Beta gate (Phase 9 / v0.45).
 
 Durations are indicative effort, not calendar time, and assume a small
 dedicated team. The ROADMAP.md version table is the single source of truth
@@ -821,6 +827,19 @@ production-ready.
   exchange stress test with hierarchical domains must stay within configured
   connection and durable shuffle-object budgets.
 
+**Waiver option (if 4-host real-network test is not feasible at phase completion)**
+
+A criterion may be waived if ALL of the following compensating controls are met:
+1. `SimNetwork` latency injection covering median 10 ms, p99 100 ms, ±5 ms jitter.
+2. ≥10 000 simulation seeds exercising the shuffle protocol under simulated latency.
+3. The waiver is documented in `plans/phase4-signoff.md` with rationale and a
+   commitment to run the real-network test before the Integration Beta gate (v0.45).
+4. The waiver is reviewed and explicitly approved by the technical lead.
+
+Waived criteria are marked `[WAIVED]` in `plans/phase4-signoff.md`. They become
+blocking before Phase 9 exit (Integration Beta). This document (`plans/phase4-signoff.md`)
+is an **outstanding deliverable** as of v0.36.
+
 **→ Operability deliverables (Phase 4)**
 
 - **Real role flags.** `--role=control|worker|gateway|all` selects which
@@ -977,6 +996,25 @@ production-ready.
   FoundationDB simulation discipline is active, not aspirational.
 - Routine worker restart surfaces `RECOVERING` with `recovery_progress` and
   suppresses false SLO alerts until `recovery_deadline`; missed deadlines alert.
+
+**v0.36 known gaps (tracked for resolution before Integration Beta, v0.45)**
+
+The following Phase 6 items were delivered as stubs in v0.36 and require
+production implementation before the Integration Beta gate:
+
+- [ ] **Kafka sink exactly-once**: the `KafkaSink` in v0.36 is a stub. Real
+  Kafka exactly-once requires `transactional.id` registration, epoch bumping
+  via `initTransactions`, and broker-side abort-on-timeout recovery
+  (`CheckBeforeCommit` idempotency profile). Tracked before v0.43.
+- [ ] **S3 sink exactly-once**: the `S3Sink` stub does not implement real MPU
+  lifecycle. Production requires abort-on-crash MPU scan and idempotent
+  conditional-rename. Tracked before v0.43.
+- [ ] **Postgres sink exactly-once**: the `PostgresSink` stub does not
+  implement `PREPARE TRANSACTION` / `COMMIT PREPARED`. Tracked before v0.43.
+- [ ] **Phase 4 real-network sign-off**: `plans/phase4-signoff.md` with 4-host
+  test results or formal waiver. Blocking before Phase 9 exit.
+- [ ] **Phase 5 real-S3 sign-off**: `plans/phase5-signoff.md` with ≥1 GB
+  benchmark on real S3. Blocking before Phase 9 exit.
 
 ---
 
