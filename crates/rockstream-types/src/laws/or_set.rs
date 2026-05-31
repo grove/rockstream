@@ -161,7 +161,10 @@ mod tests {
     use crate::merge_law::LawBundle;
 
     fn pair(e: u64, t: u64) -> OrSetPair {
-        OrSetPair { element_id: e, tag: t }
+        OrSetPair {
+            element_id: e,
+            tag: t,
+        }
     }
 
     #[test]

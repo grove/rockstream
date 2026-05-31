@@ -41,8 +41,14 @@ impl ShardRange {
             self.hi
         );
         (
-            ShardRange { lo: self.lo, hi: split_key_hash - 1 },
-            ShardRange { lo: split_key_hash, hi: self.hi },
+            ShardRange {
+                lo: self.lo,
+                hi: split_key_hash - 1,
+            },
+            ShardRange {
+                lo: split_key_hash,
+                hi: self.hi,
+            },
         )
     }
 }
@@ -72,7 +78,10 @@ impl SimShardMap {
             version: 0,
             shards: vec![ShardOwnership {
                 shard_id,
-                range: ShardRange { lo: 0, hi: u64::MAX },
+                range: ShardRange {
+                    lo: 0,
+                    hi: u64::MAX,
+                },
             }],
         }
     }
@@ -102,12 +111,7 @@ impl SimShardMap {
     /// `new_shard_id` receives the upper half.  Bumps the version.
     ///
     /// Panics if `donor_id` is not found in the map.
-    pub fn apply_split(
-        &mut self,
-        donor_id: ShardId,
-        new_shard_id: ShardId,
-        split_key_hash: u64,
-    ) {
+    pub fn apply_split(&mut self, donor_id: ShardId, new_shard_id: ShardId, split_key_hash: u64) {
         let pos = self
             .shards
             .iter()
@@ -167,8 +171,11 @@ impl SimShardMap {
     ///
     /// This is O(shards²) — only call it in tests.
     pub fn assert_no_gaps_or_overlaps(&self) {
-        let mut coverage: Vec<(u64, u64)> =
-            self.shards.iter().map(|s| (s.range.lo, s.range.hi)).collect();
+        let mut coverage: Vec<(u64, u64)> = self
+            .shards
+            .iter()
+            .map(|s| (s.range.lo, s.range.hi))
+            .collect();
         coverage.sort_unstable();
 
         // Check no overlap and no gap.

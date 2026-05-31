@@ -70,8 +70,7 @@ pub fn simulate_split_migration(
     new_shard_id: ShardId,
     law: &dyn LawBundle,
 ) -> (Vec<SimEntry>, Vec<SimEntry>) {
-    let (donor, mut new_shard) =
-        simulate_donor_cleanup(entries, split_key_hash, new_shard_id);
+    let (donor, mut new_shard) = simulate_donor_cleanup(entries, split_key_hash, new_shard_id);
     apply_tombstone_gc(&mut new_shard, law);
     (donor, new_shard)
 }
@@ -79,9 +78,9 @@ pub fn simulate_split_migration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rockstream_types::ids::ShardId;
     use rockstream_types::laws::{WeightAddV1, WEIGHT_ADD_ID};
     use rockstream_types::merge_law::{ArrangementHeader, MergeLawVersion};
-    use rockstream_types::ids::ShardId;
 
     fn weight_header() -> ArrangementHeader {
         ArrangementHeader {
@@ -99,10 +98,26 @@ mod tests {
         let law = WeightAddV1;
         let hdr = weight_header();
         let mut entries = vec![
-            SimEntry { key_hash: 1, header: hdr, value: encode_weight(0) }, // identity
-            SimEntry { key_hash: 2, header: hdr, value: encode_weight(5) }, // live
-            SimEntry { key_hash: 3, header: hdr, value: encode_weight(0) }, // identity
-            SimEntry { key_hash: 4, header: hdr, value: encode_weight(-1) }, // live
+            SimEntry {
+                key_hash: 1,
+                header: hdr,
+                value: encode_weight(0),
+            }, // identity
+            SimEntry {
+                key_hash: 2,
+                header: hdr,
+                value: encode_weight(5),
+            }, // live
+            SimEntry {
+                key_hash: 3,
+                header: hdr,
+                value: encode_weight(0),
+            }, // identity
+            SimEntry {
+                key_hash: 4,
+                header: hdr,
+                value: encode_weight(-1),
+            }, // live
         ];
         let removed = apply_tombstone_gc(&mut entries, &law);
         assert_eq!(removed, 2);
@@ -115,11 +130,14 @@ mod tests {
         let hdr = weight_header();
         let split = 100u64;
         let entries: Vec<SimEntry> = (0u64..200)
-            .map(|k| SimEntry { key_hash: k, header: hdr, value: vec![0] })
+            .map(|k| SimEntry {
+                key_hash: k,
+                header: hdr,
+                value: vec![0],
+            })
             .collect();
 
-        let (donor, new_shard) =
-            simulate_donor_cleanup(entries, split, ShardId(1));
+        let (donor, new_shard) = simulate_donor_cleanup(entries, split, ShardId(1));
 
         assert_eq!(donor.len(), 100);
         assert_eq!(new_shard.len(), 100);
@@ -135,18 +153,32 @@ mod tests {
         // 40 live entries on donor side, 30 live + 30 tombstone on new-shard side
         let mut entries = Vec::new();
         for k in 0..40 {
-            entries.push(SimEntry { key_hash: k, header: hdr, value: encode_weight(1) });
+            entries.push(SimEntry {
+                key_hash: k,
+                header: hdr,
+                value: encode_weight(1),
+            });
         }
         for k in 50..80 {
-            entries.push(SimEntry { key_hash: k, header: hdr, value: encode_weight(1) });
+            entries.push(SimEntry {
+                key_hash: k,
+                header: hdr,
+                value: encode_weight(1),
+            });
         }
         for k in 80..110 {
-            entries.push(SimEntry { key_hash: k, header: hdr, value: encode_weight(0) });
+            entries.push(SimEntry {
+                key_hash: k,
+                header: hdr,
+                value: encode_weight(0),
+            });
         }
 
         let (donor, new_shard) = simulate_split_migration(entries, split, ShardId(1), &law);
         assert_eq!(donor.len(), 40); // all donor entries survive (none are identity)
         assert_eq!(new_shard.len(), 30); // tombstones removed
-        assert!(new_shard.iter().all(|e| e.key_hash >= split && e.key_hash < 80));
+        assert!(new_shard
+            .iter()
+            .all(|e| e.key_hash >= split && e.key_hash < 80));
     }
 }

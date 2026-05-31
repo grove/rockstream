@@ -29,23 +29,26 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rockstream_runtime::checkpoint::CheckpointId;
 use rockstream_runtime::split::{MergePhase, ShardMergeOp, ShardSplitOp, SplitPhase};
 use rockstream_sim::{
     apply_tombstone_gc, simulate_donor_cleanup, simulate_split_migration, SimEntry, SimShardMap,
 };
 use rockstream_types::ids::ShardId;
+use rockstream_types::laws::or_set::{decode_or_set, encode_or_set, OrSetPair};
 use rockstream_types::laws::{
     MaxRegisterV1, OrSetV1, SumCountV1, WeightAddV1, MAX_REGISTER_ID, OR_SET_ID, SUM_COUNT_ID,
     WEIGHT_ADD_ID,
 };
-use rockstream_types::laws::or_set::{decode_or_set, encode_or_set, OrSetPair};
 use rockstream_types::merge_law::{ArrangementHeader, LawBundle, MergeLawId, MergeLawVersion};
-use rockstream_runtime::checkpoint::CheckpointId;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn header(id: MergeLawId) -> ArrangementHeader {
-    ArrangementHeader { law_id: id, law_version: MergeLawVersion(1) }
+    ArrangementHeader {
+        law_id: id,
+        law_version: MergeLawVersion(1),
+    }
 }
 
 fn encode_weight(w: i64) -> Vec<u8> {
@@ -72,28 +75,51 @@ fn proof_shard_split_state_machine_lifecycle() {
     assert!(matches!(op.phase, SplitPhase::Idle));
 
     op.begin_checkpoint(CheckpointId(10));
-    assert!(matches!(op.phase, SplitPhase::Checkpointing { checkpoint_id: CheckpointId(10) }));
+    assert!(matches!(
+        op.phase,
+        SplitPhase::Checkpointing {
+            checkpoint_id: CheckpointId(10)
+        }
+    ));
 
     op.checkpoint_ready();
-    assert!(matches!(op.phase, SplitPhase::Copying { rows_copied: 0, .. }));
+    assert!(matches!(
+        op.phase,
+        SplitPhase::Copying { rows_copied: 0, .. }
+    ));
 
     op.record_rows_copied(200);
     op.record_rows_copied(300);
-    assert!(matches!(op.phase, SplitPhase::Copying { rows_copied: 500, .. }));
+    assert!(matches!(
+        op.phase,
+        SplitPhase::Copying {
+            rows_copied: 500,
+            ..
+        }
+    ));
 
     op.copy_complete();
-    assert!(matches!(op.phase, SplitPhase::AwaitingCutover { rows_copied: 500 }));
+    assert!(matches!(
+        op.phase,
+        SplitPhase::AwaitingCutover { rows_copied: 500 }
+    ));
 
     op.cutover(7);
     assert!(matches!(
         op.phase,
-        SplitPhase::Cleanup { cutover_epoch: 7, rows_to_cleanup: 500 }
+        SplitPhase::Cleanup {
+            cutover_epoch: 7,
+            rows_to_cleanup: 500
+        }
     ));
 
     op.cleanup_complete();
     assert!(matches!(
         op.phase,
-        SplitPhase::Done { cutover_epoch: 7, rows_migrated: 500 }
+        SplitPhase::Done {
+            cutover_epoch: 7,
+            rows_migrated: 500
+        }
     ));
     assert!(op.is_done());
 }
@@ -105,18 +131,38 @@ fn proof_shard_merge_state_machine_lifecycle() {
     assert!(matches!(op.phase, MergePhase::Idle));
 
     op.begin_absorption();
-    assert!(matches!(op.phase, MergePhase::Absorbing { rows_absorbed: 0, .. }));
+    assert!(matches!(
+        op.phase,
+        MergePhase::Absorbing {
+            rows_absorbed: 0,
+            ..
+        }
+    ));
 
     op.record_rows_absorbed(1_000);
-    assert!(matches!(op.phase, MergePhase::Absorbing { rows_absorbed: 1_000, .. }));
+    assert!(matches!(
+        op.phase,
+        MergePhase::Absorbing {
+            rows_absorbed: 1_000,
+            ..
+        }
+    ));
 
     op.absorption_complete();
-    assert!(matches!(op.phase, MergePhase::AwaitingCutover { rows_absorbed: 1_000 }));
+    assert!(matches!(
+        op.phase,
+        MergePhase::AwaitingCutover {
+            rows_absorbed: 1_000
+        }
+    ));
 
     op.cutover(42);
     assert!(matches!(
         op.phase,
-        MergePhase::Done { cutover_epoch: 42, rows_absorbed: 1_000 }
+        MergePhase::Done {
+            cutover_epoch: 42,
+            rows_absorbed: 1_000
+        }
     ));
     assert!(op.is_done());
 }
@@ -220,12 +266,15 @@ fn proof_law_headers_preserved_across_split() {
                 1 => s_hdr,
                 _ => m_hdr,
             };
-            SimEntry { key_hash: k, header: hdr, value: vec![0u8; 8] }
+            SimEntry {
+                key_hash: k,
+                header: hdr,
+                value: vec![0u8; 8],
+            }
         })
         .collect();
 
-    let (_donor, new_shard) =
-        simulate_donor_cleanup(entries.clone(), split, ShardId(1));
+    let (_donor, new_shard) = simulate_donor_cleanup(entries.clone(), split, ShardId(1));
 
     // Every entry that moved to the new shard must have the same header.
     for original in entries.iter().filter(|e| e.key_hash >= split) {
@@ -256,13 +305,25 @@ fn proof_tombstone_gc_reclaims_after_split() {
     // Entries 75..100: new-shard keys that happen to be identity (weight = 0).
     let mut entries: Vec<SimEntry> = Vec::new();
     for k in 0..50 {
-        entries.push(SimEntry { key_hash: k, header: hdr, value: encode_weight(k as i64 + 1) });
+        entries.push(SimEntry {
+            key_hash: k,
+            header: hdr,
+            value: encode_weight(k as i64 + 1),
+        });
     }
     for k in 50..75 {
-        entries.push(SimEntry { key_hash: k, header: hdr, value: encode_weight(1) });
+        entries.push(SimEntry {
+            key_hash: k,
+            header: hdr,
+            value: encode_weight(1),
+        });
     }
     for k in 75..100 {
-        entries.push(SimEntry { key_hash: k, header: hdr, value: encode_weight(0) });
+        entries.push(SimEntry {
+            key_hash: k,
+            header: hdr,
+            value: encode_weight(0),
+        });
     }
 
     let (donor, new_shard) = simulate_split_migration(entries, split, ShardId(1), &law);
@@ -272,8 +333,14 @@ fn proof_tombstone_gc_reclaims_after_split() {
     assert!(donor.iter().all(|e| e.key_hash < split));
 
     // New shard: 25 live entries; 25 identity entries removed by TombstoneGc.
-    assert_eq!(new_shard.len(), 25, "tombstone entries must be GC'd from new shard");
-    assert!(new_shard.iter().all(|e| e.key_hash >= split && e.key_hash < 75));
+    assert_eq!(
+        new_shard.len(),
+        25,
+        "tombstone entries must be GC'd from new shard"
+    );
+    assert!(new_shard
+        .iter()
+        .all(|e| e.key_hash >= split && e.key_hash < 75));
 }
 
 // ── Proof 6: Output equal split vs unsplit ────────────────────────────────────
@@ -288,7 +355,11 @@ fn proof_output_equal_split_vs_unsplit_weight_add() {
 
     // Build a reference set of 200 key → weight entries.
     let entries: Vec<SimEntry> = (0u64..200)
-        .map(|k| SimEntry { key_hash: k * (u64::MAX / 200), header: hdr, value: encode_weight(k as i64 + 1) })
+        .map(|k| SimEntry {
+            key_hash: k * (u64::MAX / 200),
+            header: hdr,
+            value: encode_weight(k as i64 + 1),
+        })
         .collect();
 
     // Single-shard aggregate: sum all weights.
@@ -298,8 +369,7 @@ fn proof_output_equal_split_vs_unsplit_weight_add() {
         .sum();
 
     // Simulate a split at mid.
-    let (donor, new_shard) =
-        simulate_donor_cleanup(entries, split, ShardId(1));
+    let (donor, new_shard) = simulate_donor_cleanup(entries, split, ShardId(1));
 
     // Sum donor entries.
     let donor_sum: i64 = donor
@@ -336,7 +406,11 @@ fn proof_output_equal_split_vs_unsplit_sum_count() {
         .map(|k| {
             let sum = k as i64 * 10;
             let count = k as i64 + 1;
-            SimEntry { key_hash: k * (u64::MAX / 100), header: hdr, value: encode_sum_count(sum, count) }
+            SimEntry {
+                key_hash: k * (u64::MAX / 100),
+                header: hdr,
+                value: encode_sum_count(sum, count),
+            }
         })
         .collect();
 
@@ -402,7 +476,10 @@ fn proof_output_equal_split_vs_unsplit_max_register() {
             new_shard.iter().find(|e| e.key_hash == original.key_hash)
         };
         let found = found.expect("every entry must appear on exactly one shard");
-        assert_eq!(found.value, original.value, "value mutated during split copy");
+        assert_eq!(
+            found.value, original.value,
+            "value mutated during split copy"
+        );
     }
     let _ = law;
 }
@@ -429,9 +506,16 @@ fn proof_or_set_causal_stability_survives_split() {
             // Each key holds between 1 and 4 OR-Set pairs.
             let num_pairs = (k % 4 + 1) as usize;
             let pairs: Vec<OrSetPair> = (0..num_pairs)
-                .map(|i| OrSetPair { element_id: k * 10 + i as u64, tag: k * 100 + i as u64 })
+                .map(|i| OrSetPair {
+                    element_id: k * 10 + i as u64,
+                    tag: k * 100 + i as u64,
+                })
                 .collect();
-            SimEntry { key_hash, header: hdr, value: encode_or_set(&pairs) }
+            SimEntry {
+                key_hash,
+                header: hdr,
+                value: encode_or_set(&pairs),
+            }
         })
         .collect();
 
@@ -481,10 +565,8 @@ fn proof_or_set_causal_stability_survives_split() {
     }
 
     // No entries on both sides.
-    let donor_keys: std::collections::HashSet<u64> =
-        donor.iter().map(|e| e.key_hash).collect();
-    let new_keys: std::collections::HashSet<u64> =
-        new_shard.iter().map(|e| e.key_hash).collect();
+    let donor_keys: std::collections::HashSet<u64> = donor.iter().map(|e| e.key_hash).collect();
+    let new_keys: std::collections::HashSet<u64> = new_shard.iter().map(|e| e.key_hash).collect();
     assert!(
         donor_keys.is_disjoint(&new_keys),
         "a key appears on both donor and new shard — causal stability violated"
@@ -504,22 +586,44 @@ fn proof_or_set_tombstone_gc_clears_empty_sets() {
     let mut entries: Vec<SimEntry> = Vec::new();
     // 30 keys with live pairs.
     for k in 0..30u64 {
-        let pairs = vec![OrSetPair { element_id: k, tag: k * 7 }];
-        entries.push(SimEntry { key_hash: k, header: hdr, value: encode_or_set(&pairs) });
+        let pairs = vec![OrSetPair {
+            element_id: k,
+            tag: k * 7,
+        }];
+        entries.push(SimEntry {
+            key_hash: k,
+            header: hdr,
+            value: encode_or_set(&pairs),
+        });
     }
     // 20 keys with empty sets (identity) on the new-shard side.
     for k in 50..70u64 {
-        entries.push(SimEntry { key_hash: k, header: hdr, value: encode_or_set(&[]) });
+        entries.push(SimEntry {
+            key_hash: k,
+            header: hdr,
+            value: encode_or_set(&[]),
+        });
     }
     // 10 keys with live pairs on the new-shard side.
     for k in 70..80u64 {
-        let pairs = vec![OrSetPair { element_id: k, tag: k * 3 }];
-        entries.push(SimEntry { key_hash: k, header: hdr, value: encode_or_set(&pairs) });
+        let pairs = vec![OrSetPair {
+            element_id: k,
+            tag: k * 3,
+        }];
+        entries.push(SimEntry {
+            key_hash: k,
+            header: hdr,
+            value: encode_or_set(&pairs),
+        });
     }
 
     let (donor, new_shard) = simulate_split_migration(entries, split, ShardId(1), &law);
 
     assert_eq!(donor.len(), 30, "all 30 donor keys survive");
-    assert_eq!(new_shard.len(), 10, "20 empty-set entries removed, 10 live remain");
+    assert_eq!(
+        new_shard.len(),
+        10,
+        "20 empty-set entries removed, 10 live remain"
+    );
     assert!(new_shard.iter().all(|e| e.key_hash >= 70));
 }

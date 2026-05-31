@@ -37,7 +37,9 @@ pub use brownout::{BrownoutStatus, ObjectStoreBrownoutGuard, LOCAL_BUFFER_MAX_EP
 pub use buggify::buggify_enabled;
 pub use chaos::{run_chaos_scenario, ChaosConfig, ChaosResult};
 pub use clock::{Clock, SimClock, TokioClock};
-pub use compaction::{apply_tombstone_gc, simulate_donor_cleanup, simulate_split_migration, SimEntry};
+pub use compaction::{
+    apply_tombstone_gc, simulate_donor_cleanup, simulate_split_migration, SimEntry,
+};
 pub use coord_faults::{register_coord_faults, COORD_FAULT_IDS};
 pub use fault_model::{FaultEntry, FaultModel};
 pub use law_faults::{register_law_faults, LAW_FAULT_IDS};

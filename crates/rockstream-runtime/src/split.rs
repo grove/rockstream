@@ -259,7 +259,10 @@ impl ShardMergeOp {
         if let MergePhase::Absorbing { rows_absorbed, .. } = self.phase {
             self.phase = MergePhase::AwaitingCutover { rows_absorbed };
         } else {
-            panic!("absorption_complete called in wrong phase: {:?}", self.phase);
+            panic!(
+                "absorption_complete called in wrong phase: {:?}",
+                self.phase
+            );
         }
     }
 
@@ -312,13 +315,20 @@ mod tests {
         assert!(matches!(op.phase, SplitPhase::Checkpointing { .. }));
 
         op.checkpoint_ready();
-        assert!(matches!(op.phase, SplitPhase::Copying { rows_copied: 0, .. }));
+        assert!(matches!(
+            op.phase,
+            SplitPhase::Copying { rows_copied: 0, .. }
+        ));
 
         op.record_rows_copied(500);
         op.record_rows_copied(300);
-        assert!(
-            matches!(op.phase, SplitPhase::Copying { rows_copied: 800, .. })
-        );
+        assert!(matches!(
+            op.phase,
+            SplitPhase::Copying {
+                rows_copied: 800,
+                ..
+            }
+        ));
 
         op.copy_complete();
         assert!(matches!(
@@ -352,7 +362,13 @@ mod tests {
         assert!(matches!(op.phase, MergePhase::Idle));
 
         op.begin_absorption();
-        assert!(matches!(op.phase, MergePhase::Absorbing { rows_absorbed: 0, .. }));
+        assert!(matches!(
+            op.phase,
+            MergePhase::Absorbing {
+                rows_absorbed: 0,
+                ..
+            }
+        ));
 
         op.record_rows_absorbed(1_200);
         assert!(matches!(
@@ -366,7 +382,9 @@ mod tests {
         op.absorption_complete();
         assert!(matches!(
             op.phase,
-            MergePhase::AwaitingCutover { rows_absorbed: 1_200 }
+            MergePhase::AwaitingCutover {
+                rows_absorbed: 1_200
+            }
         ));
 
         op.cutover(99);
