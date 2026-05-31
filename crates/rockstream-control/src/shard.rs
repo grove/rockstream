@@ -35,11 +35,11 @@ use rockstream_types::lease::ShardLease;
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LeaseError {
     /// The shard is currently leased by a *different* worker.
-    #[error("RS-1601: shard {shard_id} is already leased by worker {holder}")]
+    #[error("RS-1701: shard {shard_id} is already leased by worker {holder}")]
     AlreadyLeased { shard_id: ShardId, holder: WorkerId },
     /// The provided fencing token does not match the current token.
     #[error(
-        "RS-1602: stale lease token for shard {shard_id} (provided {provided}, current {current})"
+        "RS-1702: stale lease token for shard {shard_id} (provided {provided}, current {current})"
     )]
     StaleToken {
         shard_id: ShardId,
@@ -47,7 +47,7 @@ pub enum LeaseError {
         current: LeaseToken,
     },
     /// The shard has no active lease (not yet acquired).
-    #[error("RS-1603: shard {shard_id} has no active lease")]
+    #[error("RS-1703: shard {shard_id} has no active lease")]
     NoLease { shard_id: ShardId },
 }
 
