@@ -114,6 +114,8 @@ pub const RS_2003: ErrorCode = ErrorCode::new(2003);
 // 3xxx: Merge / arrangement
 /// Merge operand malformed (fail-closed: never silently overwrites).
 pub const RS_3009: ErrorCode = ErrorCode::new(3009);
+/// Pipeline blocked due to object store brownout; local buffer exhausted (v0.36, DESIGN.md §11.7).
+pub const RS_3003: ErrorCode = ErrorCode::new(3003);
 
 // 4xxx: Connector
 /// Source connection failed.
@@ -126,6 +128,8 @@ pub const RS_4002: ErrorCode = ErrorCode::new(4002);
 pub const RS_5001: ErrorCode = ErrorCode::new(5001);
 /// Unknown merge law referenced in arrangement header.
 pub const RS_5002: ErrorCode = ErrorCode::new(5002);
+/// Wire protocol version not supported; rolling upgrade version skew (v0.36, DESIGN.md §5.5).
+pub const RS_5003: ErrorCode = ErrorCode::new(5003);
 
 /// Metadata for a registered error code.
 pub struct ErrorCodeMeta {
@@ -169,11 +173,13 @@ pub fn description(code: ErrorCode) -> &'static str {
         2001 => "View not found",
         2002 => "Query timeout",
         2003 => "Unsupported isolation level",
+        3003 => "Pipeline blocked: object store brownout, local buffer exhausted",
         3009 => "Merge operand malformed",
         4001 => "Source connection failed",
         4002 => "Sink write failed",
         5001 => "Incompatible storage format",
         5002 => "Unknown merge law in arrangement header",
+        5003 => "Wire protocol version not supported; rolling upgrade version skew",
         _ => "Unknown error",
     }
 }
@@ -212,7 +218,9 @@ pub fn next_steps(code: ErrorCode) -> &'static str {
         4001 => "Verify source connection settings and network connectivity.",
         4002 => "Check sink availability and credentials.",
         5001 => "Run the storage migration tool before upgrading.",
+        3003 => "Reduce input rate or increase local_buffer_max_epochs; check object store availability.",
         5002 => "Register the merge law or migrate the arrangement before attaching the shard.",
+        5003 => "Ensure N+1 binary is backward compatible with N; check rolling upgrade procedure in DESIGN.md §5.5.",
         1512 => "Check the step function for infinite cycles or skewed partitioning; review per-shard recompute logs.",
         1513 => "Increase max_iterations or restructure the recursive query to converge faster.",
         1601 => "Reduce input rate or increase checkpoint alignment buffer capacity; check for slow shards holding up barrier propagation.",
@@ -258,8 +266,9 @@ mod tests {
     fn all_codes_have_descriptions() {
         let codes = [
             RS_0001, RS_0002, RS_0003, RS_1001, RS_1002, RS_1003, RS_1004, RS_1005, RS_1006,
-            RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_4001, RS_4002, RS_5001, RS_5002,
-            RS_1512, RS_1513, RS_1601, RS_1602, RS_1603, RS_1701, RS_1702, RS_1703,
+            RS_1007, RS_1008, RS_2001, RS_2002, RS_2003, RS_3003, RS_4001, RS_4002, RS_5001,
+            RS_5002, RS_5003, RS_1512, RS_1513, RS_1601, RS_1602, RS_1603, RS_1701, RS_1702,
+            RS_1703,
         ];
         for code in codes {
             assert_ne!(

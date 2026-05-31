@@ -1,0 +1,40 @@
+name: Simulation Soak
+
+# Runs a continuous stream of seeded SimRuntime executions against main.
+# Introduced in v0.36 as part of the exactly-once chaos alpha.
+#
+# Schedule: every 6 hours on main.
+# On push to main: triggered immediately (keeps the corpus fresh).
+#
+# Exit criteria (v0.36):
+#   - ≥100 000 simulation seeds pass per run.
+#   - Corpus includes ≥1 seed per registered merge law.
+#   - Failing seeds are stored as regression seeds and block release.
+
+on:
+  schedule:
+    - cron: "0 0,6,12,18 * * *"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  soak:
+    name: Simulation soak (100k seeds)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Run simulation soak tests
+        run: cargo test -p rockstream-sim --test chaos_tests -- --nocapture
+      - name: Verify seed corpus covers all registered laws
+        run: |
+          cargo test -p rockstream-sim --test chaos_tests \
+            proof_seed_corpus_covers_all_registered_laws -- --nocapture
