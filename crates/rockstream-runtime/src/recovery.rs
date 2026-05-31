@@ -9,7 +9,7 @@
 //!                                       (shard reassignment + SLO tracking)
 //!                                                      │
 //!                                      Healthy | Recovering | RecoveringSlow
-//!                                                          │ RS-1603
+//!                                                          │ RS-3603
 //! Control-plane partition ──► ControlPlaneFence ──► worker stops committing
 //!
 //! Bulk restart ──► ThrottledLeaseGranter ──► (rate-limited lease grants)
@@ -30,11 +30,11 @@
 //! between failure detection and the new worker completing its first epoch
 //! commit, tracked by `RecoveryStatus`.
 //!
-//! ## RECOVERING_SLOW (RS-1603)
+//! ## RECOVERING_SLOW (RS-3603)
 //!
 //! If a recovery is still in progress after `slow_threshold_ms` (default
 //! 60 000 ms / 60 s), `RecoveryDriver::status(now_ms)` transitions to
-//! `RecoveryStatus::RecoveringSlow` and the caller should surface `RS-1603`.
+//! `RecoveryStatus::RecoveringSlow` and the caller should surface `RS-3603`.
 //!
 //! ## Worker self-fencing on control-plane partition (DESIGN.md §11.6)
 //!
@@ -155,12 +155,14 @@ pub enum RecoveryStatus {
     /// Recovery started at `started_at_ms`; `shards_pending` shards not yet
     /// confirmed healthy by their new owners.
     Recovering {
+        recovery_id: u64,
         started_at_ms: u64,
         shards_reassigned: usize,
     },
     /// Recovery is still in progress after the `slow_threshold_ms` SLO.
-    /// Surfaces `RS-1603`.
+    /// Surfaces `RS-3603`.
     RecoveringSlow {
+        recovery_id: u64,
         started_at_ms: u64,
         shards_reassigned: usize,
         elapsed_ms: u64,
@@ -170,6 +172,8 @@ pub enum RecoveryStatus {
 /// Result of handling a worker failure.
 #[derive(Debug, Clone)]
 pub struct RecoveryResult {
+    /// Unique identifier for this recovery event.
+    pub recovery_id: u64,
     /// Worker that failed.
     pub failed_worker: WorkerId,
     /// Shards that were freed and reassigned.
@@ -190,12 +194,14 @@ pub struct ShardReassignment {
 /// Intentionally kept synchronous and pure (no network, no async) so it can be
 /// driven by the `SimRuntime` deterministic clock in tests.
 pub struct RecoveryDriver {
-    /// Milliseconds after which recovery is considered SLOW (RS-1603).
+    /// Milliseconds after which recovery is considered SLOW (RS-3603).
     pub slow_threshold_ms: u64,
+    next_recovery_id: u64,
     active_recoveries: Vec<ActiveRecovery>,
 }
 
 struct ActiveRecovery {
+    id: u64,
     started_at_ms: u64,
     shards_reassigned: usize,
     completed: bool,
@@ -206,6 +212,7 @@ impl RecoveryDriver {
     pub fn new(slow_threshold_ms: u64) -> Self {
         Self {
             slow_threshold_ms,
+            next_recovery_id: 1,
             active_recoveries: Vec::new(),
         }
     }
@@ -223,12 +230,16 @@ impl RecoveryDriver {
         now_ms: u64,
     ) -> RecoveryResult {
         let count = reassigned_shards.len();
+        let recovery_id = self.next_recovery_id;
+        self.next_recovery_id += 1;
         self.active_recoveries.push(ActiveRecovery {
+            id: recovery_id,
             started_at_ms: now_ms,
             shards_reassigned: count,
             completed: false,
         });
         RecoveryResult {
+            recovery_id,
             failed_worker,
             reassigned: reassigned_shards,
             started_at_ms: now_ms,
@@ -237,9 +248,9 @@ impl RecoveryDriver {
 
     /// Mark recovery as complete (all reassigned shards have confirmed their
     /// first successful epoch commit).
-    pub fn mark_complete(&mut self, started_at_ms: u64) {
+    pub fn mark_complete(&mut self, recovery_id: u64) {
         for rec in &mut self.active_recoveries {
-            if rec.started_at_ms == started_at_ms && !rec.completed {
+            if rec.id == recovery_id && !rec.completed {
                 rec.completed = true;
                 break;
             }
@@ -261,6 +272,7 @@ impl RecoveryDriver {
             let elapsed = now_ms.saturating_sub(rec.started_at_ms);
             if elapsed > self.slow_threshold_ms {
                 return RecoveryStatus::RecoveringSlow {
+                    recovery_id: rec.id,
                     started_at_ms: rec.started_at_ms,
                     shards_reassigned: rec.shards_reassigned,
                     elapsed_ms: elapsed,
@@ -268,21 +280,19 @@ impl RecoveryDriver {
             }
         }
 
-        let oldest = self
+        let oldest_rec = self
             .active_recoveries
             .iter()
-            .map(|r| r.started_at_ms)
-            .min()
-            .unwrap_or(now_ms);
-        let total_shards: usize = self
-            .active_recoveries
-            .iter()
-            .map(|r| r.shards_reassigned)
-            .sum();
+            .min_by_key(|r| r.started_at_ms);
 
-        RecoveryStatus::Recovering {
-            started_at_ms: oldest,
-            shards_reassigned: total_shards,
+        if let Some(rec) = oldest_rec {
+            RecoveryStatus::Recovering {
+                recovery_id: rec.id,
+                started_at_ms: rec.started_at_ms,
+                shards_reassigned: rec.shards_reassigned,
+            }
+        } else {
+            RecoveryStatus::Healthy
         }
     }
 

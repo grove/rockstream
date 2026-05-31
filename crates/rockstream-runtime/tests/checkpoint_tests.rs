@@ -8,7 +8,7 @@
 //! ### Tests
 //!
 //! 1. **`proof_alignment_buffer_is_bounded`** — `AlignmentBuffer` rejects
-//!    further pushes with `RS-1601` once `max_rows` is reached; the buffer
+//!    further pushes with `RS-3601` once `max_rows` is reached; the buffer
 //!    does not grow beyond the configured capacity.
 //!
 //! 2. **`proof_checkpoint_commits_when_all_shards_ack`** — A 4-shard
@@ -17,7 +17,7 @@
 //!
 //! 3. **`proof_checkpoint_recovering_on_abort`** — When the coordinator is
 //!    aborted before all shards ack, the returned status is
-//!    `Recovering`/`RS-1602`; a new barrier may be injected afterwards.
+//!    `Recovering`/`RS-3602`; a new barrier may be injected afterwards.
 //!
 //! 4. **`proof_gc_collects_old_checkpoints_below_frontier`** — `CheckpointGc`
 //!    deletes exactly the checkpoints whose `barrier_epoch` is strictly less
@@ -29,14 +29,14 @@
 //!    `Committed` prematurely.
 //!
 //! 6. **`proof_double_barrier_injection_blocked`** — Injecting a second barrier
-//!    while one is in progress returns an error (`RS-1602`); the in-progress
+//!    while one is in progress returns an error (`RS-3602`); the in-progress
 //!    checkpoint is not replaced.
 //!
 //! 7. **`proof_alignment_buffer_drain_releases_capacity`** — After draining the
 //!    buffer, it accepts new rows up to capacity again.
 //!
 //! 8. **`proof_credit_exhaustion_never_unbounded`** — Repeated pushes after
-//!    exhaustion all return `RS-1601`; buffer length is capped at `max_rows`.
+//!    exhaustion all return `RS-3601`; buffer length is capped at `max_rows`.
 //!
 //! 9. **`proof_sequential_checkpoints_increment_id`** — Checkpoint IDs are
 //!    strictly increasing across successive checkpoints.
@@ -69,13 +69,13 @@ fn proof_alignment_buffer_is_bounded() {
     assert!(buf.push(vec![3], vec![3]).is_ok());
     assert_eq!(buf.len(), 3);
 
-    // Next push must return RS-1601 — not grow.
+    // Next push must return RS-3601 — not grow.
     let err = buf
         .push(vec![4], vec![4])
         .expect_err("must reject when buffer is full");
     assert!(
-        err.contains("RS-1601"),
-        "error must cite RS-1601, got: {err}"
+        err.contains("RS-3601"),
+        "error must cite RS-3601, got: {err}"
     );
     assert_eq!(buf.len(), 3, "buffer must not have grown");
 }
@@ -152,8 +152,8 @@ fn proof_checkpoint_recovering_on_abort() {
     );
     if let CheckpointStatus::Recovering { reason, .. } = &status {
         assert!(
-            reason.contains("RS-1602"),
-            "reason must cite RS-1602, got: {reason}"
+            reason.contains("RS-3602"),
+            "reason must cite RS-3602, got: {reason}"
         );
         assert!(
             reason.contains("shard-1 lost lease"),
@@ -250,8 +250,8 @@ fn proof_double_barrier_injection_blocked() {
         .inject_barrier(51)
         .expect_err("second barrier must be rejected while first is in progress");
     assert!(
-        err.contains("RS-1602"),
-        "error must cite RS-1602, got: {err}"
+        err.contains("RS-3602"),
+        "error must cite RS-3602, got: {err}"
     );
 
     // Original checkpoint still in progress.
@@ -296,14 +296,14 @@ fn proof_credit_exhaustion_never_unbounded() {
     }
     assert_eq!(buf.len(), CAPACITY);
 
-    // 100 further pushes — ALL must fail with RS-1601.
+    // 100 further pushes — ALL must fail with RS-3601.
     for extra in 0..100 {
         let err = buf
             .push(vec![extra as u8], vec![extra as u8])
             .expect_err("must reject when over capacity");
         assert!(
-            err.contains("RS-1601"),
-            "push {extra}: expected RS-1601, got: {err}"
+            err.contains("RS-3601"),
+            "push {extra}: expected RS-3601, got: {err}"
         );
         // Critically: buffer length must never exceed CAPACITY.
         assert_eq!(

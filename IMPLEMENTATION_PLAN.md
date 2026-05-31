@@ -40,21 +40,18 @@ The phase numbers here map to ROADMAP.md roadmap versions as follows:
 | 2 | v0.11–v0.18 | ✅ Complete | SQL frontend, joins, set ops (IVM-4 … IVM-6) | — |
 | 3 | v0.19–v0.26 | ✅ Complete | Advanced operators: windows, recursion, view-on-view (IVM-7 … IVM-12) | plans/full-assessment-v0.18.md |
 | 3.5 | v0.27 | ✅ Complete | IVM correctness soak (IVM-13) | sign-offs/v0.27.md |
-| 4 | v0.28–v0.30 | ✅ Done (*) | Multi-shard execution and exchange subsystem | plans/phase4-signoff.md |
-| 5 | v0.31–v0.32 | ✅ Done (*) | Frontier protocol and progress tracking | plans/phase5-signoff.md |
-| 6 | v0.33–v0.36 | ✅ Done (*) | Fault tolerance, exactly-once, chaos | plans/full-assessment-v0.36.md |
-| 7 | v0.37–v0.39 | Not started | Elasticity: split, merge, drain, clone | — |
-| 8 | v0.40–v0.43 | Not started | Postgres query gateway, introspection, freshness, subscribe, direct-write CRDT surface, OLTP session ergonomics | — |
-| 9 | v0.44–v0.45 | Not started | Connectors and sinks (Tier 1 + Tier 2 contract); OR-Set; CRDT schema metadata | — |
-| 10 | v0.46–v0.50 | Not started | Auth, observability, auto-tuner, secondary indexes, upgrades, security | — |
-| 11 | v0.51–v0.52 | Not started | Long soak and production beta handoff | — |
-| 12 | v0.53–v0.55 | Not started | Cold-tier sink, Iceberg REST catalog, snapshot GC | — |
+| 4 | v0.28–v0.30 | ✅ Complete | Multi-shard execution and exchange subsystem | plans/phase4-signoff.md |
+| 5 | v0.31–v0.32 | ✅ Complete | Frontier protocol and progress tracking | plans/phase5-signoff.md |
+| 6 | v0.33–v0.36 | ✅ Complete | Fault tolerance, exactly-once, chaos | plans/full-assessment-v0.36.md |
+| 7 | v0.37–v0.39 | [/] In progress | Elasticity: split, merge, drain, clone | sign-offs/v0.37.md |
+| 8 | v0.40–v0.46 | Not started | Postgres query gateway, introspection, freshness, subscribe, decomposed direct-write DML and CRDT surface (GCounter, PNCounter, LWW, OR-Set, MVRegister) | — |
+| 9 | v0.47–v0.48 | Not started | Connectors and sinks (Tier 1 + Tier 2 contract); OR-Set; CRDT schema metadata | — |
+| 10 | v0.49–v0.53 | Not started | Auth, observability, auto-tuner, secondary indexes, upgrades, security | — |
+| 11 | v0.54–v0.55 | Not started | Long soak and production beta handoff | — |
+| 12 | v0.56–v0.58 | Not started | Cold-tier sink, Iceberg REST catalog, snapshot GC | — |
 
-> (*) Done with outstanding sign-off items. Phases 4 and 5 lack formal sign-off artifacts
-> for their real-network and real-S3 exit criteria. Until `plans/phase4-signoff.md` and
-> `plans/phase5-signoff.md` are written (with either test results or a documented waiver
-> with compensating simulation controls), the ✅ marks are provisional. These sign-offs
-> are blocking before the Integration Beta gate (Phase 9 / v0.45).
+> Note: Phase 4 and Phase 5 sign-offs were formally completed on 2026-05-31 under simulation-compensated
+> waivers approved by the Principal Architect, recorded in `plans/phase4-signoff.md` and `plans/phase5-signoff.md`.
 
 Durations are indicative effort, not calendar time, and assume a small
 dedicated team. The ROADMAP.md version table is the single source of truth
@@ -1250,104 +1247,78 @@ a gateway rewrite.
 
 ### v0.43 — Direct-Write CRDT Surface (Phase 1 of user-visible CRDTs)
 
-This version delivers the first user-visible CRDT column types and DML
-writes. The internal `LawBundle` catalog (v0.5+), planner law propagation
-(v0.11+), exchange combining (v0.30), and gateway pushdown (v0.41) make this
-straightforward: each new column type is a registered law plus a DDL/DML
-binding.
+### v0.43 — DML Alpha (Core DML over pgwire)
+
+This version delivers the core DML query execution and pgwire support.
 
 - **Internal (direct-write) source connector** (DESIGN.md §13.5):
-  - `INSERT`/`UPDATE`/`DELETE` DML over the Postgres wire protocol appended to
-    a per-connection write buffer.
-  - `COMMIT` flushes as an atomic Z-set delta via `WriteBatch` to a dedicated
-    base-table shard, receiving the shard's next `source_epoch`.
+  - `INSERT`/`UPDATE`/`DELETE` DML over the Postgres wire protocol appended to a per-connection write buffer.
+  - `COMMIT` flushes as an atomic Z-set delta via `WriteBatch` to a dedicated base-table shard, receiving the shard's next `source_epoch`.
   - `ROLLBACK` discards the buffer without shard writes.
+- **Optimistic transaction metadata hooks** (DESIGN.md §13.5.1; [ideas/optimistic-locking-crdts.md](ideas/optimistic-locking-crdts.md)):
+  - `RowVersionMeta` per direct-write row: `row_version: u64`, `last_modified_frontier`, `last_writer_txn`, stored under `op_state/txn_meta/table/{table_id}/pk/{pk_hash}`.
+  - Row version increments on every committed non-CRDT write.
+  - `TxnShape` enum skeleton in `rockstream-gateway`: classifier marks transactions as `BlindCommutative`, `ShardLocalSerializable`, `OptimisticExactKey`, `MixedCrdtAndOptimisticExactKey`, or `Unsupported`.
+  - `UnsupportedTxnReason` closed enum in `rockstream-types`.
+- **`INSERT ... RETURNING`** (DESIGN.md §12.8.2 and §13.5.2): single-round-trip write + read back for auto-generated keys. Multi-row form (`INSERT ... SELECT ... RETURNING`) works.
+- **Session-scoped max-staleness** (DESIGN.md §12.8.3): `SET rockstream.max_staleness = '<duration>'` configures an analytical session to accept snapshots within the given age without blocking.
+
+**Exit criteria for v0.43**
+- `psql` runs `INSERT INTO t VALUES (...); COMMIT` and view reflects it within `freshness_target_ms`.
+- `row_version` increments on every committed non-CRDT write and is readable via `RowVersionMeta`.
+- `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` returns `RS-2003`.
+- `TxnShape` classifier correctly identifies blind-commutative vs. read-dependent transactions in unit tests.
+
+---
+
+### v0.44 — DML Hardening: Transactions and DDL
+
+This version hardens the DML surface with idempotency controls and DDL lifecycle features.
+
+- **Idempotency-key enforcement**: writes to a non-idempotent law (internal `SumCount/v1` direct writes) must carry either an exactly-once source-epoch envelope or a caller-provided idempotency key. Writes missing both are rejected with `RS-2007 write.idempotency_key_required`. The idempotency-key table is per-shard, time-bounded (default 24 h), and participates in the per-shard epoch commit.
+- **Write fence and staleness hints** (DESIGN.md §12.8.1): `rockstream.write_fence()` returns a cross-session fence token for producer→consumer coordination. `SELECT /*+ ALLOW_STALE */ ...` opts out of read-after-write for a single query.
+- **Background DDL and waiting** (DESIGN.md §14.10): `SET BACKGROUND_DDL = ON` makes `CREATE MATERIALIZED VIEW` return immediately. `WAIT FOR MATERIALIZED VIEW ... TO BE READY TIMEOUT '...'` blocks until the view reaches HEALTHY or the timeout expires.
+- **Zero-downtime view replacement** (DESIGN.md §4.2): `CREATE REPLACEMENT MATERIALIZED VIEW v2 FOR v1 AS ...` creates a new view that backfills in parallel with the live view. `ALTER MATERIALIZED VIEW v1 APPLY REPLACEMENT v2` atomically swaps query routing once the replacement catches up to the live frontier.
+- **Schema-level lifecycle** (DESIGN.md §14.10): `ALTER SCHEMA ... PAUSE` / `ALTER SCHEMA ... RESUME` pause or resume all views in a schema atomically.
+- **Namespace lifecycle**: DDL support for `CREATE SCHEMA` and `CREATE/DROP NAMESPACE`.
+
+**Exit criteria for v0.44**
+- A non-idempotent write missing both an exactly-once envelope and an idempotency key returns `RS-2007`.
+- Zero-downtime replacement swaps view routing atomically without subscribers having to reconnect.
+- `SET BACKGROUND_DDL = ON` makes DDL return immediately.
+
+---
+
+### v0.45 — CRDT Columns Alpha
+
+This version delivers the first three user-visible CRDT column types and session ergonomics.
+
 - **User-visible CRDT column types** (DESIGN.md §6.11; [ideas/crdts.md §6](ideas/crdts.md)):
   - `COUNTER` backed by `PNCounter/v1` (ID 0x0006, tag 0x30).
-  - `MAX_REGISTER`, `MIN_REGISTER` backed by `MaxRegister/v1` / `MinRegister/v1`
-    (already registered in v0.20).
-  - `LWW` backed by `LWWRegister/v1` (ID 0x0005, tag 0x22). The
-    timestamp-loss is documented explicitly in DDL output and `EXPLAIN`.
-  - `G_SET` backed by `GSet/v1` (ID 0x0007, tag 0x40).
-- **CRDT delta DML**: SQL forms `amount = amount + 1`,
-  `tags = tags || ARRAY['x']`, `winner = GREATEST(winner, $1)` lower into
-  `LawBundle::merge_fn`-friendly deltas via the planner. The planner refuses
-  to mix a CRDT column with an aggregating expression that does not match
-  its law (e.g. `SUM(g_set_col)` is rejected with a closed-enum SQL error).
-- **Idempotency-key enforcement**: writes to a non-idempotent law
-  (`COUNTER`, internal `SumCount/v1` direct writes) must carry either an
-  exactly-once source-epoch envelope or a caller-provided idempotency key.
-  Writes missing both are rejected with `RS-2007 write.idempotency_key_required`.
-  The idempotency-key table is per-shard, time-bounded (default 24 h), and
-  participates in the per-shard epoch commit.
-- **Optimistic transaction metadata hooks** (DESIGN.md §13.5.1;
-  [ideas/optimistic-locking-crdts.md](ideas/optimistic-locking-crdts.md)):
-  - `RowVersionMeta` per direct-write row: `row_version: u64`,
-    `last_modified_frontier`, `last_writer_txn`, stored under
-    `op_state/txn_meta/table/{table_id}/pk/{pk_hash}`.
-  - Row version increments on every committed non-CRDT write.
-  - Stable `op_id` generation for CRDT operands:
-    `hash(namespace_id, txn_id, statement_index, op_index, law_id)`.
-  - `EXPLAIN` prints `read_dependent=true/false` for CRDT DML lowered from SQL.
-  - `TxnShape` enum skeleton in `rockstream-gateway`: classifier marks
-    transactions as `BlindCommutative`, `ShardLocalSerializable`,
-    `OptimisticExactKey`, `MixedCrdtAndOptimisticExactKey`, or `Unsupported`.
-  - `UnsupportedTxnReason` closed enum in `rockstream-types`.
-  - Do NOT expose multi-shard optimistic transactions yet — only the metadata
-    that enables them later.
+  - `MAX_REGISTER`, `MIN_REGISTER` backed by `MaxRegister/v1` / `MinRegister/v1`.
+  - `LWW` backed by `LWWRegister/v1` (ID 0x0005, tag 0x22).
+- **CRDT delta DML**: SQL forms `amount = amount + 1`, `winner = GREATEST(winner, $1)` lower into `LawBundle::merge_fn`-friendly deltas via the planner.
+- **Session-scoped automatic read-your-writes** (DESIGN.md §12.8.1): after a `COMMIT` the session's `last_written_epoch` is set; subsequent `SELECT`s in the same connection automatically apply `wait_for` with no client action.
 
-**Exit criteria for v0.43 (Phase 8 complete)**
-
-- `psql` runs `INSERT INTO t VALUES (...); COMMIT` and view reflects it within
-  `freshness_target_ms`.
-- `CREATE TABLE balances (account TEXT PRIMARY KEY, amount COUNTER)` succeeds
-  and `UPDATE balances SET amount = amount + 1 WHERE account = $1` round-trips
-  through psql.
-- 1M concurrent counter-increment soak test lands the exact total across
-  shard splits and worker restarts.
-- A non-idempotent write missing both an exactly-once envelope and an
-  idempotency key returns `RS-2007`.
-- `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` returns `RS-2003`.
-- `row_version` increments on every committed non-CRDT write and is readable
-  via `RowVersionMeta`.
+**Exit criteria for v0.45**
+- `CREATE TABLE balances (account TEXT PRIMARY KEY, amount COUNTER)` succeeds and `UPDATE balances SET amount = amount + 1 WHERE account = $1` round-trips.
+- 1M concurrent counter-increment soak test lands the exact total across shard splits and worker restarts.
 - `EXPLAIN` shows `read_dependent=true/false` for CRDT delta DML.
-- `TxnShape` classifier correctly identifies blind-commutative vs.
-  read-dependent transactions in unit tests.
-- **Session-scoped automatic read-your-writes** (DESIGN.md §12.8.1): after
-  a `COMMIT` the session's `last_written_epoch` is set; subsequent `SELECT`s
-  in the same connection automatically apply `wait_for` with no client action.
-  `session_wait_for_triggered_total` metric increments on each implicit
-  wait-for application. Timeout returns `RS-2012`.
-- **`INSERT ... RETURNING`** (DESIGN.md §12.8.2 and §13.5.2): single-round-trip
-  write + read back for auto-generated keys. Multi-row form (`INSERT ... SELECT
-  ... RETURNING`) works. `UPDATE ... RETURNING` and `DELETE ... RETURNING` are
-  not yet implemented.
-- **Session-scoped max-staleness** (DESIGN.md §12.8.3): `SET
-  rockstream.max_staleness = '<duration>'` configures an analytical session to
-  accept snapshots within the given age without blocking. Setting `max_staleness`
-  implicitly disables implicit `wait_for`. `RS-2018 session.staleness_exceeded`
-  emitted as a `NOTICE` when the published frontier is older than the bound.
-  `session_staleness_exceeded_total` and `session_frontier_age_ms` metrics
-  added. `SHOW rockstream.session_mode` returns `olap` or `oltp`.
-- **Zero-downtime view replacement** (DESIGN.md §4.2):
-  `CREATE REPLACEMENT MATERIALIZED VIEW v2 FOR v1 AS ...` creates a new view
-  that backfills in parallel with the live view. `ALTER MATERIALIZED VIEW v1
-  APPLY REPLACEMENT v2` atomically swaps query routing once the replacement
-  catches up to the live frontier. `ALTER MATERIALIZED VIEW v1 DISCARD
-  REPLACEMENT v2` abandons the shadow plan. `SHOW REPLACEMENT STATUS FOR
-  MATERIALIZED VIEW v1` reports progress. Subscribers to `v1` see the new
-  definition without reconnecting.
-- **Write fence and staleness hints** (DESIGN.md §12.8.1):
-  `rockstream.write_fence()` returns a cross-session fence token for
-  producer→consumer coordination. `SELECT /*+ ALLOW_STALE */ ...` opts out
-  of read-after-write for a single query without changing session settings.
-- **Background DDL and waiting** (DESIGN.md §14.10):
-  `SET BACKGROUND_DDL = ON` makes `CREATE MATERIALIZED VIEW` return
-  immediately. `WAIT FOR MATERIALIZED VIEW ... TO BE READY TIMEOUT '...'`
-  blocks until the view reaches HEALTHY or the timeout expires.
-- **Schema-level lifecycle** (DESIGN.md §14.10):
-  `ALTER SCHEMA ... PAUSE` / `ALTER SCHEMA ... RESUME` pause or resume all
-  views in a schema atomically.
+
+---
+
+### v0.46 — CRDT Columns Beta & Integration Beta Gate
+
+This version delivers the remaining advanced CRDT column types and serves as the gate for the Integration Beta milestone.
+
+- **Advanced CRDT column types**:
+  - `OR_SET` backed by `OrSet/v1` (ID 0x0007, tag 0x41) with `CompactionPolicy::TombstoneGc` (used in split/merge proofs).
+  - `MV_REGISTER` backed by `MVRegister/v1`.
+- **Integration Beta exit criteria sign-off**: The final compilation of the Integration Beta checklist, including the physical 4-host network latency tests.
+
+**Exit criteria for v0.46 (Phase 8 complete)**
+- OR-Set add/remove under sustained splits and recovery survives without causal-stability violations.
+- Integration Beta sign-off documentation is finalized in the catalog.
 
 ---
 

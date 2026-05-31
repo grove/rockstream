@@ -26,7 +26,7 @@
 //! Multi-input operators (joins, unions) may receive the barrier on one input
 //! before the other.  Data arriving from the fast input is held in an
 //! `AlignmentBuffer` while the slow input catches up.  The buffer has a hard
-//! `max_rows` limit.  When the limit is reached the buffer returns `RS-1601`
+//! `max_rows` limit.  When the limit is reached the buffer returns `RS-3601`
 //! rather than growing unboundedly.
 //!
 //! ## Atomic cluster checkpoint commit
@@ -35,7 +35,7 @@
 //! registered shard has acknowledged the current barrier the coordinator
 //! transitions to `CheckpointStatus::Committed`.  If the coordinator is aborted
 //! (e.g. a shard fails) it transitions to `CheckpointStatus::Recovering` and
-//! surfaces `RS-1602`.
+//! surfaces `RS-3602`.
 //!
 //! ## Old checkpoint GC
 //!
@@ -95,7 +95,7 @@ pub enum CheckpointStatus {
         /// Number of shards that participated.
         shard_count: usize,
     },
-    /// Checkpoint aborted; pipeline is in RECOVERING state (RS-1602).
+    /// Checkpoint aborted; pipeline is in RECOVERING state (RS-3602).
     Recovering {
         checkpoint_id: CheckpointId,
         /// Human-readable reason for the failure.
@@ -129,8 +129,8 @@ pub struct ShardCheckpointAck {
 /// all inputs.
 ///
 /// The buffer has a hard `max_rows` capacity.  When the capacity is reached
-/// `push` returns `Err("RS-1601: …")` instead of growing the buffer
-/// unboundedly.  The caller is expected to surface this error as `RS-1601`
+/// `push` returns `Err("RS-3601: …")` instead of growing the buffer
+/// unboundedly.  The caller is expected to surface this error as `RS-3601`
 /// and stop the pipeline until the barrier is cleared.
 pub struct AlignmentBuffer {
     max_rows: usize,
@@ -153,11 +153,11 @@ impl AlignmentBuffer {
 
     /// Push a `(key, value)` row into the buffer.
     ///
-    /// Returns `Err("RS-1601: …")` if the buffer is at capacity.
+    /// Returns `Err("RS-3601: …")` if the buffer is at capacity.
     pub fn push(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), String> {
         if self.rows.len() >= self.max_rows {
             return Err(format!(
-                "RS-1601: checkpoint alignment buffer overflowed (capacity={}, \
+                "RS-3601: checkpoint alignment buffer overflowed (capacity={}, \
                  pipeline halted until barrier clears). Reduce input rate or \
                  increase alignment_buffer_max_rows.",
                 self.max_rows
@@ -182,7 +182,7 @@ impl AlignmentBuffer {
         std::mem::take(&mut self.rows)
     }
 
-    /// Maximum number of rows the buffer will hold before returning RS-1601.
+    /// Maximum number of rows the buffer will hold before returning RS-3601.
     pub fn max_rows(&self) -> usize {
         self.max_rows
     }
@@ -196,7 +196,7 @@ impl AlignmentBuffer {
 /// - Inject barriers by calling `inject_barrier(epoch)`.
 /// - Accept shard acknowledgements via `ack_shard(ack)`.
 /// - When all shards have acknowledged: transition to `Committed`.
-/// - When explicitly aborted: transition to `Recovering` (RS-1602).
+/// - When explicitly aborted: transition to `Recovering` (RS-3602).
 /// - Track committed checkpoints for GC via the embedded `CheckpointGc`.
 pub struct CheckpointCoordinator {
     num_shards: usize,
@@ -234,7 +234,7 @@ impl CheckpointCoordinator {
     pub fn inject_barrier(&mut self, barrier_epoch: Epoch) -> Result<CheckpointBarrier, String> {
         if self.current.is_some() {
             return Err(
-                "RS-1602: cannot inject a new barrier while a checkpoint is already in \
+                "RS-3602: cannot inject a new barrier while a checkpoint is already in \
                  progress; wait for the current checkpoint to commit or abort it first."
                     .into(),
             );
@@ -300,7 +300,7 @@ impl CheckpointCoordinator {
 
     /// Abort the current checkpoint.
     ///
-    /// Transitions to `Recovering` (RS-1602).  Clears the in-progress state so
+    /// Transitions to `Recovering` (RS-3602).  Clears the in-progress state so
     /// a new barrier can be injected after recovery.
     pub fn abort(&mut self, reason: impl Into<String>) -> CheckpointStatus {
         let id = self
@@ -312,7 +312,7 @@ impl CheckpointCoordinator {
         CheckpointStatus::Recovering {
             checkpoint_id: id,
             reason: format!(
-                "RS-1602: cluster checkpoint recovery in progress — {}",
+                "RS-3602: cluster checkpoint recovery in progress — {}",
                 reason.into()
             ),
         }
@@ -424,7 +424,7 @@ mod tests {
         assert!(buf.push(b"k1".to_vec(), b"v1".to_vec()).is_ok());
         assert!(buf.push(b"k2".to_vec(), b"v2".to_vec()).is_ok());
         let err = buf.push(b"k3".to_vec(), b"v3".to_vec()).unwrap_err();
-        assert!(err.contains("RS-1601"), "expected RS-1601 in error: {err}");
+        assert!(err.contains("RS-3601"), "expected RS-3601 in error: {err}");
         // Buffer did not grow.
         assert_eq!(buf.len(), 2);
     }
@@ -478,8 +478,8 @@ mod tests {
         );
         if let CheckpointStatus::Recovering { reason, .. } = &status {
             assert!(
-                reason.contains("RS-1602"),
-                "expected RS-1602 in reason: {reason}"
+                reason.contains("RS-3602"),
+                "expected RS-3602 in reason: {reason}"
             );
         }
     }

@@ -8,7 +8,7 @@
 //! - **Shard reassignment ≤ 30 s SLO**: The recovery driver records
 //!   reassignments synchronously; the 30 s budget is tracked by
 //!   `RecoveryStatus`.
-//! - **Pipeline freshness recovery ≤ 60 s**: `RecoveringSlow` / `RS-1603`
+//! - **Pipeline freshness recovery ≤ 60 s**: `RecoveringSlow` / `RS-3603`
 //!   fires when a recovery is still active after 60 s.
 //! - **32-worker simultaneous restart — no false failure detections**: Workers
 //!   that send heartbeats at burst time are never reported as failed.
@@ -280,7 +280,7 @@ fn proof_recovery_healthy_after_complete() {
     ));
 
     // Mark complete.
-    driver.mark_complete(result.started_at_ms);
+    driver.mark_complete(result.recovery_id);
 
     // Now healthy.
     assert_eq!(driver.status(1_000), RecoveryStatus::Healthy);
@@ -316,7 +316,7 @@ fn proof_multiple_worker_failures_tracked_independently() {
     assert_eq!(driver.active_count(), 2);
 
     // Complete A's recovery.
-    driver.mark_complete(result_a.started_at_ms);
+    driver.mark_complete(result_a.recovery_id);
     assert_eq!(driver.active_count(), 1, "only B's recovery should remain");
 
     // B's recovery is still in progress.
