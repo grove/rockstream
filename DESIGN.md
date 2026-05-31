@@ -694,6 +694,18 @@ the lease exists only to prevent concurrent writers to the committed-frontier
 key. The mechanism is identical to a distributed lock with fencing tokens and
 is well-suited to the stateless, crash-tolerant nature of the frontier role.
 
+**Synchronous frontier writes.** Frontier writes to control SlateDB must use
+`WriteBatchOptions { sync: true }` (synchronous WAL flush). Without this, a
+new leader that acquires the lease after a crash could read control SlateDB
+before the previous leader's last frontier write was flushed, computing a
+lagging cluster-wide frontier. The performance cost is bounded by the frontier
+publication interval (default 100 ms) — one synchronous flush adds at most one
+object-store round-trip (≤ 50 ms p99 for co-located control plane), within
+the frontier aggregation latency budget (§3.0: ≤ 100 ms). A frontier write
+that cannot flush within `frontier_write_timeout_ms` (default 5 000 ms) must
+cause the leader to resign its lease and trigger a new election rather than
+silently dropping the update.
+
 ---
 
 ## 4. SQL Compilation Pipeline
@@ -2150,6 +2162,26 @@ the buckets, or decline the split if replication would exceed the state quota.
 For operators without an exact partial-state encoding, the plan remains
 unsplit and reports `SKEW_BOUND` if the SLO cannot be met.
 
+**Exception: non-composable aggregates must not use bucket salting.**
+A merge law is non-composable (`LawDescriptor.composable = false`) if it
+requires access to the *full* key weight before emitting output. `WeightAdd/v1`
+(DISTINCT) is non-composable: it fires output only on zero-crossings of the
+total weight across all rows for a key. With bucket salting, per-bucket shards
+each see a partial weight independently. A key with total weight 0 expressed
+as (+1, bucket-0) and (−1, bucket-1) causes bucket-0 to emit a spurious +1
+delta and bucket-1 to emit a spurious −1 delta before the combiner sees both.
+If these deltas cross an epoch boundary (due to shuffle reordering, §7.1),
+a downstream subscriber can receive and commit one delta before the combiner
+cancels it, violating DISTINCT semantics.
+
+For hot keys whose operator uses a non-composable law, the planner **must**
+route all rows for that key to a single designated spill shard. The spill
+shard applies the full-weight computation before redistributing the result.
+Single-shard throughput is the fundamental ceiling for non-composable
+aggregates on hot keys; this tradeoff cannot be avoided without weakening the
+aggregate semantics. The planner emits `SKEW_BOUND_NON_COMPOSABLE` rather
+than attempting bucket salting.
+
 ---
 
 ### 10.6 Proactive Shard Splitting
@@ -2302,8 +2334,38 @@ Commit (after cluster checkpoint succeeds):
 ```
 
 Replay after crash: on recovery, the connector inspects `sink_state/`:
-- If pre-committed but not committed: re-run commit (idempotent).
-- If neither: epoch's data will be reproduced; nothing to do.
+- If committed: nothing to do; epoch already delivered exactly once.
+- If pre-committed but not committed: recovery behavior depends on the
+  sink's `SinkIdempotencyProfile` (see below).
+- If neither: epoch's data will be reproduced via normal pre-commit; nothing to do.
+
+**Sink idempotency profiles.** Because external systems differ in their
+crash-recovery semantics, each sink implementation must declare one of the
+following profiles. The recovery driver reads the profile at recovery time
+and dispatches accordingly:
+
+- `NativeIdempotent` — The external system supports idempotent re-commit
+  natively (e.g., S3 conditional PUT using `If-None-Match`, Postgres
+  `COMMIT PREPARED` after `PREPARE TRANSACTION` on a named transaction).
+  Recovery calls `commit(epoch, checkpoint_id)` directly.
+
+- `FencingTokenRequired` — The external system requires a fencing token to
+  distinguish first commit from re-commit. The sink stores
+  `hash(worker_id || shard_id || epoch)` as the idempotency key and checks
+  it before applying the commit. Recovery calls `commit` with the same token.
+
+- `CheckBeforeCommit` — The external system does not safely support re-commit
+  after a broker/server-side abort (e.g., Kafka transactions are aborted by
+  the broker after `transaction.timeout.ms`). Recovery must first query the
+  external system's commit status (Kafka `describe_transactions`,
+  Postgres `pg_prepared_xacts`). If the transaction was already committed,
+  recovery only updates `sink_state/`. If the transaction was aborted,
+  recovery must re-run `pre_commit → commit` against a new transaction.
+
+Sink implementations **must** declare their `SinkIdempotencyProfile`. The
+`KafkaSink` uses `CheckBeforeCommit`; `S3Sink` uses `NativeIdempotent`;
+`PostgresSink` uses `NativeIdempotent` (via named `PREPARE TRANSACTION`).
+A sink missing a declared profile is rejected at registration time.
 
 ---
 
@@ -5028,6 +5090,44 @@ tests against a real endpoint (MinIO minimum) at the Phase 4 and Phase 6 gates.
 
 Behaviors not modeled by `SimRuntime` must be covered by integration tests
 against real object storage at the Phase 4 (v0.30) and Phase 6 (v0.36) gates.
+
+**Known simulation fidelity gaps introduced at v0.36 (target mitigations listed):**
+
+1. **Partial object writes** — `SimObjectStore` atomically commits writes in
+   memory; real S3/GCS may serve truncated bytes for in-progress or crashed
+   MPU uploads. Consequence: cold-tier Parquet sink crash-recovery is not
+   fully exercised in simulation. Mitigation target: add
+   `partial_write_probability: f64` to `SimObjectStore`'s fault model by
+   v0.37; add a `PartialWriteRecoveryTest` to the law-faults corpus.
+   Status: **[UNMITIGATED]** — blocks cold-tier exactly-once claim at v0.45.
+
+2. **Kafka transactional broker timeout** — `SimNetwork` can inject message
+   drops but does not model Kafka broker-side transaction timeout (which
+   aborts open transactions after `transaction.timeout.ms`). Consequence:
+   the `CheckBeforeCommit` recovery path for `KafkaSink` is not exercised in
+   simulation. Mitigation: add a `kafka_tx_timeout_probability` fault
+   parameter to the Kafka connector simulator before v0.43.
+   Status: **[UNMITIGATED]** — blocks Kafka exactly-once claim at v0.43.
+
+3. **S3 LIST consistency delays** — `SimObjectStore` returns synchronously
+   consistent LIST results; real S3 may return stale LIST responses for
+   several seconds after a PUT. Consequence: the CALM epoch manifest
+   verifiability property (§8.4) is not tested against LIST staleness.
+   Mitigation: add `list_staleness_epochs` fault parameter to
+   `SimObjectStore` by v0.38.
+   Status: **[UNMITIGATED]** — informational only; CALM property depends on
+   direct manifest reads, not LIST.
+
+4. **Network packet fragmentation** — TCP segmentation of large shuffle
+   frames is not exercised in simulation. Consequence: the `wire_version`
+   negotiation handshake (§5.5) is not tested against fragmented reads.
+   Mitigation: integration test with real gRPC and large frame sizes.
+   Status: **[DEFERRED]** — low risk in practice; gRPC handles reassembly.
+
+Each `[UNMITIGATED]` gap must be resolved before the corresponding feature
+reaches the Integration Beta gate (v0.45). Gaps are tracked in the
+simulation coverage matrix and the Phase 6 known-gaps list in
+IMPLEMENTATION_PLAN.md.
 
 ---
 
