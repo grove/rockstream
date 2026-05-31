@@ -33,6 +33,67 @@ pub fn register_law_faults(model: &mut FaultModel) {
                        state via DbReader snapshot reads.",
         category: FaultCategory::Io,
     });
+
+    // SumCount/v1 — sum and count pair for AVG (abelian group)
+    model.register(FaultEntry {
+        id: "law.sum_count.reorder",
+        description: "SumCount/v1: partial sums and counts arrive out of order across epoch \
+                       boundaries. Commutativity of addition guarantees the final AVG is \
+                       identical regardless of delivery order.",
+        category: FaultCategory::Network,
+    });
+    model.register(FaultEntry {
+        id: "law.sum_count.crash_replay",
+        description: "SumCount/v1: crash after writing sum but before writing count. \
+                       Replay must reproduce the full (sum, count) pair atomically.",
+        category: FaultCategory::Io,
+    });
+
+    // MaxRegister/v1 — last-write-wins maximum (bounded semilattice)
+    model.register(FaultEntry {
+        id: "law.max_register.reorder",
+        description: "MaxRegister/v1: updates arrive out of order. Idempotency and \
+                       commutativity of max() ensure the highest observed value wins \
+                       regardless of delivery order.",
+        category: FaultCategory::Network,
+    });
+    model.register(FaultEntry {
+        id: "law.max_register.duplicate",
+        description: "MaxRegister/v1: the same update is delivered twice (at-least-once \
+                       delivery). Idempotency of max() ensures no inflation.",
+        category: FaultCategory::Network,
+    });
+
+    // HyperLogLog/v1 — approximate distinct count (merge-safe sketch)
+    model.register(FaultEntry {
+        id: "law.hyper_log_log.reorder",
+        description: "HyperLogLog/v1: sketch merge operands arrive out of order. \
+                       Union of HLL sketches is commutative; the cardinality estimate \
+                       must be within error bounds regardless of merge order.",
+        category: FaultCategory::Network,
+    });
+    model.register(FaultEntry {
+        id: "law.hyper_log_log.crash_replay",
+        description: "HyperLogLog/v1: crash after partial sketch write. On replay, \
+                       the full sketch is re-merged; the estimate must not diverge \
+                       beyond the documented error bound.",
+        category: FaultCategory::Io,
+    });
+
+    // BloomUnion/v1 — set membership sketch (monotone, merge-safe)
+    model.register(FaultEntry {
+        id: "law.bloom_union.reorder",
+        description: "BloomUnion/v1: bit-OR merge operands arrive out of order. \
+                       Bit-OR is commutative and associative; false-positive rate \
+                       must stay within documented bounds.",
+        category: FaultCategory::Network,
+    });
+    model.register(FaultEntry {
+        id: "law.bloom_union.duplicate",
+        description: "BloomUnion/v1: the same filter is merged twice. \
+                       Idempotency of bit-OR ensures no additional false positives.",
+        category: FaultCategory::Network,
+    });
 }
 
 /// Fault-model entries registered by `register_law_faults`.
@@ -40,6 +101,14 @@ pub const LAW_FAULT_IDS: &[&str] = &[
     "law.weight_add.reorder",
     "law.weight_add.crash_replay",
     "law.weight_add.fence",
+    "law.sum_count.reorder",
+    "law.sum_count.crash_replay",
+    "law.max_register.reorder",
+    "law.max_register.duplicate",
+    "law.hyper_log_log.reorder",
+    "law.hyper_log_log.crash_replay",
+    "law.bloom_union.reorder",
+    "law.bloom_union.duplicate",
 ];
 
 #[cfg(test)]
@@ -61,7 +130,6 @@ mod tests {
     fn law_faults_are_categorized() {
         let mut model = FaultModel::new();
         register_law_faults(&mut model);
-        // All three WeightAdd faults must be present and categorized
         assert_eq!(
             model.get("law.weight_add.reorder").unwrap().category,
             FaultCategory::Network
@@ -73,6 +141,25 @@ mod tests {
         assert_eq!(
             model.get("law.weight_add.fence").unwrap().category,
             FaultCategory::Io
+        );
+        assert_eq!(
+            model.get("law.sum_count.reorder").unwrap().category,
+            FaultCategory::Network
+        );
+        assert_eq!(
+            model.get("law.max_register.duplicate").unwrap().category,
+            FaultCategory::Network
+        );
+        assert_eq!(
+            model
+                .get("law.hyper_log_log.crash_replay")
+                .unwrap()
+                .category,
+            FaultCategory::Io
+        );
+        assert_eq!(
+            model.get("law.bloom_union.duplicate").unwrap().category,
+            FaultCategory::Network
         );
     }
 }
