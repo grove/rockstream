@@ -40,8 +40,8 @@ The phase numbers here map to ROADMAP.md roadmap versions as follows:
 | 2 | v0.11–v0.18 | ✅ Complete | SQL frontend, joins, set ops (IVM-4 … IVM-6) | — |
 | 3 | v0.19–v0.26 | ✅ Complete | Advanced operators: windows, recursion, view-on-view (IVM-7 … IVM-12) | plans/full-assessment-v0.18.md |
 | 3.5 | v0.27 | ✅ Complete | IVM correctness soak (IVM-13) | sign-offs/v0.27.md |
-| 4 | v0.28–v0.30 | ✅ Done (*) | Multi-shard execution and exchange subsystem | plans/phase4-signoff.md [OUTSTANDING] |
-| 5 | v0.31–v0.32 | ✅ Done (*) | Frontier protocol and progress tracking | plans/phase5-signoff.md [OUTSTANDING] |
+| 4 | v0.28–v0.30 | ✅ Done (*) | Multi-shard execution and exchange subsystem | plans/phase4-signoff.md |
+| 5 | v0.31–v0.32 | ✅ Done (*) | Frontier protocol and progress tracking | plans/phase5-signoff.md |
 | 6 | v0.33–v0.36 | ✅ Done (*) | Fault tolerance, exactly-once, chaos | plans/full-assessment-v0.36.md |
 | 7 | v0.37–v0.39 | Not started | Elasticity: split, merge, drain, clone | — |
 | 8 | v0.40–v0.43 | Not started | Postgres query gateway, introspection, freshness, subscribe, direct-write CRDT surface, OLTP session ergonomics | — |
@@ -1011,16 +1011,31 @@ production implementation before the Integration Beta gate:
   conditional-rename. Tracked before v0.43.
 - [ ] **Postgres sink exactly-once**: the `PostgresSink` stub does not
   implement `PREPARE TRANSACTION` / `COMMIT PREPARED`. Tracked before v0.43.
-- [ ] **Phase 4 real-network sign-off**: `plans/phase4-signoff.md` with 4-host
-  test results or formal waiver. Blocking before Phase 9 exit.
-- [ ] **Phase 5 real-S3 sign-off**: `plans/phase5-signoff.md` with ≥1 GB
-  benchmark on real S3. Blocking before Phase 9 exit.
+- [x] **Phase 4 real-network sign-off**: `plans/phase4-signoff.md` — waiver
+  approved 2026-05-31; real 4-host test commitment binding before Phase 9 exit.
+- [x] **Phase 5 real-S3 sign-off**: `plans/phase5-signoff.md` — waiver approved
+  2026-05-31; real-S3 benchmark commitment binding before Phase 9 exit.
 
 ---
 
 ## Phase 7 — Elasticity
 
 **Goal**: Add and remove shards without downtime.
+
+**Entry criteria** (all must be satisfied before work begins)
+
+- `sign-offs/v0.36.md` exists with all items checked (Phase 6 complete). ✅
+- `cargo test --workspace` is green on `main`. ✅
+- ROADMAP.md v0.36 row shows `✅ Done`. ✅
+- "Distributed architecture" decision gate recorded in ROADMAP.md with date
+  and decision-maker. ✅ (Decided 2026-05-31: single-region for Integration Beta.)
+- "CRDT value" decision gate recorded in ROADMAP.md with date and
+  decision-maker. ✅ (Decided 2026-05-31: include CRDTs on decomposed schedule.)
+- `plans/phase4-signoff.md` exists with test results or approved waiver. ✅
+- `plans/phase5-signoff.md` exists with test results or approved waiver. ✅
+- Continuous simulation soak CI job is running and has produced at least one
+  regression-seed corpus entry. ✅ (`.github/workflows/simulation-soak.yml` live
+  since v0.36; initial corpus in `rockstream-sim/src/soak.rs`.)
 
 **Deliverables**
 
